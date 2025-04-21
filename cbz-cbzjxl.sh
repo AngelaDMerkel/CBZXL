@@ -2,28 +2,28 @@
 
 set -euo pipefail
 
-# Config
+# Parameters
 LOG_FILE="cbz_jxl_conversion.log"
 JXL_THREADS=10
 TEMP_DIR_ROOT=$(mktemp -d)
 JXL_EFFORT=8
 
-# Logging helper
+# Logs
 log_msg() {
     echo "$1"
     echo "$1" >> "$LOG_FILE"
 }
 
-# Check if a CBZ has already been processed
+# Skip previously processed
 is_processed() {
     grep -Fxq "$1" "$LOG_FILE" 2>/dev/null
 }
 
-# Track the total original and final sizes
+# Storage Savings
 total_original_size=0
 total_final_size=0
 
-# Process each .cbz
+# Process .cbz
 find . -type f -name "*.cbz" | while read -r cbz; do
     rel_cbz="${cbz#./}"
     if is_processed "$rel_cbz"; then
