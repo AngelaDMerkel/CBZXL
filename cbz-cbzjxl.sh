@@ -1,103 +1,158 @@
 #!/usr/bin/env bash
-
 set -euo pipefail
 
-# Parameters
+# Config
 LOG_FILE="cbz_jxl_conversion.log"
 JXL_THREADS=10
-TEMP_DIR_ROOT=$(mktemp -d)
 JXL_EFFORT=8
+TEMP_DIR_ROOT=$(mktemp -d /tmp/cbzjxl.XXXXXX)
+DB_FILE="converted_archives.db"  # SQLite DB for tracking processed archives
 
-# Logs
-log_msg() {
-    echo "$1"
-    echo "$1" >> "$LOG_FILE"
+# Global counters
+total_cbz_files=$(find . -type f -name "*.cbz" | wc -l)
+processed_cbz_count=0
+total_original=0
+total_final=0
+total_saved_bytes=0
+
+# SQLite helper function to escape paths
+sqlite3_escape() {
+    echo "$1" | sed "s/'/''/g"
 }
 
-# Skip previously processed
-is_processed() {
-    grep -Fxq "$1" "$LOG_FILE" 2>/dev/null
-}
+# Initialize SQLite database and create an index
+init_db() {
+    if [ ! -f "$DB_FILE" ]; then
+        sqlite3 "$DB_FILE" <<EOF
+CREATE TABLE converted_archives (
+    path TEXT PRIMARY KEY
+);
 
-# Storage Savings
-total_original_size=0
-total_final_size=0
-
-# Process .cbz
-find . -type f -name "*.cbz" | while read -r cbz; do
-    rel_cbz="${cbz#./}"
-    if is_processed "$rel_cbz"; then
-        log_msg "✅ Already processed: $rel_cbz"
-        continue
+-- Add an index to speed up searches
+CREATE INDEX idx_path ON converted_archives (path);
+EOF
     fi
+}
 
-    log_msg "📦 Processing: $rel_cbz"
+# Check if a CBZ has already been processed (using SQLite)
+is_processed() {
+    result=$(sqlite3 "$DB_FILE" "SELECT 1 FROM converted_archives WHERE path = '$(sqlite3_escape "$1")';")
+    [ "$result" = "1" ]
+}
 
-    # Store original size for space saving calculation
-    original_size=$(stat -f%z "$cbz")
-    total_original_size=$((total_original_size + original_size))
+# Mark a CBZ as processed
+mark_processed() {
+    sqlite3 "$DB_FILE" "INSERT INTO converted_archives (path) VALUES ('$(sqlite3_escape "$1")');"
+}
 
-    # Create temp dir and unzip
-    TEMP_DIR=$(mktemp -d -p "$TEMP_DIR_ROOT")
-    unzip -q "$cbz" -d "$TEMP_DIR"
+# Remove a CBZ entry from the database if the file doesn't exist
+remove_deleted_from_db() {
+    sqlite3 "$DB_FILE" "DELETE FROM converted_archives WHERE path = '$(sqlite3_escape "$1")';"
+}
 
-    # Fix extensions based on actual MIME type
-    find "$TEMP_DIR" -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" \) | while read -r img; do
-        actual_type=$(file --mime-type -b "$img")
+# Get the size of a file
+get_size() {
+    stat -f%z "$1"
+}
 
-        case "$actual_type" in
-            image/webp)
-                new_name="${img%.*}.webp"
-                if [ "$img" != "$new_name" ]; then
-                    mv "$img" "$new_name"
-                    log_msg "🔁 Renamed WebP file with wrong extension: $img → $new_name"
-                fi
-                ;;
-            image/jpeg|image/png)
-                # Correct, no action needed
-                ;;
-            *)
-                log_msg "⚠️ Unknown file type ($actual_type): $img"
-                ;;
-        esac
-    done
+# Logging function
+log_msg() { 
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $1" | tee -a "$LOG_FILE"
+}
 
-    # Convert eligible images to JXL
-    export JXL_EFFORT
-    export TEMP_DIR
-    find "$TEMP_DIR" -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" \) ! -iname "*.gif" ! -iname "*.apng" ! -iname "*.avif" ! -iname "*.webp" ! -iname "*.jxl" | while read -r img; do
-        jxl_path="${img%.*}.jxl"
-        if cjxl --effort=$JXL_EFFORT "$img" "$jxl_path" >/dev/null 2>&1; then
-            rm -f "$img"
-            log_msg "🖼️ Converted: $img → $jxl_path"
-        else
-            log_msg "❌ Failed to convert: $img"
+# Update progress bar in terminal
+update_progress() {
+  local progress="$((processed_cbz_count * 100 / total_cbz_files))"
+  echo -ne "\rProgress: ${progress}% (${processed_cbz_count}/${total_cbz_files}) - Saved: $(echo "scale=2; $total_saved_bytes / (1024^3)" | bc) GB"
+}
+
+# Initialize temporary directory and SQLite DB
+log_msg "🛠️ Starting CBZ to JXL conversion..."
+init_db
+
+# Periodically remove any deleted archives from the database
+cleanup_db() {
+    find . -type f -name "*.cbz" | while IFS= read -r cbz; do
+        rel_cbz="${cbz#./}"
+        if ! [ -e "$cbz" ]; then
+            log_msg "🧹 Removing deleted archive from DB: $rel_cbz"
+            remove_deleted_from_db "$rel_cbz"
         fi
     done
+}
 
-    # Repack the CBZ
-    NEW_CBZ="$(mktemp -p "$TEMP_DIR_ROOT" tmp.XXXXXX).cbz"
-    if (cd "$TEMP_DIR" && zip -qr "$NEW_CBZ" .); then
-        mv "$NEW_CBZ" "$cbz"
-        log_msg "✅ Repacked: $rel_cbz"
-    else
-        log_msg "❌ Failed to rezip: $rel_cbz"
-    fi
+find . -type f -name "*.cbz" | while IFS= read -r cbz; do
+  processed_cbz_count=$((processed_cbz_count + 1))
+  rel_cbz="${cbz#./}"
+  update_progress
 
-    # Store final size for space saving calculation
-    new_cbz_size=$(stat -f%z "$cbz")
-    total_final_size=$((total_final_size + new_cbz_size))
+  if is_processed "$rel_cbz"; then
+    log_msg "✅ Previously processed: $rel_cbz"
+    continue
+  fi
 
-    # Clean up
-    rm -rf "$TEMP_DIR"
-    echo "$rel_cbz" >> "$LOG_FILE"
+  # Remove deleted archives from DB
+  cleanup_db
+
+  log_msg "📦 Processing: $rel_cbz"
+  original_size=$(get_size "$cbz")
+  TEMP_DIR=$(mktemp -d -p "$TEMP_DIR_ROOT")
+  unzip -q "$cbz" -d "$TEMP_DIR"
+
+  # Fix extensions based on MIME
+  find "$TEMP_DIR" -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" \) | while IFS= read -r img; do
+    case "$(file --mime-type -b "$img")" in
+      image/webp)
+        new="${img%.*}.webp"
+        [ "$img" != "$new" ] && mv "$img" "$new" && log_msg "🔁 Renamed: $img → $new"
+        ;;
+      image/jpeg|image/png) : ;;
+      *) log_msg "⚠️ Unknown type: $img" ;;
+    esac
+  done
+
+  # Export vars for parallel jobs
+  export JXL_EFFORT LOG_FILE
+
+  # Create a file to track if anything was converted
+  touch "$TEMP_DIR/.converted_flag"
+
+  find "$TEMP_DIR" -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" \) \
+    ! -iname "*.gif" ! -iname "*.apng" ! -iname "*.avif" ! -iname "*.webp" ! -iname "*.jxl" -print0 |
+    xargs -0 -n1 -P "$JXL_THREADS" -I{} bash -c '
+      img="$1"
+      jxl="${img%.*}.jxl"
+      original_size=$(stat -f%z "$img" 2>/dev/null || echo 0)
+      if cjxl -d 0 --effort=$JXL_EFFORT "$img" "$jxl" >/dev/null 2>&1; then
+        rm "$img"
+        printf "%s 🖼️ Converted: %s → %s\n" "$(date "+%Y-%m-%d %H:%M:%S")" "$img" "$jxl" >> "$LOG_FILE"
+        touch "$img.converted"
+        echo "$original_size"
+      else
+        printf "%s ❌ Failed: %s\n" "$(date "+%Y-%m-%d %H:%M:%S")" "$img" >> "$LOG_FILE"
+        echo 0
+      fi
+    ' _ {} | while IFS= read -r bytes_saved; do
+      total_saved_bytes=$((total_saved_bytes + bytes_saved))
+    done
+
+  # Check if any conversions happened and repack
+  if find "$TEMP_DIR" -type f -name "*.converted" | grep -q .; then
+    new_cbz=$(mktemp -p "$TEMP_DIR_ROOT" tmp.XXXXXX).cbz
+    (cd "$TEMP_DIR" && zip -qr "$new_cbz" .) && mv "$new_cbz" "$cbz"
+    new_size=$(get_size "$cbz")
+    total_original=$((total_original + original_size))
+    total_final=$((total_final + new_size))
+    mark_processed "$rel_cbz"
+    log_msg "🖼️ Converted and repacked: $rel_cbz"
+  else
+    log_msg "ℹ️ Skipped (no conversions): $rel_cbz"
+    mark_processed "$rel_cbz"
+  fi
+
+  rm -rf "$TEMP_DIR"
 done
 
-# Calculate and print saved space
-saved_bytes=$((total_original_size - total_final_size))
-saved_gb=$(echo "scale=2; $saved_bytes / (1024^3)" | bc)
-log_msg "✅ Total space saved: $saved_gb GB"
-
-# Final cleanup
-rm -rf "$TEMP_DIR_ROOT"
-log_msg "🎉 Done!"
+# Final cleanup and message
+log_msg "🎉 Done! Total space saved: $(echo "scale=2; $total_saved_bytes / (1024^3)" | bc) GB"
+echo "" # Add a newline at the end for cleaner terminal output
