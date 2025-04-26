@@ -8,6 +8,7 @@ This bash script unpacks CBZ archives and converts .JPEG and .PNG files to JXL u
 - Ignores file types `cjxl` cannot handle
 - Renames incorrect extensions using MIME type
 - Skips previously converted archives
+- Records basic information in an SQLite DB
 
 ## Caveats
 
