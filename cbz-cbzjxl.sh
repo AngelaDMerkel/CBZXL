@@ -66,6 +66,11 @@ update_progress() {
   echo -ne "\rProgress: ${progress}% (${processed_cbz_count}/${total_cbz_files}) - Saved: $(echo "scale=2; $total_saved_bytes / (1024^3)" | bc) GB"
 }
 
+# Clean up any leftover .converted files in the temp directory
+clean_converted_markers() {
+  find "$1" -type f -name "*.converted" -exec rm {} \; && log_msg "🧹 Cleaned up leftover .converted files in $1"
+}
+
 # Initialize temporary directory and SQLite DB
 log_msg "🛠️ Starting CBZ to JXL conversion..."
 init_db
@@ -81,24 +86,31 @@ cleanup_db() {
     done
 }
 
+# Periodic cleanup every 500 files
 find . -type f -name "*.cbz" | while IFS= read -r cbz; do
   processed_cbz_count=$((processed_cbz_count + 1))
   rel_cbz="${cbz#./}"
   update_progress
+
+  # Periodic cleanup after every 500 files
+  if (( processed_cbz_count % 500 == 0 )); then
+    log_msg "🧹 Periodic database cleanup at $processed_cbz_count files"
+    cleanup_db
+  fi
 
   if is_processed "$rel_cbz"; then
     log_msg "✅ Previously processed: $rel_cbz"
     continue
   fi
 
-  # Remove deleted archives from DB
-  cleanup_db
-
   log_msg "📦 Processing: $rel_cbz"
   original_size=$(get_size "$cbz")
   TEMP_DIR=$(mktemp -d -p "$TEMP_DIR_ROOT")
   unzip -q "$cbz" -d "$TEMP_DIR"
 
+  # Clean up any leftover .converted files immediately
+  clean_converted_markers "$TEMP_DIR"
+    
   # Fix extensions based on MIME
   find "$TEMP_DIR" -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" \) | while IFS= read -r img; do
     case "$(file --mime-type -b "$img")" in
@@ -136,10 +148,13 @@ find . -type f -name "*.cbz" | while IFS= read -r cbz; do
       total_saved_bytes=$((total_saved_bytes + bytes_saved))
     done
 
+  # Clean up any leftover .converted files before repacking
+  clean_converted_markers "$TEMP_DIR"
+
   # Check if any conversions happened and repack
   if find "$TEMP_DIR" -type f -name "*.converted" | grep -q .; then
     new_cbz=$(mktemp -p "$TEMP_DIR_ROOT" tmp.XXXXXX).cbz
-    (cd "$TEMP_DIR" && zip -qr "$new_cbz" .) && mv "$new_cbz" "$cbz"
+    (cd "$TEMP_DIR" && zip -qr "$new_cbz" . -x "*.converted") && mv "$new_cbz" "$cbz"
     new_size=$(get_size "$cbz")
     total_original=$((total_original + original_size))
     total_final=$((total_final + new_size))
