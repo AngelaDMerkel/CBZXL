@@ -5,10 +5,10 @@ import tempfile
 import zipfile
 import subprocess
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from rich.console import Console
 from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn, SpinnerColumn
 
-# Configuration
 JXL_EFFORT = 8
 DB_FILE = "converted_archives.db"
 LOG_FILE = "cbz_jxl_conversion.log"
@@ -32,8 +32,7 @@ def init_db():
     return conn
 
 def is_processed(conn, path):
-    result = conn.execute("SELECT 1 FROM converted_archives WHERE path = ?", (path,)).fetchone()
-    return result is not None
+    return conn.execute("SELECT 1 FROM converted_archives WHERE path = ?", (path,)).fetchone() is not None
 
 def mark_processed(conn, path):
     conn.execute("INSERT OR IGNORE INTO converted_archives (path) VALUES (?)", (path,))
@@ -48,41 +47,59 @@ def fix_grayscale_icc(path):
 def convert_cmyk_to_rgb(path):
     subprocess.run(["magick", path, "-colorspace", "sRGB", path], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+def correct_extension(img_path, mime):
+    ext_map = {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/avif": ".avif",
+    }
+    correct_ext = ext_map.get(mime)
+    if correct_ext and img_path.suffix.lower() != correct_ext:
+        new_path = img_path.with_suffix(correct_ext)
+        img_path.rename(new_path)
+        log(f"[blue]🔧 Corrected extension: {img_path.name} → {new_path.name}")
+        return new_path
+    return img_path
+
+def convert_single_image(img_path):
+    img_path = img_path.resolve()
+    mime = subprocess.getoutput(f"file --mime-type -b \"{img_path}\"").strip()
+    if mime not in ("image/jpeg", "image/png"):
+        return 0
+
+    img_path = correct_extension(img_path, mime)
+    jxl_path = img_path.with_suffix(".jxl")
+    orig_size = get_size(img_path)
+
+    if mime == "image/png":
+        fix_grayscale_icc(str(img_path))
+    elif mime == "image/jpeg":
+        if subprocess.getoutput(f"identify -format '%[colorspace]' \"{img_path}\"").strip() == "CMYK":
+            convert_cmyk_to_rgb(str(img_path))
+
+    result = subprocess.run([
+        "cjxl", "-d", "0", f"--effort={JXL_EFFORT}", str(img_path), str(jxl_path)
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    if result.returncode == 0 and jxl_path.exists():
+        jxl_size = get_size(jxl_path)
+        os.remove(img_path)
+        return orig_size - jxl_size
+    else:
+        log(f"[red]❌ Failed to convert: {img_path}")
+        return 0
+
 def convert_images(temp_dir):
-    converted = False
-    saved_bytes = 0
-    for ext in ('*.jpg', '*.jpeg', '*.png'):
-        for img_path in Path(temp_dir).rglob(ext):
-            img_path = img_path.resolve()
-            mime = subprocess.getoutput(f"file --mime-type -b \"{img_path}\"").strip()
-            if mime not in ("image/jpeg", "image/png"):
-                continue
+    total_saved = 0
+    paths = [p for ext in ('*.jpg', '*.jpeg', '*.png', '*.webp', '*.avif') for p in Path(temp_dir).rglob(ext)]
 
-            jxl_path = img_path.with_suffix(".jxl")
-            orig_size = get_size(img_path)
+    with ThreadPoolExecutor(max_workers=THREADS) as executor:
+        futures = [executor.submit(convert_single_image, path) for path in paths]
+        for future in as_completed(futures):
+            total_saved += future.result()
 
-            # Fix grayscale ICC bug
-            if mime == "image/png":
-                fix_grayscale_icc(str(img_path))
-
-            # Convert CMYK JPEGs to RGB
-            if mime == "image/jpeg":
-                color_profile = subprocess.getoutput(f"identify -format '%[colorspace]' \"{img_path}\"").strip()
-                if color_profile == "CMYK":
-                    convert_cmyk_to_rgb(str(img_path))
-
-            result = subprocess.run([
-                "cjxl", "-d", "0", f"--effort={JXL_EFFORT}", str(img_path), str(jxl_path)
-            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-            if result.returncode == 0 and jxl_path.exists():
-                os.remove(img_path)
-                converted = True
-                saved_bytes += orig_size
-            else:
-                log(f"[red]❌ Failed to convert: {img_path}")
-
-    return converted, saved_bytes
+    return total_saved > 0, total_saved
 
 def process_cbz(cbz_path, conn):
     rel_path = os.path.relpath(cbz_path)
@@ -124,7 +141,6 @@ def main():
     total_saved = 0
     converted_count = 0
     skipped_count = 0
-
     conn = init_db()
 
     log("🛠️ Starting CBZ to JXL conversion...")
