@@ -10,6 +10,10 @@ This Python script unpacks CBZ archives and converts .JPEG and .PNG files to JXL
 - SQLite to skip reviously processed archives
 - Basic logging
 
+## Usage
+
+- `--verbose` for more info including per archive savings and percent saved. I recommend you pass this flag
+
 ## Caveats
 
 The script is pretty unsophisticated and it's up to the user to have `magic`, `cjxl` etc in their path for the script to use. As far as I can tell, it catches every edge case you're likely to encounter. 
