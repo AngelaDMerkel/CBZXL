@@ -9,10 +9,16 @@ This Python script unpacks CBZ archives and converts .JPEG and .PNG files to JXL
 - Corrects atypical or unusual colour space or metadata
 - SQLite to skip reviously processed archives
 - Basic logging
+- Basic acrhive error handling
 
 ## Usage
 
 - `--verbose` for more info including per archive savings and percent saved. I recommend you pass this flag
+- `--suppress-skipped` overrides `--verbose` and supresses any messages indicating when an archive has been skipped
+- `--effort` overrides the default effort level of `9`
+- `--threads` overrides the default of `10` threads
+- `--backup` creates backups of the CBZ archives
+- `--dry-run`
 
 ## Caveats
 
