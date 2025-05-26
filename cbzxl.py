@@ -38,6 +38,7 @@ class ConversionStatus(Enum):
     ALREADY_JXL_NO_CONVERTIBLES = auto() # Only JXL, or JXL + other non-JPG/PNG
     NO_JPG_PNG_FOUND = auto()          # Other image types (webp, etc.) found, but no JPG/PNG
     NO_IMAGES_RECOGNIZED = auto()      # No files recognized as images the script cares about
+    CONTAIN_OTHER_FORMATS = auto()     # Added for specific logging
 
 
 def log(msg, level="info", msg_type="general"):
@@ -45,12 +46,12 @@ def log(msg, level="info", msg_type="general"):
     log_prefix = "[DRY RUN] " if DRY_RUN else ""
     full_msg = f"{log_prefix}{msg}"
 
-    if msg_type == "skipped" and SUPPRESS_SKIPPED and not DRY_RUN: # Don't suppress skipped if it's a dry run
+    if msg_type == "skipped" and SUPPRESS_SKIPPED and not DRY_RUN:
         with open(LOG_FILE, 'a', encoding='utf-8') as f:
             f.write(full_msg + "\n")
         return
 
-    if VERBOSE or level == "error" or DRY_RUN: # Always print to console in dry run or if verbose/error
+    if VERBOSE or level == "error" or DRY_RUN:
         console.print(full_msg)
 
     with open(LOG_FILE, 'a', encoding='utf-8') as f:
@@ -61,7 +62,7 @@ def init_db(db_path):
     """Initialize the SQLite database"""
     if DRY_RUN:
         log(f"Would initialize database at {db_path}")
-        return None # In dry run, don't actually connect or return a connection object
+        return None
     conn = sqlite3.connect(db_path)
     with conn:
         conn.execute("""
@@ -72,7 +73,7 @@ def init_db(db_path):
                 bytes_saved INTEGER,
                 percent_saved REAL,
                 converted_at TEXT,
-                status TEXT DEFAULT 'processed' -- Added status: processed, failed
+                status TEXT DEFAULT 'processed'
             )
         """)
     return conn
@@ -90,31 +91,7 @@ def is_processed(conn, path_str):
             converted_at_str = result[0]
             if converted_at_str is None:
                  return False
-            converted_at = datetime.fromisoformat(converted_at_str)
-            # Ensure the path_str for getmtime is absolute or correctly relative to cwd if necessary
-            # If path_str is already how it's stored (e.g. relative to input_dir), need to reconstruct full path
-            # For simplicity, assuming path_str as passed can be used by os.path.getmtime
-            # This might need adjustment if path_str is not directly usable by os.path.getmtime
-            # full_path_for_mtime = Path(args.input_dir).resolve() / path_str # Example if path_str is relative to input_dir
-            # For now, let's assume path_str itself is usable if the script is run from where paths are relative,
-            # or if path_str is already absolute. The `cbz_path` object in main is absolute.
-            # The `rel_path_for_db` is relative. This means is_processed needs the full path.
-            # This part of is_processed might not be robust if path_str is relative.
-            # Let's assume for now that `os.path.getmtime` will get the correct file.
-            # A better approach would be to pass the full path to is_processed.
-            # Or, store full paths in DB, or always resolve based on a known root.
-            # The `cbz_files_path_obj_list` in main holds absolute paths.
-            # `rel_path_for_db` is used for DB keys.
-            # When calling is_processed, we should use `rel_path_for_db`, but for mtime, we need the full path.
-            # This is a subtle bug source.
-            # A quick fix is to not check mtime here, or ensure full path is available.
-            # For now, I will remove the mtime check to avoid complexities with path resolution here.
-            # A more robust solution would involve passing the full path along with rel_path_for_db or storing absolute paths.
-            # To keep the change minimal for now, let's assume if it's in DB as 'processed', it's done.
-            # This means re-running won't re-process unless DB is cleared or status is 'failed'.
-            return True # Simplified: if in DB and not 'failed', consider processed.
-            # actual_mtime = datetime.fromtimestamp(os.path.getmtime(path_str)) # This line is problematic with relative paths
-            # return actual_mtime <= converted_at
+            return True
     except sqlite3.Error as e:
         log(f"[red]DB Error checking if processed {path_str}: {e}", level="error")
     return False
@@ -262,15 +239,11 @@ def convert_single_image(img_path_obj):
 
         if result.returncode == 0 and jxl_path.exists() and get_size(jxl_path) > 0:
             saved = orig_size - get_size(jxl_path)
-            if saved > 0 :
-                os.remove(img_path_obj)
-                if VERBOSE: # Only log individual image conversion details if verbose
-                    log(f"   🖼️  Converted image: {img_path_obj.name} (MIME: {mime}, Saved: {saved / 1024:.2f} KB)")
-                return saved
-            else:
-                log(f"[yellow]   ⚠️ JXL not smaller for {img_path_obj.name}. Original kept.")
-                if jxl_path.exists(): os.remove(jxl_path)
-                return 0
+            # Always remove original if JXL conversion was successful, regardless of space saved
+            os.remove(img_path_obj)
+            if VERBOSE:
+                log(f"   🖼️  Converted image: {img_path_obj.name} (MIME: {mime}, Original Size: {orig_size / 1024:.2f} KB, JXL Size: {get_size(jxl_path) / 1024:.2f} KB)")
+            return saved # Return saved bytes, can be negative if JXL is larger
         else:
             log(f"[red]❌ Failed to convert with cjxl: {img_path_obj.name}", level="error")
             if result.stdout: log(f"[red]   cjxl stdout: {result.stdout.strip()}", level="error")
@@ -296,8 +269,7 @@ def convert_images(temp_dir_path): # temp_dir_path is Path object
 
     known_convertible_exts = ('.jpg', '.jpeg', '.png')
     known_jxl_exts = ('.jxl',)
-    # Define other image extensions script is aware of but won't convert
-    known_other_image_exts = ('.webp', '.avif', '.gif', '.tiff', '.bmp') 
+    known_other_image_exts = ('.webp', '.avif', '.gif', '.tiff', '.bmp')
 
     for p in all_files_in_temp:
         if not p.is_file():
@@ -310,16 +282,27 @@ def convert_images(temp_dir_path): # temp_dir_path is Path object
         elif ext in known_other_image_exts:
             other_image_paths.append(p)
 
-    if not convertible_paths: # No JPG/PNG images found
-        if jxl_paths: # JXLs are present, no JPG/PNG
-            return ConversionStatus.ALREADY_JXL_NO_CONVERTIBLES, 0
-        elif other_image_paths: # Other images (webp etc) present, but no JPG/PNG and no JXL
-            return ConversionStatus.NO_JPG_PNG_FOUND, 0
-        else: # No .jpg, .png, .jxl, or other known image types found
-            return ConversionStatus.NO_IMAGES_RECOGNIZED, 0
+    if not convertible_paths:
+        if jxl_paths:
+            return ConversionStatus.ALREADY_JXL_NO_CONVERTIBLES, 0, ""
+        elif other_image_paths:
+            # Determine the predominant "other" image type for specific logging
+            ext_counts = {}
+            for p in other_image_paths:
+                ext = p.suffix.lower()
+                ext_counts[ext] = ext_counts.get(ext, 0) + 1
+            
+            if ext_counts:
+                # Find the most frequent "other" extension
+                most_frequent_ext = max(ext_counts, key=ext_counts.get)
+                # Remove the leading dot for cleaner logging
+                return ConversionStatus.CONTAIN_OTHER_FORMATS, 0, most_frequent_ext[1:].upper()
+            else:
+                return ConversionStatus.NO_JPG_PNG_FOUND, 0, ""
+        else:
+            return ConversionStatus.NO_IMAGES_RECOGNIZED, 0, ""
 
-    # Proceed with converting images in convertible_paths
-    if VERBOSE or DRY_RUN: # Log count only if verbose or dry run
+    if VERBOSE or DRY_RUN:
         log(f"   Found {len(convertible_paths)} JPEG/PNG images for potential conversion...")
     
     with ThreadPoolExecutor(max_workers=THREADS) as executor:
@@ -333,9 +316,9 @@ def convert_images(temp_dir_path): # temp_dir_path is Path object
                 log(f"[red]❌ Error processing image {path_obj.name} in thread: {e}", level="error")
 
     if total_saved > 0:
-        return ConversionStatus.PROCESSED_SAVED_SPACE, total_saved
+        return ConversionStatus.PROCESSED_SAVED_SPACE, total_saved, ""
     else: 
-        return ConversionStatus.PROCESSED_NO_SPACE_SAVED, total_saved
+        return ConversionStatus.PROCESSED_NO_SPACE_SAVED, total_saved, ""
 
 
 def flatten_cbz_archive(cbz_path_for_log, temp_dir_path):
@@ -404,7 +387,7 @@ def flatten_cbz_archive(cbz_path_for_log, temp_dir_path):
     return action_taken
 
 
-def process_cbz(cbz_path_obj, conn_main_db, conn_fail_db, cli_args): # Pass cli_args for input_dir context
+def process_cbz(cbz_path_obj, conn_main_db, conn_fail_db, cli_args):
     """Processes a single CBZ archive."""
     rel_path_str = os.path.relpath(cbz_path_obj, Path(cli_args.input_dir).resolve())
     log(f"\n[bold]📦 Processing: {rel_path_str}[/bold]")
@@ -422,7 +405,6 @@ def process_cbz(cbz_path_obj, conn_main_db, conn_fail_db, cli_args): # Pass cli_
     temp_dir_obj = None
     try:
         temp_dir_obj = Path(tempfile.mkdtemp())
-        # Extraction log removed as per request
 
         if not DRY_RUN:
             try:
@@ -437,30 +419,22 @@ def process_cbz(cbz_path_obj, conn_main_db, conn_fail_db, cli_args): # Pass cli_
                 mark_failed(conn_fail_db, rel_path_str)
                 return 0, False
         
-        # Original size log removed from here
-
         if not DRY_RUN:
             for leftover in temp_dir_obj.rglob("*.converted"):
                 leftover.unlink()
 
-        status, saved_bytes = convert_images(temp_dir_obj)
+        status, saved_bytes, dominant_other_format = convert_images(temp_dir_obj)
         
-        current_cbz_original_size = get_size(cbz_path_obj) # Get original size for all cases for mark_processed
+        current_cbz_original_size = get_size(cbz_path_obj)
 
         flattened_this_archive = False
         if status in [ConversionStatus.PROCESSED_SAVED_SPACE, ConversionStatus.PROCESSED_NO_SPACE_SAVED] or \
-           (DRY_RUN and status not in [ConversionStatus.NO_IMAGES_RECOGNIZED, ConversionStatus.ALREADY_JXL_NO_CONVERTIBLES, ConversionStatus.NO_JPG_PNG_FOUND]):
-            # Only attempt flattening if conversions happened or would have happened.
-            # Don't flatten if it's just JXLs or no convertible images, unless it's a dry run of a conversion scenario.
-            # This logic might need refinement based on whether flattening is desired *regardless* of conversion status.
-            # For now, linking it to actual or potential conversion work.
+           (DRY_RUN and status not in [ConversionStatus.NO_IMAGES_RECOGNIZED, ConversionStatus.ALREADY_JXL_NO_CONVERTIBLES, ConversionStatus.NO_JPG_PNG_FOUND, ConversionStatus.CONTAIN_OTHER_FORMATS]):
             needs_flattening = any(item.is_dir() and item.name not in ['__MACOSX'] and not item.name.startswith('.')
                                    for item in temp_dir_obj.iterdir())
             if needs_flattening:
                 if VERBOSE or DRY_RUN: log("   Archive appears nested, attempting to flatten structure.")
                 flattened_this_archive = flatten_cbz_archive(cbz_path_obj.name, temp_dir_obj)
-            # else:
-            #     if VERBOSE or DRY_RUN: log("   Archive structure is already flat or contains no processable subdirectories.")
 
 
         if status == ConversionStatus.PROCESSED_SAVED_SPACE:
@@ -477,7 +451,7 @@ def process_cbz(cbz_path_obj, conn_main_db, conn_fail_db, cli_args): # Pass cli_
                 reduction_percentage = (saved_bytes / current_cbz_original_size) * 100 if current_cbz_original_size > 0 else 0
                 log(f"   ✅ Converted and repacked (Saved: {saved_bytes / (1024*1024):.2f} MB) ({reduction_percentage:.2f}% Reduction!)")
                 mark_processed(conn_main_db, rel_path_str, current_cbz_original_size, final_size, saved_bytes)
-            else: # DRY_RUN
+            else:
                 final_size_estimate = current_cbz_original_size - saved_bytes
                 reduction_percentage = (saved_bytes / current_cbz_original_size) * 100 if current_cbz_original_size > 0 else 0
                 log(f"   [DRY RUN] Would convert and repack (Saved: {saved_bytes / (1024*1024):.2f} MB) ({reduction_percentage:.2f}% Reduction!)")
@@ -485,12 +459,35 @@ def process_cbz(cbz_path_obj, conn_main_db, conn_fail_db, cli_args): # Pass cli_
             return saved_bytes, flattened_this_archive
 
         elif status == ConversionStatus.PROCESSED_NO_SPACE_SAVED:
-            log(f"   ⚠️ Conversion attempted, but no space saved. Original CBZ retained.")
-            mark_processed(conn_main_db, rel_path_str, current_cbz_original_size, current_cbz_original_size, 0)
-            return 0, flattened_this_archive
+            if not DRY_RUN:
+                new_cbz_path_str = tempfile.mktemp(suffix=".cbz", dir=cbz_path_obj.parent)
+                if VERBOSE: log(f"   Repacking CBZ to: {Path(new_cbz_path_str).name}")
+                with zipfile.ZipFile(new_cbz_path_str, 'w', zipfile.ZIP_DEFLATED) as zip_out:
+                    for file_path in temp_dir_obj.rglob("*"):
+                        if file_path.is_file():
+                            arcname = file_path.relative_to(temp_dir_obj).as_posix()
+                            zip_out.write(file_path, arcname)
+                shutil.move(new_cbz_path_str, cbz_path_obj)
+                final_size = get_size(cbz_path_obj)
+                # Calculate actual bytes saved, which might be negative
+                actual_saved_bytes = current_cbz_original_size - final_size
+                reduction_percentage = (actual_saved_bytes / current_cbz_original_size) * 100 if current_cbz_original_size > 0 else 0
+                log(f"   ✅ Converted and repacked (Actual Change: {actual_saved_bytes / (1024*1024):.2f} MB) ({reduction_percentage:.2f}% Change!)")
+                mark_processed(conn_main_db, rel_path_str, current_cbz_original_size, final_size, actual_saved_bytes)
+            else:
+                final_size_estimate = current_cbz_original_size - saved_bytes # saved_bytes here could be negative
+                reduction_percentage = (saved_bytes / current_cbz_original_size) * 100 if current_cbz_original_size > 0 else 0
+                log(f"   [DRY RUN] Would convert and repack (Actual Change: {saved_bytes / (1024*1024):.2f} MB) ({reduction_percentage:.2f}% Change!)")
+                mark_processed(conn_main_db, rel_path_str, current_cbz_original_size, final_size_estimate, saved_bytes)
+            return saved_bytes, flattened_this_archive
             
         elif status == ConversionStatus.ALREADY_JXL_NO_CONVERTIBLES:
             log(f"   ℹ️  Already JXL")
+            mark_processed(conn_main_db, rel_path_str, current_cbz_original_size, current_cbz_original_size, 0)
+            return 0, flattened_this_archive
+
+        elif status == ConversionStatus.CONTAIN_OTHER_FORMATS:
+            log(f"   ℹ️  Contains {dominant_other_format} images. No JPEG/PNG found for conversion.")
             mark_processed(conn_main_db, rel_path_str, current_cbz_original_size, current_cbz_original_size, 0)
             return 0, flattened_this_archive
 
@@ -504,7 +501,6 @@ def process_cbz(cbz_path_obj, conn_main_db, conn_fail_db, cli_args): # Pass cli_
             mark_processed(conn_main_db, rel_path_str, current_cbz_original_size, current_cbz_original_size, 0)
             return 0, flattened_this_archive
         
-        # Should not be reached if status is handled comprehensively
         return 0, flattened_this_archive
 
     except Exception as e:
@@ -515,15 +511,14 @@ def process_cbz(cbz_path_obj, conn_main_db, conn_fail_db, cli_args): # Pass cli_
         return 0, False
     finally:
         if temp_dir_obj and temp_dir_obj.exists():
-            # Cleanup log removed as per request
             if not DRY_RUN :
                  shutil.rmtree(temp_dir_obj)
-            elif DRY_RUN and (VERBOSE or os.environ.get("CBZJXL_KEEP_DRY_RUN_TEMP")): # Optional: keep temp for debug
+            elif DRY_RUN and (VERBOSE or os.environ.get("CBZJXL_KEEP_DRY_RUN_TEMP")):
                  if not os.environ.get("CBZJXL_KEEP_DRY_RUN_TEMP"):
                     shutil.rmtree(temp_dir_obj)
                  else:
                     log(f"   [DRY RUN] Kept temporary directory for inspection: {temp_dir_obj}")
-            else: # Not DRY_RUN or not VERBOSE in DRY_RUN and no explicit keep flag
+            else:
                  shutil.rmtree(temp_dir_obj)
 
 
@@ -577,7 +572,6 @@ def main():
     conn = init_db(DB_FILE)
     fail_conn = init_db(FAILED_DB_FILE)
 
-    # Resolve input_dir to an absolute path for consistent relative path calculations
     resolved_input_dir = Path(args.input_dir).resolve()
     cbz_files_path_obj_list = list(resolved_input_dir.rglob('*.cbz'))
     total_files = len(cbz_files_path_obj_list)
@@ -609,18 +603,14 @@ def main():
         task_id = progress_bar.add_task("Processing CBZs...", total=total_files)
 
         for cbz_path in cbz_files_path_obj_list:
-            # Use path relative to the initial input_dir for DB keys and simpler logs
             rel_path_for_db = os.path.relpath(cbz_path, resolved_input_dir)
 
-            # The is_processed mtime check was removed for simplicity. Re-evaluate if strict mtime checking is critical.
-            # To re-enable mtime check, is_processed would need the absolute `cbz_path`.
-            if is_processed(conn, rel_path_for_db): # Pass rel_path_for_db as key
+            if is_processed(conn, rel_path_for_db):
                 skipped_count += 1
                 log(f"[yellow]⚠️ Skipping already processed archive: {rel_path_for_db}", msg_type="skipped")
                 progress_bar.update(task_id, advance=1)
                 continue
             
-            # Pass the full `args` object to process_cbz if it needs context like args.input_dir
             bytes_saved_this_cbz, was_flattened = process_cbz(cbz_path, conn, fail_conn, args)
 
             if was_flattened:
@@ -634,10 +624,10 @@ def main():
 
             if failed_check_result:
                 failed_to_process_count +=1
-            elif bytes_saved_this_cbz > 0: # Only count as "converted" if actual space was saved
-                converted_count += 1
-                total_bytes_saved_overall += bytes_saved_this_cbz
-            
+            else: # This branch now covers both space saved and no space saved, as they are both marked as 'processed'
+                converted_count += 1 # Increment converted count if it was processed, regardless of space saved
+                total_bytes_saved_overall += bytes_saved_this_cbz # This can now be negative
+
             progress_bar.update(task_id, advance=1)
 
     if conn: conn.close()
@@ -645,12 +635,19 @@ def main():
 
     log("\n🎉 [bold green]Conversion process finished![/bold green]")
     log(f"   Total archives found:     {total_files}")
-    log(f"   Archives converted:       {converted_count} (where space was saved)")
+    log(f"   Archives converted:       {converted_count} (where space was saved or conversion occurred)") # Updated wording
     log(f"   Archives flattened:       {flattened_archives_count}")
     log(f"   Skipped (already done):   {skipped_count}")
     log(f"   Failed to process:        {failed_to_process_count}")
-    log(f"   Total space saved:        {total_bytes_saved_overall / (1024 ** 3):.3f} GB "
-        f"({total_bytes_saved_overall / (1024 ** 2):.2f} MB)")
+    
+    # Adjust reporting for total space saved, as it can now be negative
+    if total_bytes_saved_overall >= 0:
+        log(f"   Total space saved:        {total_bytes_saved_overall / (1024 ** 3):.3f} GB "
+            f"({total_bytes_saved_overall / (1024 ** 2):.2f} MB)")
+    else:
+        log(f"   Total space increased by: {-total_bytes_saved_overall / (1024 ** 3):.3f} GB "
+            f"({-total_bytes_saved_overall / (1024 ** 2):.2f} MB)")
+
     log(f"Log file written to: {Path(LOG_FILE).resolve()}")
     if DRY_RUN:
         console.print("[bold yellow]DRY RUN COMPLETE[/bold yellow] - No actual changes were made to files or databases.")
