@@ -233,10 +233,22 @@ def convert_single_image(img_path_obj):
         log(f"   Would convert image to JXL: {img_path_obj.name} (Effort: {JXL_EFFORT})")
         return 0
 
-    try:
-        cjxl_cmd = ["cjxl", "-d", "0", f"--effort={JXL_EFFORT}", img_path_str, str(jxl_path)]
-        result = subprocess.run(cjxl_cmd, capture_output=True, text=True)
+    # First attempt at conversion
+    cjxl_cmd = ["cjxl", "-d", "0", f"--effort={JXL_EFFORT}", img_path_str, str(jxl_path)]
+    result = subprocess.run(cjxl_cmd, capture_output=True, text=True)
 
+    # Check for specific error and re-attempt with --allow_jpeg_reconstruction 0
+    if result.returncode != 0 and "JPEG bitstream reconstruction data could not be created" in result.stderr:
+        log(f"[yellow]   ⚠️ Retrying {img_path_obj.name} with --allow_jpeg_reconstruction 0 due to error: {result.stderr.strip()}", level="error")
+        # Clean up any partial JXL file from failed attempt
+        if jxl_path.exists():
+            os.remove(jxl_path)
+        
+        cjxl_cmd_retry = ["cjxl", "-d", "0", f"--effort={JXL_EFFORT}", "--allow_jpeg_reconstruction", "0", img_path_str, str(jxl_path)]
+        result = subprocess.run(cjxl_cmd_retry, capture_output=True, text=True)
+
+
+    try:
         if result.returncode == 0 and jxl_path.exists() and get_size(jxl_path) > 0:
             saved = orig_size - get_size(jxl_path)
             # Always remove original if JXL conversion was successful, regardless of space saved
