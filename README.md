@@ -20,6 +20,10 @@ This Python script unpacks CBZ archives and converts .JPEG and .PNG files to JXL
 - `--backup` creates backups of the CBZ archives
 - `--dry-run`
 
+## Visualise.py
+
+Can be run using `python visualise.py` and will look for a appropriately named .db file in the working directory and use that to print some statistics inside the terminal.
+
 ## Caveats
 
 The script is pretty unsophisticated and it's up to the user to have `magic`, `cjxl` etc in their path for the script to use. As far as I can tell, it catches every edge case you're likely to encounter. 
