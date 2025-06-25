@@ -6,19 +6,26 @@ This Python script unpacks CBZ archives and converts .JPEG and .PNG files to JXL
 
 - Converts JPEG and PNG to JXL losslessly
 - Renames incorrect extensions using MIME type
-- Corrects atypical or unusual colour space or metadata
+- Corrects atypical or unusual colour spaces or metadata
 - SQLite to skip reviously processed archives
 - Basic logging
 - Basic acrhive error handling
+- User configurable timeout
 
 ## Usage
 
-- `--verbose` for more info including per archive savings and percent saved. I recommend you pass this flag
-- `--suppress-skipped` overrides `--verbose` and supresses any messages indicating when an archive has been skipped
-- `--effort` overrides the default effort level of `9`
+- `--effort` overrides the default effort level of `10`
 - `--threads` overrides the default of `10` threads
+- `--verbose` for more info including per archive savings and percent saved. I recommend you pass this flag
+- `--quiet` supresses all console messages except for critical errors
+- `--suppress-skipped` overrides `--verbose` and supresses any messages indicating when an archive has been skipped
 - `--backup` creates backups of the CBZ archives
 - `--dry-run`
+- `--no-flatten` prevents the script from flattening internal archive structure
+- `--no-convert` prevent conversion to JXL but allows all other functions (including flattening)
+- `--stats` displayes database statistics
+- `--reprocess-failed`
+- `--reset-db` will delete both databases and allow the script to reinspect each archive from scratch
 
 ## Visualise.py
 
