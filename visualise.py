@@ -1,129 +1,179 @@
 import sqlite3
 import os
+import pandas as pd
+import matplotlib.pyplot as plt
 from rich.console import Console
 from rich.table import Table
-from enum import Enum
 
-# Fixed Constants (should match the original script)
+# --- Constants ---
+# These should match the constants in your main processing script
 DB_FILE = "converted_archives.db"
 FAILED_DB_FILE = "failed_archives.db"
 
+# --- Initial Setup ---
 console = Console()
+# Set a style for the plots
+plt.style.use('seaborn-v0_8-whitegrid')
 
-class ConversionStatus(Enum):
-    PROCESSED_SAVED_SPACE = 1
-    PROCESSED_NO_SPACE_SAVED = 2
-    ALREADY_JXL_NO_CONVERTIBLES = 3
-    NO_JPG_PNG_FOUND = 4
-    NO_IMAGES_RECOGNIZED = 5
-    CONTAIN_OTHER_FORMATS = 6
 
-def get_db_connection(db_path):
-    """Establishes a connection to the SQLite database."""
-    if not os.path.exists(db_path):
-        console.print(f"[red]Error: Database file not found at '{db_path}'[/red]")
-        return None
-    try:
-        conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row # Allows access to columns by name
-        return conn
-    except sqlite3.Error as e:
-        console.print(f"[red]Error connecting to database '{db_path}': {e}[/red]")
-        return None
+def load_dataframes():
+    """Loads data from both databases into pandas DataFrames."""
+    processed_df = None
+    failed_df = None
 
-def analyze_conversion_data():
-    console.print(f"\n[bold green]--- Analyzing Conversion Data from {DB_FILE} ---[/bold green]")
+    if os.path.exists(DB_FILE):
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            processed_df = pd.read_sql_query("SELECT * FROM converted_archives", conn)
+            console.print(f"[green]Successfully loaded {len(processed_df)} records from '{DB_FILE}'[/green]")
+            conn.close()
+        except sqlite3.Error as e:
+            console.print(f"[red]Error reading database '{DB_FILE}': {e}[/red]")
+    else:
+        console.print(f"[yellow]Warning: Database file not found at '{DB_FILE}'[/yellow]")
 
-    conn = get_db_connection(DB_FILE)
-    if not conn:
+    if os.path.exists(FAILED_DB_FILE):
+        try:
+            conn = sqlite3.connect(FAILED_DB_FILE)
+            failed_df = pd.read_sql_query("SELECT * FROM converted_archives", conn)
+            console.print(f"[green]Successfully loaded {len(failed_df)} records from '{FAILED_DB_FILE}'[/green]")
+            conn.close()
+        except sqlite3.Error as e:
+            console.print(f"[red]Error reading database '{FAILED_DB_FILE}': {e}[/red]")
+    else:
+        console.print(f"[yellow]Warning: Database file not found at '{FAILED_DB_FILE}'[/yellow]")
+
+    return processed_df, failed_df
+
+
+def display_statistics(df):
+    """Calculates and displays detailed statistics using a Rich table."""
+    console.print("\n[bold cyan]--- Detailed Statistics ---[/bold cyan]")
+
+    if df.empty:
+        console.print("[yellow]No data available for statistics.[/yellow]")
         return
 
-    try:
-        # 1. Get and display table fields
-        cursor = conn.execute("PRAGMA table_info(converted_archives)")
-        fields = [row['name'] for row in cursor.fetchall()]
-        console.print("\n[bold blue]Fields in 'converted_archives' table:[/bold blue]")
-        for field in fields:
-            console.print(f"- {field}")
+    # Calculate statistics
+    total_saved_mb = df['bytes_saved'].sum() / (1024 * 1024)
+    mean_percent_saved = df['percent_saved'].mean()
+    median_percent_saved = df['percent_saved'].median()
+    max_percent_saved = df['percent_saved'].max()
+    min_percent_saved = df['percent_saved'].min()
+    
+    # Get top 5 best and worst conversions by percentage
+    top_5_best = df.nlargest(5, 'percent_saved')
+    top_5_worst = df.nsmallest(5, 'percent_saved')
 
-        # 2. Query for data analysis
-        query = "SELECT path, original_size, final_size, bytes_saved, percent_saved, status FROM converted_archives"
-        data = conn.execute(query).fetchall()
+    # Create and populate the main stats table
+    stats_table = Table(title="Conversion Summary")
+    stats_table.add_column("Metric", style="cyan")
+    stats_table.add_column("Value", style="magenta")
+    
+    stats_table.add_row("Total Space Saved", f"{total_saved_mb:.2f} MB")
+    stats_table.add_row("Average Saving Percentage", f"{mean_percent_saved:.2f}%")
+    stats_table.add_row("Median Saving Percentage", f"{median_percent_saved:.2f}%")
+    stats_table.add_row("Best Saving Percentage", f"{max_percent_saved:.2f}%")
+    stats_table.add_row("Worst Saving Percentage", f"{min_percent_saved:.2f}%")
+    
+    console.print(stats_table)
 
-        if not data:
-            console.print("\n[yellow]No conversion data found in the database.[/yellow]")
-            return
-
-        total_bytes_saved_overall = 0
-        total_bytes_saved_from_converted = 0
-        jxl_archives_count = 0
-        other_image_type_archives_count = 0
-        total_processed_archives = 0
-
-        # Detailed breakdown of archive types
-        status_counts = {status.name: 0 for status in ConversionStatus}
-        status_counts['failed'] = 0 # Include failed archives
-        status_counts['unknown_status'] = 0 # For any status not explicitly handled by enum
-
-        for row in data:
-            status = row['status']
-            bytes_saved = row['bytes_saved'] if row['bytes_saved'] is not None else 0
-            
-            total_bytes_saved_overall += bytes_saved
-
-            if status == 'processed':
-                total_processed_archives += 1
-                if bytes_saved > 0:
-                    total_bytes_saved_from_converted += bytes_saved
-            
-            if status == ConversionStatus.ALREADY_JXL_NO_CONVERTIBLES.name:
-                jxl_archives_count += 1
-                status_counts[status] += 1
-            elif status == ConversionStatus.CONTAIN_OTHER_FORMATS.name or \
-                 status == ConversionStatus.NO_JPG_PNG_FOUND.name or \
-                 status == ConversionStatus.NO_IMAGES_RECOGNIZED.name:
-                other_image_type_archives_count += 1
-                status_counts[status] += 1
-            elif status == 'failed':
-                status_counts['failed'] += 1
-            elif status in status_counts: # For PROCESSED_SAVED_SPACE and PROCESSED_NO_SPACE_SAVED
-                status_counts[status] += 1
-            else:
-                status_counts['unknown_status'] += 1
-
-
-        console.print("\n[bold blue]--- Summary Statistics ---[/bold blue]")
-        console.print(f"Total Archives Recorded: {len(data)}")
-
-        if total_bytes_saved_overall >= 0:
-            console.print(f"Total Space Saved (Overall): [green]{total_bytes_saved_overall / (1024**3):.3f} GB[/green] ({total_bytes_saved_overall / (1024**2):.2f} MB)")
-        else:
-            console.print(f"Total Space [red]Increased[/red] by (Overall): [red]{-total_bytes_saved_overall / (1024**3):.3f} GB[/red] ({-total_bytes_saved_overall / (1024**2):.2f} MB)")
+    # Create and populate the "Top 5 Best" table
+    best_table = Table(title="Top 5 Best Conversions (by % Saved)")
+    best_table.add_column("File Path", style="green", no_wrap=True)
+    best_table.add_column("% Saved", style="magenta")
+    for _, row in top_5_best.iterrows():
+        best_table.add_row(row['path'], f"{row['percent_saved']:.2f}%")
+    
+    console.print(best_table)
+    
+    # Create and populate the "Top 5 Worst" table
+    worst_table = Table(title="Top 5 Worst Conversions (by % Saved)")
+    worst_table.add_column("File Path", style="red", no_wrap=True)
+    worst_table.add_column("% Saved", style="magenta")
+    for _, row in top_5_worst.iterrows():
+        worst_table.add_row(row['path'], f"{row['percent_saved']:.2f}%")
         
-        console.print(f"Total Space Saved (from successfully converted archives with positive saving): [green]{total_bytes_saved_from_converted / (1024**3):.3f} GB[/green] ({total_bytes_saved_from_converted / (1024**2):.2f} MB)")
+    console.print(worst_table)
+
+
+def plot_savings_distribution(df):
+    """Plots a histogram of the saving percentages."""
+    if df.empty or 'percent_saved' not in df.columns:
+        return
         
-        console.print("\n[bold blue]--- Archive Type Breakdown ---[/bold blue]")
-        table = Table(title="Archive Processing Status Counts")
-        table.add_column("Status", style="cyan")
-        table.add_column("Count", style="magenta")
+    plt.figure(figsize=(10, 6))
+    df['percent_saved'].plot(kind='hist', bins=30, color='skyblue', ec='black')
+    plt.title('Distribution of Saving Percentages', fontsize=16)
+    plt.xlabel('Saving Percentage (%)', fontsize=12)
+    plt.ylabel('Number of Archives', fontsize=12)
+    plt.axvline(df['percent_saved'].mean(), color='red', linestyle='dashed', linewidth=2, label=f"Mean: {df['percent_saved'].mean():.2f}%")
+    plt.legend()
+    plt.tight_layout()
+    console.print("\n[bold]Displaying plot 1: Distribution of Saving Percentages...[/bold]")
+    plt.show()
 
-        for status_name, count in status_counts.items():
-            table.add_row(status_name, str(count))
+
+def plot_size_vs_savings(df):
+    """Plots original file size vs. saving percentage."""
+    if df.empty or 'percent_saved' not in df.columns:
+        return
+
+    # Create a new column for original size in MB for better plotting
+    df['original_size_mb'] = df['original_size'] / (1024 * 1024)
+
+    plt.figure(figsize=(10, 6))
+    plt.scatter(df['original_size_mb'], df['percent_saved'], alpha=0.5)
+    plt.title('Original File Size vs. Saving Percentage', fontsize=16)
+    plt.xlabel('Original File Size (MB)', fontsize=12)
+    plt.ylabel('Saving Percentage (%)', fontsize=12)
+    plt.xscale('log') # Use a log scale for size as it can vary greatly
+    plt.tight_layout()
+    console.print("[bold]Displaying plot 2: Original Size vs. Saving Percentage...[/bold]")
+    plt.show()
+
+
+def plot_summary_pie(processed_count, failed_count):
+    """Plots a pie chart of processed vs. failed archives."""
+    if processed_count == 0 and failed_count == 0:
+        return
         
-        console.print(table)
+    labels = 'Processed', 'Failed'
+    sizes = [processed_count, failed_count]
+    colors = ['lightgreen', 'lightcoral']
+    explode = (0.1, 0) if processed_count > 0 else (0, 0)
 
-        if jxl_archives_count > 0 or other_image_type_archives_count > 0:
-            ratio = jxl_archives_count / (other_image_type_archives_count + jxl_archives_count) if (other_image_type_archives_count + jxl_archives_count) > 0 else 0
-            console.print(f"\nRatio of 'Already JXL' archives to 'Other Image Types': [bold]{jxl_archives_count}:{other_image_type_archives_count}[/bold] (Approx. {ratio:.2f} JXL per non-JXL image archive)")
-        else:
-            console.print("\nNo 'Already JXL' or 'Other Image Types' archives found to calculate ratio.")
+    plt.figure(figsize=(8, 8))
+    plt.pie(sizes, explode=explode, labels=labels, colors=colors, autopct='%1.1f%%',
+            shadow=True, startangle=140)
+    plt.axis('equal')  # Equal aspect ratio ensures that pie is drawn as a circle.
+    plt.title('Overall Summary: Processed vs. Failed Archives', fontsize=16)
+    console.print("[bold]Displaying plot 3: Overall Summary Pie Chart...[/bold]")
+    plt.show()
 
 
-    except sqlite3.Error as e:
-        console.print(f"[red]Database query error: {e}[/red]")
-    finally:
-        if conn:
-            conn.close()
+def main():
+    """Main function to run the analysis."""
+    console.print("\n[bold green]--- Conversion Data Visualizer ---[/bold green]")
+    processed_df, failed_df = load_dataframes()
+
+    processed_count = len(processed_df) if processed_df is not None else 0
+    failed_count = len(failed_df) if failed_df is not None else 0
+
+    if processed_count > 0:
+        display_statistics(processed_df)
+        
+        # Generate Plots
+        plot_savings_distribution(processed_df.copy())
+        plot_size_vs_savings(processed_df.copy())
+        plot_summary_pie(processed_count, failed_count)
+    else:
+        console.print("\n[yellow]No processed archives found to generate statistics or plots.[/yellow]")
+        if failed_count > 0:
+            plot_summary_pie(processed_count, failed_count)
+
+    console.print("\n[bold green]--- Analysis Complete ---[/bold green]")
+
 
 if __name__ == "__main__":
-    analyze_conversion_data()
+    main()
