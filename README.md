@@ -9,7 +9,7 @@ This Python script unpacks CBZ archives and converts .JPEG and .PNG files to JXL
 - Corrects atypical or unusual colour spaces or metadata
 - SQLite to skip reviously processed archives
 - Basic logging
-- Basic acrhive error handling
+- Basic archive error handling
 - User configurable timeout
 
 ## Usage
