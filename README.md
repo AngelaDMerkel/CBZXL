@@ -23,7 +23,7 @@ This Python script unpacks CBZ archives and converts .JPEG and .PNG files to JXL
 - `--dry-run`
 - `--no-flatten` prevents the script from flattening internal archive structure
 - `--no-convert` prevent conversion to JXL but allows all other functions (including flattening)
-- `--stats` displayes database statistics
+- `--stats` displays database statistics
 - `--reprocess-failed`
 - `--reset-db` will delete both databases and allow the script to reinspect each archive from scratch
 
