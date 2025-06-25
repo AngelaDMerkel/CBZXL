@@ -33,7 +33,6 @@ BACKUP_ENABLED = False
 JXL_EFFORT = DEFAULT_JXL_EFFORT
 THREADS = DEFAULT_THREADS
 
-
 class ConversionStatus(Enum):
     PROCESSED_SAVED_SPACE = auto()
     PROCESSED_NO_SPACE_SAVED = auto()
@@ -538,11 +537,28 @@ def main():
     # --- Database Utilities ---
     db_group = parser.add_argument_group('Database Utilities')
     db_group.add_argument("--stats", action="store_true", help="Show conversion stats from the database and exit.")
-    db_group.add_argument("--reprocess-failed", action="store_true", help="Delete the failed DB to allow reprocessing of failed items.")
+    db_group.add_argument("--reprocess-failed", action="store_true", help="Run processing only on files listed in the failed DB.")
     db_group.add_argument("--reset-db", action="store_true", help="Delete both databases to reprocess everything.")
 
 
     args = parser.parse_args()
+    
+    # --- Set Global Configs ---
+    DRY_RUN = args.dry_run
+    if args.quiet:
+        VERBOSE = False
+        SUPPRESS_SKIPPED = True
+    else:
+        VERBOSE = args.verbose or DRY_RUN
+        SUPPRESS_SKIPPED = args.suppress_skipped
+
+    BACKUP_ENABLED = args.backup
+    JXL_EFFORT = args.effort
+    THREADS = args.threads
+
+    if DRY_RUN:
+        console.print("[bold yellow] DRY RUN MODE ENABLED [/bold yellow] - No actual changes will be made.")
+        VERBOSE = True
 
     # --- Handle Utility Modes First ---
     if args.stats:
@@ -588,35 +604,55 @@ def main():
         return 0
 
     if args.reprocess_failed:
-        console.print(f"[bold yellow]This will delete the failed archives database ('{FAILED_DB_FILE}') to allow them to be reprocessed.[/bold yellow]")
+        log(" reprocessing failed archives...")
+        if not os.path.exists(FAILED_DB_FILE):
+            log("[green]No failed archives database found. Nothing to reprocess.[/green]")
+            return 0
+        
+        temp_fail_conn = sqlite3.connect(FAILED_DB_FILE)
         try:
-            if os.path.exists(FAILED_DB_FILE):
-                os.remove(FAILED_DB_FILE)
-                console.print(f"[green]'{FAILED_DB_FILE}' has been deleted. Failed items will be reprocessed on the next run.[/green]")
-            else:
-                console.print(f"'{FAILED_DB_FILE}' not found. Nothing to do.")
-        except OSError as e:
-            console.print(f"[red]Error deleting failed database: {e}[/red]")
+            failed_paths = [row[0] for row in temp_fail_conn.execute("SELECT path FROM converted_archives")]
+        except sqlite3.Error as e:
+            log(f"[red]Could not read from failed archives database: {e}[/red]")
+            temp_fail_conn.close()
+            return 1
+        finally:
+            temp_fail_conn.close()
+
+        if not failed_paths:
+            log("[green]No failed archives to reprocess.[/green]")
+            return 0
+
+        log(f"Attempting to reprocess {len(failed_paths)} failed archives.")
+        conn = init_db(DB_FILE)
+        fail_conn = init_db(FAILED_DB_FILE)
+        
+        with Progress(SpinnerColumn(), TextColumn("[cyan]{task.description}[/cyan]"), BarColumn(), TextColumn("{task.completed}/{task.total} archives"), TimeRemainingColumn(), console=console, disable=args.quiet and not DRY_RUN) as progress_bar:
+            task_id = progress_bar.add_task("Reprocessing...", total=len(failed_paths))
+
+            for rel_path in failed_paths:
+                cbz_path = Path(args.input_dir).resolve() / rel_path
+                if not cbz_path.exists():
+                    log(f"[yellow]⚠️ Skipping '{rel_path}' as it no longer exists.[/yellow]")
+                    fail_conn.execute("DELETE FROM converted_archives WHERE path = ?", (rel_path,))
+                    fail_conn.commit()
+                    progress_bar.update(task_id, advance=1)
+                    continue
+
+                # Remove from failed DB before processing. It will be re-added if it fails again.
+                fail_conn.execute("DELETE FROM converted_archives WHERE path = ?", (rel_path,))
+                fail_conn.commit()
+                
+                process_cbz(cbz_path, conn, fail_conn, args)
+                progress_bar.update(task_id, advance=1)
+        
+        if conn: conn.close()
+        if fail_conn: fail_conn.close()
+        log("[bold green]Finished reprocessing failed archives.[/bold green]")
         return 0
 
 
     # --- Main Processing Logic ---
-    DRY_RUN = args.dry_run
-    if args.quiet:
-        VERBOSE = False
-        SUPPRESS_SKIPPED = True
-    else:
-        VERBOSE = args.verbose or DRY_RUN
-        SUPPRESS_SKIPPED = args.suppress_skipped
-
-    BACKUP_ENABLED = args.backup
-    JXL_EFFORT = args.effort
-    THREADS = args.threads
-
-    if DRY_RUN:
-        console.print("[bold yellow] DRY RUN MODE ENABLED [/bold yellow] - No actual changes will be made.")
-        VERBOSE = True
-
     for tool in ["cjxl", "magick", "identify", "file"]:
         if not shutil.which(tool):
             log(f"[red]❌ CRITICAL: '{tool}' command not found. Please ensure it is installed and in your system's PATH.", level="error")
