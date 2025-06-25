@@ -54,9 +54,17 @@ def display_statistics(df):
         console.print("[yellow]No data available for statistics.[/yellow]")
         return
 
-    # Calculate statistics
+    # --- Calculate statistics ---
     total_saved_mb = df['bytes_saved'].sum() / (1024 * 1024)
-    mean_percent_saved = df['percent_saved'].mean()
+    
+    # Filter for mean calculation as per user request
+    df_for_mean = df[df['percent_saved'] >= 0.5]
+    if not df_for_mean.empty:
+        mean_percent_saved = df_for_mean['percent_saved'].mean()
+    else:
+        mean_percent_saved = 0.0 # Default to 0 if no files meet the criteria
+
+    # Other stats use the full dataset
     median_percent_saved = df['percent_saved'].median()
     max_percent_saved = df['percent_saved'].max()
     min_percent_saved = df['percent_saved'].min()
@@ -71,8 +79,8 @@ def display_statistics(df):
     stats_table.add_column("Value", style="magenta")
     
     stats_table.add_row("Total Space Saved", f"{total_saved_mb:.2f} MB")
-    stats_table.add_row("Average Saving Percentage", f"{mean_percent_saved:.2f}%")
-    stats_table.add_row("Median Saving Percentage", f"{median_percent_saved:.2f}%")
+    stats_table.add_row("Average Saving Percentage (>=0.5%)", f"{mean_percent_saved:.2f}%")
+    stats_table.add_row("Median Saving Percentage (all files)", f"{median_percent_saved:.2f}%")
     stats_table.add_row("Best Saving Percentage", f"{max_percent_saved:.2f}%")
     stats_table.add_row("Worst Saving Percentage", f"{min_percent_saved:.2f}%")
     
