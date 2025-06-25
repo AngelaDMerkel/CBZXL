@@ -29,7 +29,7 @@ This Python script unpacks CBZ archives and converts .JPEG and .PNG files to JXL
 
 ## Visualise.py
 
-Can be run using `python visualise.py` and will look for a appropriately named .db file in the working directory and use that to print some statistics inside the terminal.
+Can be run using `python visualise.py` and will look for a appropriately named .db file in the working directory and use that to print some statistics inside the terminal. Additionally, `--html-report MyConversionReport.html` can be appended to write an HTML file containing both the statistics normally output to the console alongside embedded graphs. 
 
 ## Caveats
 
