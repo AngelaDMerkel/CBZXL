@@ -6,7 +6,6 @@ from rich.console import Console
 from rich.table import Table
 
 # --- Constants ---
-# These should match the constants in your main processing script
 DB_FILE = "converted_archives.db"
 FAILED_DB_FILE = "failed_archives.db"
 
