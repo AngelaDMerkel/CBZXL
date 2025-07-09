@@ -28,10 +28,13 @@ VERBOSE = True
 SUPPRESS_SKIPPED = False
 DRY_RUN = False
 BACKUP_ENABLED = False
+RECHECK_ALL = False  # New global variable for recheck-all feature
+DELETE_EMPTY_ARCHIVES = False # New global variable for deleting empty archives
 
 # These will be populated from args or defaults
 JXL_EFFORT = DEFAULT_JXL_EFFORT
 THREADS = DEFAULT_THREADS
+
 
 class ConversionStatus(Enum):
     PROCESSED_SAVED_SPACE = auto()
@@ -66,6 +69,7 @@ def init_db(db_path):
         return None
     conn = sqlite3.connect(db_path)
     with conn:
+        # UPDATED: Added dominant_type column to the schema
         conn.execute("""
             CREATE TABLE IF NOT EXISTS converted_archives (
                 path TEXT PRIMARY KEY,
@@ -74,26 +78,29 @@ def init_db(db_path):
                 bytes_saved INTEGER,
                 percent_saved REAL,
                 converted_at TEXT,
-                status TEXT DEFAULT 'processed'
+                status TEXT DEFAULT 'processed',
+                dominant_type TEXT
             )
         """)
     return conn
 
 
-def mark_processed(conn, path_str, original_size, final_size, saved_bytes):
+def mark_processed(conn, path_str, original_size, final_size, saved_bytes, dominant_type):
     """Mark an archive as processed with metadata"""
     if DRY_RUN or conn is None:
-        log(f"Would mark as processed: {path_str} (Original: {original_size}, Final: {final_size}, Saved: {saved_bytes})")
+        log(f"Would mark as processed: {path_str} (Original: {original_size}, Final: {final_size}, Saved: {saved_bytes}, Type: {dominant_type})")
         return
 
     percent_saved = (saved_bytes / original_size) * 100 if original_size > 0 else 0
     converted_at_iso = datetime.now().isoformat()
     try:
+        # UPDATED: Added dominant_type to the INSERT statement
+        # Use INSERT OR REPLACE to allow re-processing and updating entries
         conn.execute("""
             INSERT OR REPLACE INTO converted_archives
-            (path, original_size, final_size, bytes_saved, percent_saved, converted_at, status)
-            VALUES (?, ?, ?, ?, ?, ?, 'processed')
-        """, (path_str, original_size, final_size, saved_bytes, percent_saved, converted_at_iso))
+            (path, original_size, final_size, bytes_saved, percent_saved, converted_at, status, dominant_type)
+            VALUES (?, ?, ?, ?, ?, ?, 'processed', ?)
+        """, (path_str, original_size, final_size, saved_bytes, percent_saved, converted_at_iso, dominant_type))
         conn.commit()
     except sqlite3.DatabaseError as e:
         log(f"[red]❌ Failed to mark as processed in DB: {path_str} — {e}", level="error")
@@ -105,6 +112,7 @@ def mark_failed(conn, path_str):
         log(f"Would mark as FAILED: {path_str}")
         return
     try:
+        # Use INSERT OR REPLACE to allow re-processing and updating entries
         conn.execute("""
             INSERT OR REPLACE INTO converted_archives (path, status, converted_at) VALUES (?, 'failed', ?)
         """, (path_str, datetime.now().isoformat()))
@@ -269,8 +277,14 @@ def convert_images(temp_dir_path): # temp_dir_path is Path object
     convertible_paths = [] # jpg, png
     jxl_paths = []
     other_image_paths = [] # webp, avif, gif, tiff, etc.
+    
+    # UPDATED: Added logic to count original image types
+    jpg_count = 0
+    png_count = 0
+    dominant_type = "N/A"
 
-    known_convertible_exts = ('.jpg', '.jpeg', '.png')
+    known_jpg_exts = ('.jpg', '.jpeg')
+    known_png_exts = ('.png',)
     known_jxl_exts = ('.jxl',)
     known_other_image_exts = ('.webp', '.avif', '.gif', '.tiff', '.bmp')
 
@@ -278,16 +292,28 @@ def convert_images(temp_dir_path): # temp_dir_path is Path object
         if not p.is_file():
             continue
         ext = p.suffix.lower()
-        if ext in known_convertible_exts:
+        if ext in known_jpg_exts:
             convertible_paths.append(p)
+            jpg_count += 1
+        elif ext in known_png_exts:
+            convertible_paths.append(p)
+            png_count += 1
         elif ext in known_jxl_exts:
             jxl_paths.append(p)
         elif ext in known_other_image_exts:
             other_image_paths.append(p)
 
+    if jpg_count > png_count:
+        dominant_type = "JPG"
+    elif png_count > jpg_count:
+        dominant_type = "PNG"
+    elif jpg_count > 0: # They are equal and non-zero
+        dominant_type = "Mixed"
+
+
     if not convertible_paths:
         if jxl_paths:
-            return ConversionStatus.ALREADY_JXL_NO_CONVERTIBLES, 0, ""
+            return ConversionStatus.ALREADY_JXL_NO_CONVERTIBLES, 0, "", dominant_type
         elif other_image_paths:
             ext_counts = {}
             for p in other_image_paths:
@@ -296,11 +322,11 @@ def convert_images(temp_dir_path): # temp_dir_path is Path object
             
             if ext_counts:
                 most_frequent_ext = max(ext_counts, key=ext_counts.get)
-                return ConversionStatus.CONTAIN_OTHER_FORMATS, 0, most_frequent_ext[1:].upper()
+                return ConversionStatus.CONTAIN_OTHER_FORMATS, 0, most_frequent_ext[1:].upper(), dominant_type
             else:
-                return ConversionStatus.NO_JPG_PNG_FOUND, 0, ""
+                return ConversionStatus.NO_JPG_PNG_FOUND, 0, "", dominant_type
         else:
-            return ConversionStatus.NO_IMAGES_RECOGNIZED, 0, ""
+            return ConversionStatus.NO_IMAGES_RECOGNIZED, 0, "", dominant_type
 
     if VERBOSE or DRY_RUN:
         log(f"   Found {len(convertible_paths)} JPEG/PNG images for potential conversion...")
@@ -316,9 +342,9 @@ def convert_images(temp_dir_path): # temp_dir_path is Path object
                 log(f"[red]❌ Error processing image {path_obj.name} in thread: {e}", level="error")
 
     if total_saved > 0:
-        return ConversionStatus.PROCESSED_SAVED_SPACE, total_saved, ""
+        return ConversionStatus.PROCESSED_SAVED_SPACE, total_saved, "", dominant_type
     else: 
-        return ConversionStatus.PROCESSED_NO_SPACE_SAVED, total_saved, ""
+        return ConversionStatus.PROCESSED_NO_SPACE_SAVED, total_saved, "", dominant_type
 
 
 def flatten_cbz_archive(cbz_path_for_log, temp_dir_path):
@@ -400,11 +426,14 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args):
         except Exception as e:
             log(f"[red]❌ Failed to backup {rel_path_str}: {e}", level="error")
             mark_failed(conn_fail, rel_path_str)
-            return 0, False
+            return 0, False, False # Add an extra return value for was_deleted
+
     elif BACKUP_ENABLED and DRY_RUN:
         log(f"   [DRY RUN] Would backup original to {cbz_path_obj.name}.bak")
 
     temp_dir_obj = None
+    original_cbz_size = get_size(cbz_path_obj)
+    
     try:
         temp_dir_obj = Path(tempfile.mkdtemp())
 
@@ -415,11 +444,11 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args):
             except zipfile.BadZipFile:
                 log(f"[red]❌ Corrupt CBZ archive: {rel_path_str}", level="error")
                 mark_failed(conn_fail, rel_path_str)
-                return 0, False
+                return 0, False, False
             except Exception as e:
                 log(f"[red]❌ Failed to extract {rel_path_str}: {e}", level="error")
                 mark_failed(conn_fail, rel_path_str)
-                return 0, False
+                return 0, False, False
         
         if not DRY_RUN:
             # Feature: Clean up any leftover .converted placeholder files
@@ -431,8 +460,12 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args):
         conversion_saved_bytes = 0
         
         # --- Conversion Step ---
+        dominant_type = "N/A"
+        conversion_status = ConversionStatus.NO_IMAGES_RECOGNIZED # Default
         if not cli_args.no_convert:
-            status, saved_bytes, dominant_other_format = convert_images(temp_dir_obj)
+            # UPDATED: Capture dominant_type from function call
+            status, saved_bytes, dominant_other_format, dominant_type = convert_images(temp_dir_obj)
+            conversion_status = status
             conversion_saved_bytes = saved_bytes
             if status in (ConversionStatus.PROCESSED_SAVED_SPACE, ConversionStatus.PROCESSED_NO_SPACE_SAVED):
                 action_taken = True
@@ -448,8 +481,31 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args):
         else:
             log("   ⏩ Conversion skipped by user command.")
 
+        # --- Delete Empty Archives Feature ---
+        was_deleted = False
+        if DELETE_EMPTY_ARCHIVES and conversion_status == ConversionStatus.NO_IMAGES_RECOGNIZED:
+            log(f"[yellow]   🗑️  Archive '{rel_path_str}' contains no recognized images. Initiating deletion...[/yellow]")
+            if not DRY_RUN:
+                try:
+                    os.remove(cbz_path_obj)
+                    log(f"[green]   ✅ Deleted empty archive: {rel_path_str}[/green]")
+                    was_deleted = True
+                    # Mark as processed with 0 size and 0 bytes saved, but status indicates deletion reason
+                    mark_processed(conn_main, rel_path_str, original_cbz_size, 0, 0, "DELETED_NO_IMAGES")
+                    return 0, False, was_deleted # Return saved bytes, was_flattened, was_deleted
+                except Exception as e:
+                    log(f"[red]❌ Failed to delete empty archive {rel_path_str}: {e}", level="error")
+                    mark_failed(conn_fail, rel_path_str)
+                    return 0, False, False
+            else:
+                log(f"[DRY RUN]   Would delete empty archive: {rel_path_str}")
+                mark_processed(conn_main, rel_path_str, original_cbz_size, 0, 0, "WOULD_DELETE_NO_IMAGES")
+                return 0, False, True # In dry run, simulate deletion for stats
+        
+        if was_deleted: # If it was deleted, no further processing needed for this archive
+            return 0, False, True
+
         # --- Flattening Step ---
-        original_cbz_size = get_size(cbz_path_obj)
         flattened_this_archive = False
         if not cli_args.no_flatten:
             needs_flattening = any(item.is_dir() for item in temp_dir_obj.iterdir())
@@ -475,16 +531,17 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args):
                 actual_saved_bytes = original_cbz_size - final_size
                 reduction_percentage = (actual_saved_bytes / original_cbz_size) * 100 if original_cbz_size > 0 else 0
                 log(f"   ✅ Repacked. Final Size: {final_size / (1024*1024):.2f} MB. Change: {actual_saved_bytes / (1024*1024):.2f} MB ({reduction_percentage:.2f}%)")
-                mark_processed(conn_main, rel_path_str, original_cbz_size, final_size, actual_saved_bytes)
-                return actual_saved_bytes, flattened_this_archive
+                mark_processed(conn_main, rel_path_str, original_cbz_size, final_size, actual_saved_bytes, dominant_type)
+                return actual_saved_bytes, flattened_this_archive, False
             else: # Dry Run
                 log(f"   [DRY RUN] Would repack archive.")
-                mark_processed(conn_main, rel_path_str, original_cbz_size, original_cbz_size - conversion_saved_bytes, conversion_saved_bytes)
-                return conversion_saved_bytes, flattened_this_archive
+                # For dry run, estimate saved bytes as only conversion_saved_bytes
+                mark_processed(conn_main, rel_path_str, original_cbz_size, original_cbz_size - conversion_saved_bytes, conversion_saved_bytes, dominant_type)
+                return conversion_saved_bytes, flattened_this_archive, False
         else:
             log("   No actions performed that require repacking.")
-            mark_processed(conn_main, rel_path_str, original_cbz_size, original_cbz_size, 0)
-            return 0, flattened_this_archive
+            mark_processed(conn_main, rel_path_str, original_cbz_size, original_cbz_size, 0, dominant_type)
+            return 0, flattened_this_archive, False
 
     except Exception as e:
         log(f"[red]❌❌ UNHANDLED EXCEPTION while processing {rel_path_str}: {e}", level="error")
@@ -492,7 +549,7 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args):
         log(f"[red]Traceback: {traceback.format_exc()}", level="error")
         if conn_fail:
             mark_failed(conn_fail, rel_path_str)
-        return 0, False
+        return 0, False, False
     finally:
         if temp_dir_obj and temp_dir_obj.exists():
             if not DRY_RUN :
@@ -507,7 +564,7 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args):
 
 
 def main():
-    global VERBOSE, SUPPRESS_SKIPPED, DRY_RUN, BACKUP_ENABLED, JXL_EFFORT, THREADS
+    global VERBOSE, SUPPRESS_SKIPPED, DRY_RUN, BACKUP_ENABLED, JXL_EFFORT, THREADS, RECHECK_ALL, DELETE_EMPTY_ARCHIVES
 
     parser = argparse.ArgumentParser(description="Convert images in CBZ files to JPEG XL and flatten structure.")
     parser.add_argument("input_dir", nargs="?", default=".",
@@ -519,7 +576,9 @@ def main():
     action_group.add_argument("--no-flatten", action="store_true", help="Do not flatten archive directory structure.")
     action_group.add_argument("--backup", action="store_true", help="Backup original CBZ files (as .cbz.bak) before processing.")
     action_group.add_argument("--dry-run", action="store_true", help="Simulate processing: show what would be done without modifying files.")
-
+    action_group.add_argument("--delete-empty-archives", action="store_true", 
+                              help="Delete CBZ archives that contain no recognized image files (JPG, PNG, JXL).") # New argument
+    
     # --- Conversion Tuning ---
     tuning_group = parser.add_argument_group('Conversion Tuning')
     tuning_group.add_argument("--effort", type=int, default=DEFAULT_JXL_EFFORT, choices=range(0,11), metavar="[0-10]",
@@ -539,6 +598,8 @@ def main():
     db_group.add_argument("--stats", action="store_true", help="Show conversion stats from the database and exit.")
     db_group.add_argument("--reprocess-failed", action="store_true", help="Run processing only on files listed in the failed DB.")
     db_group.add_argument("--reset-db", action="store_true", help="Delete both databases to reprocess everything.")
+    db_group.add_argument("--recheck-all", action="store_true", 
+                        help="Process all CBZ files, overwriting existing database entries. Does not delete DB.") # New argument
 
 
     args = parser.parse_args()
@@ -555,6 +616,8 @@ def main():
     BACKUP_ENABLED = args.backup
     JXL_EFFORT = args.effort
     THREADS = args.threads
+    RECHECK_ALL = args.recheck_all # Set new global from arg
+    DELETE_EMPTY_ARCHIVES = args.delete_empty_archives # Set new global from arg
 
     if DRY_RUN:
         console.print("[bold yellow] DRY RUN MODE ENABLED [/bold yellow] - No actual changes will be made.")
@@ -567,11 +630,16 @@ def main():
         console.print("\n[bold cyan]📊 Database Statistics[/bold cyan]")
         try:
             if conn:
-                processed_archives = conn.execute("SELECT COUNT(*) FROM converted_archives").fetchone()[0]
-                total_saved = conn.execute("SELECT SUM(bytes_saved) FROM converted_archives").fetchone()[0]
+                processed_archives = conn.execute("SELECT COUNT(*) FROM converted_archives WHERE status = 'processed'").fetchone()[0]
+                total_saved = conn.execute("SELECT SUM(bytes_saved) FROM converted_archives WHERE status = 'processed'").fetchone()[0]
+                deleted_archives_count = conn.execute("SELECT COUNT(*) FROM converted_archives WHERE dominant_type IN ('DELETED_NO_IMAGES', 'WOULD_DELETE_NO_IMAGES')").fetchone()[0] # Count deleted ones
+                
                 console.print(f"   Successfully Processed: {processed_archives}")
                 if total_saved is not None:
                     console.print(f"   Total Space Saved:      {total_saved / (1024**3):.3f} GB")
+                if deleted_archives_count > 0:
+                    console.print(f"   Archives Deleted (no images): {deleted_archives_count}")
+
             else:
                 console.print("   No successfully processed archives found.")
 
@@ -663,9 +731,9 @@ def main():
     
     # Performance: Pre-load paths from the main DB to skip successfully processed files.
     processed_paths = set()
-    if conn:
+    if conn and not RECHECK_ALL: # Only skip if RECHECK_ALL is NOT enabled
         try:
-            cursor = conn.execute("SELECT path FROM converted_archives")
+            cursor = conn.execute("SELECT path FROM converted_archives WHERE status = 'processed'")
             processed_paths.update(row[0] for row in cursor)
             if VERBOSE and processed_paths:
                 log(f"Found {len(processed_paths)} successfully processed archives in the database to be skipped.")
@@ -685,11 +753,14 @@ def main():
     log(f"   JXL Effort: {JXL_EFFORT}, Conversion Threads: {THREADS}")
     if BACKUP_ENABLED: log("   Backup: ENABLED")
     if DRY_RUN: log("   Mode: DRY RUN")
+    if RECHECK_ALL: log("   Mode: RECHECK ALL ARCHIVES (Overwriting DB entries)") # Log the new mode
+    if DELETE_EMPTY_ARCHIVES: log("   Action: DELETE EMPTY ARCHIVES ENABLED") # Log the new action
 
     total_bytes_saved_overall = 0
     processed_count = 0
     skipped_count = 0
     flattened_archives_count = 0
+    deleted_empty_archives_count = 0 # New counter for deleted archives
 
     with Progress(SpinnerColumn(), TextColumn("[cyan]{task.description}[/cyan]"), BarColumn(), TextColumn("{task.completed}/{task.total} archives"), TimeRemainingColumn(), console=console, disable=args.quiet and not DRY_RUN) as progress_bar:
         task_id = progress_bar.add_task("Processing CBZs...", total=total_files)
@@ -697,18 +768,22 @@ def main():
         for cbz_path in cbz_files_path_obj_list:
             rel_path_for_db = os.path.relpath(cbz_path, resolved_input_dir)
 
-            if rel_path_for_db in processed_paths:
+            if rel_path_for_db in processed_paths and not RECHECK_ALL: # Add RECHECK_ALL condition
                 skipped_count += 1
                 log(f"[yellow]⚠️ Skipping already processed archive: {rel_path_for_db}", msg_type="skipped")
                 progress_bar.update(task_id, advance=1)
                 continue
             
-            bytes_saved_this_cbz, was_flattened = process_cbz(cbz_path, conn, fail_conn, args)
-            processed_count += 1
-            total_bytes_saved_overall += bytes_saved_this_cbz
+            bytes_saved_this_cbz, was_flattened, was_deleted = process_cbz(cbz_path, conn, fail_conn, args)
+            
+            if was_deleted:
+                deleted_empty_archives_count += 1
+            else: # Only count as processed if not deleted
+                processed_count += 1
+                total_bytes_saved_overall += bytes_saved_this_cbz
 
-            if was_flattened:
-                flattened_archives_count +=1
+                if was_flattened:
+                    flattened_archives_count +=1
 
             progress_bar.update(task_id, advance=1)
 
@@ -731,6 +806,7 @@ def main():
     log(f"   Archives processed:       {processed_count}")
     log(f"   Archives flattened:       {flattened_archives_count}")
     log(f"   Skipped (already done):   {skipped_count}")
+    log(f"   Archives deleted (no images): {deleted_empty_archives_count}") # Display new counter
     log(f"   Failed to process:        {failed_to_process_count}")
     
     if total_bytes_saved_overall >= 0:
