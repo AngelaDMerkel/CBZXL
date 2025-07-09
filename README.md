@@ -26,6 +26,8 @@ This Python script unpacks CBZ archives and converts .JPEG and .PNG files to JXL
 - `--stats` displays database statistics
 - `--reprocess-failed`
 - `--reset-db` will delete both databases and allow the script to reinspect each archive from scratch
+- `--recheck-all` will force every archive to be rescanned without requiring the database to be deleted first
+- `--delete-empty-archives` will delete all archives which do not contain image files, even if they contain other file types
 
 ## Visualise.py
 
