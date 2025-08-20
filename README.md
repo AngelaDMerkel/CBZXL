@@ -28,6 +28,8 @@ This Python script unpacks CBZ archives and converts .JPEG and .PNG files to JXL
 - `--reset-db` will delete both databases and allow the script to reinspect each archive from scratch
 - `--recheck-all` will force every archive to be rescanned without requiring the database to be deleted first
 - `--delete-empty-archives` will delete all archives which do not contain image files, even if they contain other file types
+- `--distance` will enable lossy conversion at the specified distance e.g. `0.1`
+- `--smart-distance` triggers a lossy conversion only for images above 10MB or 5 megapixels and defaults to a distance of `0.1` or whatever distance has been specified in `--distance`
 
 ## Visualise.py
 
