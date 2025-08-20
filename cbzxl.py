@@ -16,7 +16,7 @@ from enum import Enum, auto
 # Default Constants (can be overwritten by args)
 DEFAULT_JXL_EFFORT = 10
 DEFAULT_THREADS = 10
-SCRIPT_VERSION = "2.1"  # Versioning for tracking script changes
+SCRIPT_VERSION = "1.6"  # Versioning for tracking script changes
 
 # Fixed Constants
 DB_FILE = "converted_archives.db"
