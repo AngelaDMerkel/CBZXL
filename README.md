@@ -5,9 +5,11 @@ This Python script unpacks CBZ archives and converts .JPEG and .PNG files to JXL
 ## Features
 
 - Converts JPEG and PNG to JXL losslessly
+- (Optionally and Intelligently) converts images lossily
 - Renames incorrect extensions using MIME type
 - Corrects atypical or unusual colour spaces or metadata
 - SQLite to skip reviously processed archives
+- SQLite for data visualisation with companion script
 - Basic logging
 - Basic archive error handling
 - User configurable timeout
