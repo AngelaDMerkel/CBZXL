@@ -16,7 +16,7 @@ from enum import Enum, auto
 # Default Constants (can be overwritten by args)
 DEFAULT_JXL_EFFORT = 10
 DEFAULT_THREADS = 10
-SCRIPT_VERSION = "1.4"  # Versioning for tracking script changes
+SCRIPT_VERSION = "2.1"  # Versioning for tracking script changes
 
 # Fixed Constants
 DB_FILE = "converted_archives.db"
@@ -101,13 +101,15 @@ def init_db(db_path):
                 png_count INTEGER,
                 script_version TEXT,
                 jxl_version TEXT,
-                error_message TEXT
+                error_message TEXT,
+                conversion_mode TEXT,
+                megapixels_info TEXT
             )
         """)
     return conn
 
 
-def mark_processed(conn, path_str, original_size, final_size, saved_bytes, dominant_type, jxl_effort_level, duration, img_count, num_jpg, num_png):
+def mark_processed(conn, path_str, original_size, final_size, saved_bytes, dominant_type, jxl_effort_level, duration, img_count, num_jpg, num_png, conversion_mode, megapixels_info):
     """Mark an archive as processed with enhanced metadata."""
     if DRY_RUN or conn is None:
         log(f"Would mark as processed: {path_str} (Duration: {duration:.2f}s, Images: {img_count})")
@@ -119,10 +121,10 @@ def mark_processed(conn, path_str, original_size, final_size, saved_bytes, domin
         conn.execute("""
             INSERT OR REPLACE INTO converted_archives
             (path, original_size, final_size, bytes_saved, percent_saved, converted_at, status, dominant_type, jxl_effort,
-             processing_duration_seconds, image_count, jpg_count, png_count, script_version, jxl_version)
-            VALUES (?, ?, ?, ?, ?, ?, 'processed', ?, ?, ?, ?, ?, ?, ?, ?)
+             processing_duration_seconds, image_count, jpg_count, png_count, script_version, jxl_version, conversion_mode, megapixels_info)
+            VALUES (?, ?, ?, ?, ?, ?, 'processed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (path_str, original_size, final_size, saved_bytes, percent_saved, converted_at_iso, dominant_type, jxl_effort_level,
-              duration, img_count, num_jpg, num_png, SCRIPT_VERSION, JXL_VERSION))
+              duration, img_count, num_jpg, num_png, SCRIPT_VERSION, JXL_VERSION, conversion_mode, megapixels_info))
         conn.commit()
     except sqlite3.DatabaseError as e:
         log(f"[red]❌ Failed to mark as processed in DB: {path_str} — {e}", level="error")
@@ -215,18 +217,32 @@ def correct_extension(img_path, mime):
     return img_path
 
 
-def convert_single_image(img_path_obj):
+def convert_single_image(img_path_obj, cli_args):
     img_path_str = str(img_path_obj)
     mime = get_mime_type(img_path_obj)
 
+    default_return = (0, 0.0, "N/A", 0)
+
     if mime not in ("image/jpeg", "image/png"):
-        return 0
+        return default_return
 
     img_path_obj = correct_extension(img_path_obj, mime)
     img_path_str = str(img_path_obj)
 
     jxl_path = img_path_obj.with_suffix(".jxl")
     orig_size = get_size(img_path_obj)
+
+    # Get image dimensions for megapixel calculation
+    megapixels = 0.0
+    try:
+        id_result = subprocess.run(
+            ["identify", "-format", "%w %h", img_path_str],
+            capture_output=True, text=True, check=True, timeout=30
+        )
+        width, height = map(int, id_result.stdout.strip().split())
+        megapixels = (width * height) / 1_000_000
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
+        log(f"[yellow]⚠️ Could not get image dimensions for {img_path_obj.name}: {e}", level="error")
 
     if mime == "image/png":
         fix_grayscale_icc(img_path_str)
@@ -243,11 +259,30 @@ def convert_single_image(img_path_obj):
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
             log(f"[red]Could not identify colorspace for {img_path_str}: {e}", level="error")
 
-    if DRY_RUN:
-        log(f"   Would convert image to JXL: {img_path_obj.name} (Effort: {JXL_EFFORT})")
-        return 0
+    # --- JXL Conversion Logic ---
+    final_distance = 0
+    conversion_mode = "Lossless"
+    
+    # Global lossy conversion (`--distance` without `--smart-distance`)
+    if cli_args.distance is not None and not cli_args.smart_distance:
+        final_distance = cli_args.distance
+        conversion_mode = "Lossy"
+    # Smart distance logic
+    elif cli_args.smart_distance:
+        is_large_file = orig_size > (10 * 1024 * 1024)  # 10MB
+        is_high_res = megapixels > 5.0
+        if is_large_file or is_high_res:
+            # Use distance from --distance flag if provided, otherwise default to 0.1
+            final_distance = cli_args.distance if cli_args.distance is not None else 0.1
+            conversion_mode = "Smart Lossy"
+            log_reason = "large file size" if is_large_file else "high resolution"
+            log(f"   ⚡ Applying smart lossy conversion to {img_path_obj.name} (d={final_distance}) due to {log_reason}.")
 
-    cjxl_cmd = ["cjxl", "-d", "0", f"--effort={JXL_EFFORT}", img_path_str, str(jxl_path)]
+    if DRY_RUN:
+        log(f"   Would convert image to JXL: {img_path_obj.name} (Effort: {JXL_EFFORT}, Distance: {final_distance})")
+        return default_return
+
+    cjxl_cmd = ["cjxl", "-d", str(final_distance), f"--effort={JXL_EFFORT}", img_path_str, str(jxl_path)]
     result = None
     try:
         result = subprocess.run(cjxl_cmd, capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT)
@@ -256,15 +291,15 @@ def convert_single_image(img_path_obj):
             log(f"[yellow]   ⚠️ Retrying {img_path_obj.name} with --allow_jpeg_reconstruction 0 due to error: {result.stderr.strip()}", level="error")
             if jxl_path.exists(): os.remove(jxl_path)
             
-            cjxl_cmd_retry = ["cjxl", "-d", "0", f"--effort={JXL_EFFORT}", "--allow_jpeg_reconstruction", "0", img_path_str, str(jxl_path)]
+            cjxl_cmd_retry = ["cjxl", "-d", str(final_distance), f"--effort={JXL_EFFORT}", "--allow_jpeg_reconstruction", "0", img_path_str, str(jxl_path)]
             result = subprocess.run(cjxl_cmd_retry, capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT)
     except subprocess.TimeoutExpired:
         log(f"[red]❌ cjxl timed out after {SUBPROCESS_TIMEOUT}s on {img_path_obj.name}", level="error")
         if jxl_path.exists(): os.remove(jxl_path)
-        return 0
+        return default_return
     except Exception as e:
         log(f"[red]❌ An unexpected error occurred during cjxl execution: {e}", level="error")
-        return 0
+        return default_return
 
 
     try:
@@ -273,22 +308,22 @@ def convert_single_image(img_path_obj):
             os.remove(img_path_obj)
             if VERBOSE:
                 log(f"   🖼️  Converted image: {img_path_obj.name} (MIME: {mime}, Original Size: {orig_size / 1024:.2f} KB, JXL Size: {get_size(jxl_path) / 1024:.2f} KB)")
-            return saved
+            return saved, megapixels, conversion_mode, final_distance
         else:
             log(f"[red]❌ Failed to convert with cjxl: {img_path_obj.name}", level="error")
             if result and result.stdout: log(f"[red]   cjxl stdout: {result.stdout.strip()}", level="error")
             if result and result.stderr: log(f"[red]   cjxl stderr: {result.stderr.strip()}", level="error")
             if jxl_path.exists() and get_size(jxl_path) == 0: os.remove(jxl_path)
-            return 0
+            return default_return
     except FileNotFoundError:
         log("[red]Error: 'cjxl' command not found.", level="error")
-        return 0
+        return default_return
     except Exception as e:
         log(f"[red]❌ Unexpected error converting {img_path_obj.name}: {e}", level="error")
-        return 0
+        return default_return
 
 
-def convert_images(temp_dir_path):
+def convert_images(temp_dir_path, cli_args):
     total_saved = 0
     
     all_files_in_temp = list(temp_dir_path.rglob("*.*"))
@@ -330,7 +365,7 @@ def convert_images(temp_dir_path):
     elif jpg_count > 0:
         dominant_type = "Mixed"
 
-    base_return = (0, "", dominant_type, image_count, jpg_count, png_count)
+    base_return = (0, "", dominant_type, image_count, jpg_count, png_count, "N/A", "N/A")
 
     if not convertible_paths:
         if jxl_paths:
@@ -339,22 +374,51 @@ def convert_images(temp_dir_path):
             ext_counts = {p.suffix.lower(): 0 for p in other_image_paths}
             for p in other_image_paths: ext_counts[p.suffix.lower()] += 1
             most_frequent_ext = max(ext_counts, key=ext_counts.get) if ext_counts else ""
-            return ConversionStatus.CONTAIN_OTHER_FORMATS, 0, most_frequent_ext[1:].upper(), dominant_type, image_count, jpg_count, png_count
+            return ConversionStatus.CONTAIN_OTHER_FORMATS, 0, most_frequent_ext[1:].upper(), dominant_type, image_count, jpg_count, png_count, "N/A", "N/A"
         else:
             return ConversionStatus.NO_IMAGES_RECOGNIZED, *base_return
 
     if VERBOSE or DRY_RUN:
         log(f"   Found {len(convertible_paths)} JPEG/PNG images for potential conversion...")
     
+    results = []
     with ThreadPoolExecutor(max_workers=THREADS) as executor:
-        futures = {executor.submit(convert_single_image, path_obj): path_obj for path_obj in convertible_paths}
+        futures = {executor.submit(convert_single_image, path_obj, cli_args): path_obj for path_obj in convertible_paths}
         for future in as_completed(futures):
             try:
-                total_saved += future.result()
+                results.append(future.result())
             except Exception as e:
                 log(f"[red]❌ Error processing image {futures[future].name} in thread: {e}", level="error")
     
-    final_return = (total_saved, "", dominant_type, image_count, jpg_count, png_count)
+    total_saved = sum(r[0] for r in results)
+    megapixels_list = [r[1] for r in results if r[1] > 0]
+    modes_set = {r[2] for r in results if r[2] != "N/A"}
+    distances_set = {r[3] for r in results if r[2] != "N/A"}
+
+    # Create megapixel info string
+    if not megapixels_list:
+        megapixels_info = "N/A"
+    else:
+        avg_mp = sum(megapixels_list) / len(megapixels_list)
+        max_mp = max(megapixels_list)
+        megapixels_info = f"Avg: {avg_mp:.2f}MP, Max: {max_mp:.2f}MP"
+
+    # Create conversion mode string
+    final_conversion_mode = "N/A"
+    if len(modes_set) == 1:
+        mode = modes_set.pop()
+        if mode == "Lossless":
+            final_conversion_mode = "Lossless"
+        elif "Lossy" in mode:
+            distance = max(distances_set)
+            final_conversion_mode = f"{mode} (d={distance})"
+    elif len(modes_set) > 1:
+        final_conversion_mode = "Mixed"
+    elif not modes_set:
+         final_conversion_mode = "N/A"
+
+
+    final_return = (total_saved, "", dominant_type, image_count, jpg_count, png_count, final_conversion_mode, megapixels_info)
     if total_saved > 0:
         return ConversionStatus.PROCESSED_SAVED_SPACE, *final_return
     else:
@@ -446,10 +510,10 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args):
 
         # --- Conversion Step ---
         conversion_saved_bytes = 0
-        status, saved_bytes, dominant_other, dominant_type, img_count, num_jpg, num_png = (ConversionStatus.NO_IMAGES_RECOGNIZED, 0, "", "N/A", 0, 0, 0)
+        status, saved_bytes, dominant_other, dominant_type, img_count, num_jpg, num_png, conv_mode, mp_info = (ConversionStatus.NO_IMAGES_RECOGNIZED, 0, "", "N/A", 0, 0, 0, "N/A", "N/A")
         
         if not cli_args.no_convert:
-            status, saved_bytes, dominant_other, dominant_type, img_count, num_jpg, num_png = convert_images(temp_dir_obj)
+            status, saved_bytes, dominant_other, dominant_type, img_count, num_jpg, num_png, conv_mode, mp_info = convert_images(temp_dir_obj, cli_args)
             conversion_saved_bytes = saved_bytes
             if status == ConversionStatus.ALREADY_JXL_NO_CONVERTIBLES: log(f"   ℹ️  Already JXL. No conversion needed.")
             elif status == ConversionStatus.CONTAIN_OTHER_FORMATS: log(f"   ℹ️  Contains {dominant_other} images. No JPEG/PNG found.")
@@ -468,7 +532,7 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args):
                 try:
                     os.remove(cbz_path_obj)
                     log(f"[green]   ✅ Deleted empty archive: {rel_path_str}[/green]")
-                    mark_processed(conn_main, rel_path_str, original_cbz_size, 0, original_cbz_size, "DELETED", JXL_EFFORT, duration, 0, 0, 0)
+                    mark_processed(conn_main, rel_path_str, original_cbz_size, 0, original_cbz_size, "DELETED", JXL_EFFORT, duration, 0, 0, 0, "N/A", "N/A")
                     return 0, False, True
                 except Exception as e:
                     log(f"[red]❌ Failed to delete empty archive {rel_path_str}: {e}", level="error")
@@ -476,7 +540,7 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args):
                     return 0, False, False
             else:
                 log(f"[DRY RUN]   Would delete empty archive: {rel_path_str}")
-                mark_processed(conn_main, rel_path_str, original_cbz_size, 0, original_cbz_size, "WOULD_DELETE", JXL_EFFORT, duration, 0, 0, 0)
+                mark_processed(conn_main, rel_path_str, original_cbz_size, 0, original_cbz_size, "WOULD_DELETE", JXL_EFFORT, duration, 0, 0, 0, "N/A", "N/A")
                 return 0, False, True
 
         # --- Flattening Step ---
@@ -505,11 +569,11 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args):
             reduction_percentage = (actual_saved_bytes / original_cbz_size) * 100 if original_cbz_size > 0 else 0
             log_msg = f"Repacked. Final Size: {final_size / (1024*1024):.2f} MB. Change: {actual_saved_bytes / (1024*1024):.2f} MB ({reduction_percentage:.2f}%)"
             log(f"   ✅ {log_msg}")
-            mark_processed(conn_main, rel_path_str, original_cbz_size, final_size, actual_saved_bytes, dominant_type, JXL_EFFORT, duration, img_count, num_jpg, num_png)
+            mark_processed(conn_main, rel_path_str, original_cbz_size, final_size, actual_saved_bytes, dominant_type, JXL_EFFORT, duration, img_count, num_jpg, num_png, conv_mode, mp_info)
             return actual_saved_bytes, flattened_this_archive, False
         else:
             log("   No actions performed that require repacking.")
-            mark_processed(conn_main, rel_path_str, original_cbz_size, original_cbz_size, 0, dominant_type, JXL_EFFORT, duration, img_count, num_jpg, num_png)
+            mark_processed(conn_main, rel_path_str, original_cbz_size, original_cbz_size, 0, dominant_type, JXL_EFFORT, duration, img_count, num_jpg, num_png, conv_mode, mp_info)
             return 0, flattened_this_archive, False
 
     except Exception as e:
@@ -536,10 +600,12 @@ def main():
     action_group.add_argument("--backup", action="store_true", help="Backup original CBZ files (as .cbz.bak).")
     action_group.add_argument("--dry-run", action="store_true", help="Simulate processing without modifying files.")
     action_group.add_argument("--delete-empty-archives", action="store_true", help="Delete CBZ archives with no recognized images.")
-    
+    action_group.add_argument("--smart-distance", action="store_true", help="Apply lossy conversion only to images >10MB or >5MP.")
+
     tuning_group = parser.add_argument_group('Conversion Tuning')
     tuning_group.add_argument("--effort", type=int, default=DEFAULT_JXL_EFFORT, choices=range(0,11), metavar="[0-10]", help=f"JXL encoding effort (default: {DEFAULT_JXL_EFFORT})")
     tuning_group.add_argument("--threads", type=int, default=DEFAULT_THREADS, help=f"Number of threads for image conversion (default: {DEFAULT_THREADS})")
+    tuning_group.add_argument("--distance", type=float, help="Set JXL lossy distance (e.g., 1.0). Overrides default lossless.")
 
     output_group = parser.add_argument_group('Output Control')
     output_group.add_argument("--quiet", "-q", action="store_true", help="Suppress all console output except critical errors.")
@@ -606,6 +672,8 @@ def main():
     log(f"🛠️ Starting CBZ processing for {total_files} file(s) in '{resolved_input_dir}'...")
     log(f"   Script Version: {SCRIPT_VERSION}, JXL Version: {JXL_VERSION}")
     log(f"   JXL Effort: {JXL_EFFORT}, Conversion Threads: {THREADS}")
+    if args.distance: log(f"   JXL Distance: {args.distance}")
+    if args.smart_distance: log("   Mode: SMART DISTANCE ENABLED")
     if BACKUP_ENABLED: log("   Backup: ENABLED")
     if RECHECK_ALL: log("   Mode: RECHECK ALL ARCHIVES (Overwriting DB entries)")
     if DELETE_EMPTY_ARCHIVES: log("   Action: DELETE EMPTY ARCHIVES ENABLED")
