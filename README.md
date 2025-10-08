@@ -16,7 +16,7 @@ This Python script unpacks CBZ archives and converts .JPEG and .PNG files to JXL
 
 ## Usage
 
-- `--effort` overrides the default effort level of `10`
+- `--effort` overrides the default effort level of `10` and automatically sets the correct flags for effort `11`
 - `--threads` overrides the default of `10` threads
 - `--verbose` for more info including per archive savings and percent saved. I recommend you pass this flag
 - `--quiet` supresses all console messages except for critical errors
