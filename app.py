@@ -3,6 +3,7 @@ import os
 import sqlite3
 import tempfile
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -22,6 +23,7 @@ from cbzxl_web.database import (
     default_profile,
     initialize,
     merged_options,
+    parse_datetime,
     row_dict,
     rows_dict,
     schedule_description,
@@ -35,7 +37,7 @@ ROOT = Path(__file__).parent
 FRONTEND_DIST = ROOT / "frontend" / "dist"
 LEGACY_STATIC = ROOT / "static"
 
-app = FastAPI(title="CBZXL", version="2.0.0", docs_url="/api/docs", redoc_url=None)
+app = FastAPI(title="CBZXL", version="3.3.0", docs_url="/api/docs", redoc_url=None)
 
 
 class ScanOptions(BaseModel):
@@ -44,7 +46,7 @@ class ScanOptions(BaseModel):
     recheck_all: bool = False
     verbose: bool = True
     no_convert: bool = False
-    no_flatten: bool = False
+    no_flatten: bool = True
     delete_empty: bool = False
     smart_distance: bool = False
     effort: int = Field(7, ge=0, le=11)
@@ -52,6 +54,12 @@ class ScanOptions(BaseModel):
     distance: Optional[float] = Field(None, ge=0, le=15)
     smart_mb: float = Field(10.0, ge=0.1, le=1000)
     smart_mp: float = Field(5.0, ge=0.1, le=1000)
+
+    @model_validator(mode="after")
+    def enforce_filename_preservation(self):
+        self.no_flatten = True
+        self.delete_empty = False
+        return self
 
 
 class JobCreate(BaseModel):
@@ -116,7 +124,7 @@ def parse_json(value, fallback=None):
         return fallback if fallback is not None else {}
 
 
-def hydrate_job(job):
+def hydrate_job(job, samples=None):
     if not job:
         return job
     job["options"] = parse_json(job.pop("options_json", None))
@@ -128,6 +136,27 @@ def hydrate_job(job):
     job["completed"] = completed
     job["remaining"] = max(0, total - completed)
     job["percent"] = round(completed / total * 100, 1) if total else 0
+    page_total = int(job.get("total_pages") or 0)
+    page_current = min(page_total, int(job.get("current_page") or 0))
+    archive_fraction = page_current / page_total if page_total and job.get("status") in {"running", "stopping"} else 0
+    job["smooth_percent"] = round(min(100, (completed + archive_fraction) / total * 100), 2) if total else 0
+    started = parse_datetime(job.get("started_at"))
+    finished = parse_datetime(job.get("finished_at"))
+    elapsed = max(0, int(((finished or datetime.now(timezone.utc)) - started).total_seconds())) if started else 0
+    rate = completed / elapsed * 60 if elapsed and completed else 0
+    if samples and len(samples) > 1:
+        recent = samples[-12:]
+        first_time = parse_datetime(recent[0].get("recorded_at"))
+        last_time = parse_datetime(recent[-1].get("recorded_at"))
+        sample_elapsed = (last_time - first_time).total_seconds() if first_time and last_time else 0
+        sample_completed = int(recent[-1].get("completed") or 0) - int(recent[0].get("completed") or 0)
+        if sample_elapsed > 0 and sample_completed > 0:
+            rate = sample_completed / sample_elapsed * 60
+    job["elapsed_seconds"] = elapsed
+    job["rate_per_minute"] = round(rate, 1)
+    job["eta_seconds"] = round(job["remaining"] / rate * 60) if rate and job["remaining"] else None
+    heartbeat = parse_datetime(job.get("heartbeat_at"))
+    job["heartbeat_age_seconds"] = max(0, round((datetime.now(timezone.utc) - heartbeat).total_seconds())) if heartbeat else None
     return job
 
 
@@ -170,7 +199,10 @@ def dashboard():
                     SUM(CASE WHEN status='processed' AND bytes_saved < 0 THEN 1 ELSE 0 END) AS grew_count,
                     COALESCE(SUM(CASE WHEN status='processed' AND bytes_saved > 0 THEN bytes_saved ELSE 0 END), 0) AS saved_bytes,
                     COALESCE(SUM(CASE WHEN status='processed' AND bytes_saved < 0 THEN -bytes_saved ELSE 0 END), 0) AS increased_bytes,
-                    COALESCE(SUM(CASE WHEN status='processed' THEN bytes_saved ELSE 0 END), 0) AS net_bytes
+                    COALESCE(SUM(CASE WHEN status='processed' THEN bytes_saved ELSE 0 END), 0) AS net_bytes,
+                    COALESCE(SUM(CASE WHEN status='processed' THEN image_count ELSE 0 END), 0) AS page_count,
+                    COALESCE(AVG(CASE WHEN status='processed' AND original_size > 0 THEN percent_saved END), 0) AS average_percent_saved,
+                    COALESCE(AVG(CASE WHEN status='processed' THEN processing_duration_seconds END), 0) AS average_duration_seconds
                 FROM archives
                 """
             ).fetchone()
@@ -236,6 +268,9 @@ def dashboard():
             "saved_gb": gb(totals.get("saved_bytes")),
             "increased_gb": gb(totals.get("increased_bytes")),
             "net_gb": gb(totals.get("net_bytes")),
+            "page_count": totals.get("page_count") or 0,
+            "average_percent_saved": round(totals.get("average_percent_saved") or 0, 1),
+            "average_duration_seconds": round(totals.get("average_duration_seconds") or 0, 1),
         },
         "review": {"failed": review.get("failed") or 0, "grew": review.get("grew") or 0},
         "outcomes": outcomes,
@@ -264,9 +299,11 @@ def get_job(job_id: str):
             raise HTTPException(404, "Scan not found")
         events = rows_dict(conn.execute("SELECT * FROM job_events WHERE job_id=? ORDER BY id DESC LIMIT 200", (job_id,)).fetchall())
         results = rows_dict(conn.execute("SELECT * FROM archive_results WHERE job_id=? ORDER BY id DESC LIMIT 200", (job_id,)).fetchall())
+        samples = rows_dict(conn.execute("SELECT * FROM job_progress_samples WHERE job_id=? ORDER BY id DESC LIMIT 180", (job_id,)).fetchall())
+        samples.reverse()
     for event in events:
         event["data"] = parse_json(event.pop("data_json", None), None)
-    return {"job": hydrate_job(job), "events": events, "results": results}
+    return {"job": hydrate_job(job, samples), "events": events, "results": results, "progress": samples}
 
 
 @app.post("/api/jobs", status_code=201)
@@ -514,7 +551,7 @@ def health():
     try:
         with connect() as conn:
             conn.execute("SELECT 1").fetchone()
-        return {"status": "healthy", "database": "ok", "version": "2.0.0"}
+        return {"status": "healthy", "database": "ok", "version": "3.3.0"}
     except sqlite3.Error as exc:
         raise HTTPException(503, f"Database unavailable: {exc}") from exc
 

@@ -81,6 +81,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     bytes_increased INTEGER NOT NULL DEFAULT 0,
     net_bytes_saved INTEGER NOT NULL DEFAULT 0,
     current_archive TEXT,
+    current_stage TEXT,
+    current_page INTEGER NOT NULL DEFAULT 0,
+    total_pages INTEGER NOT NULL DEFAULT 0,
+    heartbeat_at TEXT,
     cancel_requested INTEGER NOT NULL DEFAULT 0 CHECK (cancel_requested IN (0, 1)),
     error_message TEXT
 );
@@ -96,6 +100,24 @@ CREATE TABLE IF NOT EXISTS job_events (
     data_json TEXT
 );
 
+CREATE TABLE IF NOT EXISTS job_progress_samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    recorded_at TEXT NOT NULL,
+    completed INTEGER NOT NULL DEFAULT 0,
+    processed INTEGER NOT NULL DEFAULT 0,
+    skipped INTEGER NOT NULL DEFAULT 0,
+    failed INTEGER NOT NULL DEFAULT 0,
+    deleted INTEGER NOT NULL DEFAULT 0,
+    bytes_saved INTEGER NOT NULL DEFAULT 0,
+    bytes_increased INTEGER NOT NULL DEFAULT 0,
+    net_bytes_saved INTEGER NOT NULL DEFAULT 0,
+    current_archive TEXT,
+    current_stage TEXT,
+    current_page INTEGER NOT NULL DEFAULT 0,
+    total_pages INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS archives (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
@@ -107,6 +129,7 @@ CREATE TABLE IF NOT EXISTS archives (
     percent_saved REAL,
     converted_at TEXT,
     archive_mtime REAL,
+    content_fingerprint TEXT,
     dominant_type TEXT,
     jxl_effort INTEGER,
     processing_duration_seconds REAL,
@@ -176,6 +199,7 @@ CREATE TABLE IF NOT EXISTS import_batches (
 CREATE INDEX IF NOT EXISTS idx_jobs_status_queued ON jobs(status, queued_at);
 CREATE INDEX IF NOT EXISTS idx_jobs_schedule ON jobs(schedule_id, queued_at);
 CREATE INDEX IF NOT EXISTS idx_events_job_created ON job_events(job_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_progress_job_recorded ON job_progress_samples(job_id, recorded_at);
 CREATE INDEX IF NOT EXISTS idx_archives_status ON archives(status);
 CREATE INDEX IF NOT EXISTS idx_archives_review ON archives(review_status, status);
 CREATE INDEX IF NOT EXISTS idx_archives_saved ON archives(bytes_saved);
@@ -190,7 +214,7 @@ DEFAULT_OPTIONS = {
     "recheck_all": False,
     "verbose": True,
     "no_convert": False,
-    "no_flatten": False,
+    "no_flatten": True,
     "delete_empty": False,
     "smart_distance": False,
     "effort": 7,
@@ -263,6 +287,33 @@ def initialize() -> None:
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, ?)",
             (utc_now(),),
         )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, ?)",
+            (utc_now(),),
+        )
+        migrations = {
+            "jobs": {
+                "current_stage": "TEXT",
+                "current_page": "INTEGER NOT NULL DEFAULT 0",
+                "total_pages": "INTEGER NOT NULL DEFAULT 0",
+                "heartbeat_at": "TEXT",
+            },
+            "job_progress_samples": {
+                "current_stage": "TEXT",
+                "current_page": "INTEGER NOT NULL DEFAULT 0",
+                "total_pages": "INTEGER NOT NULL DEFAULT 0",
+            },
+            "archives": {"content_fingerprint": "TEXT"},
+        }
+        for table, additions in migrations.items():
+            existing_columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            for column, definition in additions.items():
+                if column not in existing_columns:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (3, ?)",
+            (utc_now(),),
+        )
         now = utc_now()
         library_id = "library-default"
         profile_id = "profile-balanced"
@@ -311,6 +362,9 @@ def create_job(
     queued_at: str | None = None,
 ) -> str:
     job_id = job_id or str(uuid.uuid4())
+    options = dict(options)
+    options["no_flatten"] = True
+    options["delete_empty"] = False
     queued_at = queued_at or utc_now()
     conn.execute(
         """

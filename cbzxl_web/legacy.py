@@ -20,6 +20,28 @@ RESULT_FIELDS = (
     "megapixels_info", "error_message", "converted_at", "archive_mtime",
 )
 
+LEGACY_TABLES = {
+    "converted_archives": {
+        "target": "archives",
+        "required": {"path"},
+        "recognized": {"path", *ARCHIVE_FIELDS},
+    },
+    "runs": {
+        "target": "jobs",
+        "required": set(),
+        "recognized": {
+            "id", "started_at", "finished_at", "status", "archives_found", "processed", "skipped",
+            "failed", "flattened", "deleted", "bytes_saved", "bytes_increased", "net_bytes_saved",
+            "error_message", "jxl_effort", "threads", "smart_distance", "distance",
+        },
+    },
+    "archive_results": {
+        "target": "archive_results",
+        "required": {"run_id", "path"},
+        "recognized": {"run_id", "path", *RESULT_FIELDS},
+    },
+}
+
 
 def source_info(path: Path):
     stat = path.stat()
@@ -48,9 +70,41 @@ def inspect_legacy(path: str | Path):
     try:
         integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
         tables = {}
-        for table in ("converted_archives", "runs", "archive_results"):
-            tables[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] if table_exists(conn, table) else 0
-        return {**source_info(source), "integrity": integrity, "tables": tables}
+        schema = {}
+        for table, mapping in LEGACY_TABLES.items():
+            present = table_exists(conn, table)
+            table_columns = []
+            if present:
+                tables[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                table_columns = [
+                    {"name": row[1], "type": row[2] or "", "nullable": not bool(row[3]), "primary_key": bool(row[5])}
+                    for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+                ]
+            else:
+                tables[table] = 0
+            names = {column["name"] for column in table_columns}
+            missing = sorted(mapping["required"] - names) if present else sorted(mapping["required"])
+            schema[table] = {
+                "present": present,
+                "target": mapping["target"],
+                "columns": table_columns,
+                "mapped_columns": sorted(names & mapping["recognized"]),
+                "unmapped_columns": sorted(names - mapping["recognized"]),
+                "missing_required": missing,
+                "compatible": present and not missing,
+            }
+        compatible_tables = sum(1 for value in schema.values() if value["compatible"])
+        return {
+            **source_info(source),
+            "integrity": integrity,
+            "tables": tables,
+            "schema": schema,
+            "mapping": {
+                "compatible_tables": compatible_tables,
+                "available_tables": sum(1 for value in schema.values() if value["present"]),
+                "ready": integrity == "ok" and compatible_tables > 0,
+            },
+        }
     finally:
         conn.close()
 

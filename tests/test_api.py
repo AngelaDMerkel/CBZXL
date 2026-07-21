@@ -36,6 +36,14 @@ class ApiTests(unittest.TestCase):
         response = self.client.post("/api/schedules", json={"cadence": "monthly", "day_of_month": 40})
         self.assertEqual(response.status_code, 422)
 
+    def test_job_progress_includes_rate_metadata(self):
+        job = self.client.post("/api/jobs", json={}).json()
+        hydrated = self.client.get(f"/api/jobs/{job['id']}").json()["job"]
+        self.assertIn("elapsed_seconds", hydrated)
+        self.assertIn("rate_per_minute", hydrated)
+        self.assertIn("eta_seconds", hydrated)
+        self.assertIn("smooth_percent", hydrated)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,6 @@
-# CBZXL Web 2.0
+# CBZXL
 
-CBZXL is a self-hosted CBZ-to-JPEG XL archive optimizer with a portable SQLite database, durable scheduling, a separate conversion worker, and a responsive operations interface.
+CBZXL is a self-hosted CBZ-to-JPEG XL archive optimizer with a portable SQLite database, durable scheduling, a separate conversion worker, and a minimalist web workspace.
 
 ## What changed
 
@@ -9,7 +9,20 @@ CBZXL is a self-hosted CBZ-to-JPEG XL archive optimizer with a portable SQLite d
 - Scan requests, progress, cancellation, results, reviews, schedules, and activity survive restarts.
 - Schedules use daily, weekly, monthly, or repeating interval choices—no cron expressions.
 - Existing `converted_archives`, `runs`, and `archive_results` tables can be imported from the previous SQLite database.
+- The migration workspace reads and explains the legacy schema before building the new record set; the source stays read-only.
+- Per-archive progress samples power smooth live progress, rolling throughput, ETA, momentum, and durable run statistics.
+- Engine 3 uses structured JSON events, page-level progress, content signatures, persistent resume manifests, bounded libjxl scheduling, decode verification, and fsynced atomic commits.
 - Database exports use SQLite's online backup mechanism to produce a consistent single-file snapshot.
+
+## Conversion engine
+
+The worker treats `threads` as a total CPU budget. It automatically divides that budget between concurrent pages and each native `cjxl` encoder, preventing the oversubscription caused by giving every encoder the entire machine. Set `RESUME_DIR` to durable storage (the Compose default is `/config/resume`) so interrupted archives can continue from verified JXL pages on the next attempt.
+
+The engine validates ZIP paths before extraction, writes each page through a partial file, checks the JXL signature, verifies the completed CBZ and its CRCs, decodes representative pages with `djxl`, syncs the replacement, and only then performs the atomic replacement.
+
+Archive paths, archive filenames, image directories, and image basenames are immutable. Conversion may only replace an image extension with `.jxl` (for example, `Chapter 2/004.jpg` becomes `Chapter 2/004.jxl`). Flattening and empty-archive deletion are disabled. If two inputs would require the same `.jxl` path, the archive fails safely and remains unchanged.
+
+Smart mode is lossless-first and savings-gated per file. Every convertible page is first tested as lossless JXL. If that file is smaller, it is kept immediately. Only when lossless is not smaller and the configured file-size or resolution threshold is met does the engine try distance `0.5`; that lossy result is also kept only when smaller. Otherwise the original page remains byte-for-byte unchanged. Archive-level size does not override those page decisions; metadata is deflated during repacking while already-compressed image formats are stored directly.
 
 ## Run with Docker Compose
 

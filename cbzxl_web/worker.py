@@ -20,25 +20,26 @@ from .database import (
     transaction,
     utc_now,
 )
+from .protocol import parse_event
 
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT_PATH = Path(os.getenv("CONVERTER_PATH", str(ROOT / "cbzxl.py")))
 POLL_SECONDS = float(os.getenv("WORKER_POLL_SECONDS", "2"))
+STALL_SECONDS = int(os.getenv("WORKER_STALL_SECONDS", "900"))
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+STRUCTURED_JOBS = set()
 
 
 def command_for_job(job, library):
     options = json.loads(job["options_json"])
-    command = [sys.executable, "-u", str(SCRIPT_PATH), library["root_path"], "--run-id", job["id"]]
+    command = [sys.executable, "-u", str(SCRIPT_PATH), library["root_path"], "--run-id", job["id"], "--no-flatten"]
     flags = {
         "dry_run": "--dry-run",
         "backup": "--backup",
         "recheck_all": "--recheck-all",
         "verbose": "--verbose",
         "no_convert": "--no-convert",
-        "no_flatten": "--no-flatten",
-        "delete_empty": "--delete-empty-archives",
         "smart_distance": "--smart-distance",
     }
     for key, flag in flags.items():
@@ -47,6 +48,7 @@ def command_for_job(job, library):
     for key, flag in (
         ("effort", "--effort"),
         ("threads", "--threads"),
+        ("encoder_threads", "--encoder-threads"),
         ("distance", "--distance"),
         ("smart_mb", "--smart-mb"),
         ("smart_mp", "--smart-mp"),
@@ -71,7 +73,7 @@ def classify(text):
         return "error", "error"
     if any(word in lowered for word in ("warning", "skipping", "no processable", "contains no recognized")):
         return "warning", "warning"
-    if any(word in lowered for word in ("repacked", "finished", "converted image", "flattening complete")):
+    if any(word in lowered for word in ("repacked", "finished", "converted image")):
         return "success", "progress"
     return "info", "progress"
 
@@ -87,7 +89,6 @@ def should_store(text):
         "timed out",
         "No processable",
         "contains no recognized",
-        "Deleted empty archive",
         "Conversion process finished",
         "Starting CBZ processing",
         "No CBZ files found",
@@ -104,18 +105,83 @@ def stream_reader(stream, output):
 
 
 def persist_output(job_id, raw):
+    event = parse_event(raw)
+    if event:
+        STRUCTURED_JOBS.add(job_id)
+        persist_structured_event(job_id, event)
+        return
+    if job_id in STRUCTURED_JOBS:
+        return
     text = clean_line(raw)
     if not text:
         return
     archive_path = None
     if "Processing:" in text:
         archive_path = text.split("Processing:", 1)[1].strip()
+    elif "Skipping already processed archive:" in text:
+        archive_path = text.split("Skipping already processed archive:", 1)[1].strip()
     level, event_type = classify(text)
     with transaction() as conn:
         if archive_path:
             conn.execute("UPDATE jobs SET current_archive=? WHERE id=?", (archive_path, job_id))
         if should_store(text):
             add_event(conn, job_id, level, event_type, text, archive_path)
+
+
+def persist_structured_event(job_id, event):
+    event_type = event["type"]
+    archive_path = event.get("archive")
+    stage = event.get("stage")
+    page = max(0, int(event.get("page") or 0))
+    total_pages = max(0, int(event.get("total_pages") or 0))
+    now = event.get("at") or utc_now()
+    durable_types = {
+        "job_started", "job_completed", "job_failed", "job_cancelled",
+        "archive_started", "archive_resumed", "archive_completed", "archive_failed",
+        "verification_started", "verification_completed",
+    }
+    with transaction() as conn:
+        conn.execute(
+            """
+            UPDATE jobs SET
+                current_archive=COALESCE(?, current_archive),
+                current_stage=COALESCE(?, current_stage),
+                current_page=CASE WHEN ? > 0 OR ? = 'archive_started' THEN ? ELSE current_page END,
+                total_pages=CASE WHEN ? > 0 OR ? = 'archive_started' THEN ? ELSE total_pages END,
+                heartbeat_at=?
+            WHERE id=?
+            """,
+            (archive_path, stage, page, event_type, page, total_pages, event_type, total_pages, now, job_id),
+        )
+        if event_type in {"page_completed", "page_started"}:
+            job = row_dict(conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
+            completed = sum(int(job.get(key) or 0) for key in ("processed", "skipped", "failed", "deleted"))
+            conn.execute(
+                """
+                INSERT INTO job_progress_samples(
+                    job_id, recorded_at, completed, processed, skipped, failed, deleted,
+                    bytes_saved, bytes_increased, net_bytes_saved, current_archive,
+                    current_stage, current_page, total_pages
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id, now, completed, job.get("processed") or 0, job.get("skipped") or 0,
+                    job.get("failed") or 0, job.get("deleted") or 0, job.get("bytes_saved") or 0,
+                    job.get("bytes_increased") or 0, job.get("net_bytes_saved") or 0,
+                    archive_path or job.get("current_archive"), stage or job.get("current_stage"),
+                    page or job.get("current_page") or 0, total_pages or job.get("total_pages") or 0,
+                ),
+            )
+        if event_type in durable_types:
+            add_event(
+                conn,
+                job_id,
+                event.get("level", "info"),
+                event_type,
+                event.get("message") or event_type.replace("_", " ").capitalize(),
+                archive_path,
+                {key: value for key, value in event.items() if key not in {"protocol", "type", "level", "message", "at"}},
+            )
 
 
 def run_job(job):
@@ -142,7 +208,9 @@ def run_job(job):
     reader = threading.Thread(target=stream_reader, args=(process.stdout, output), daemon=True)
     reader.start()
     cancelled = False
+    stalled = False
     stream_open = True
+    last_activity = time.monotonic()
 
     while process.poll() is None or stream_open or not output.empty():
         try:
@@ -150,6 +218,7 @@ def run_job(job):
             if line is None:
                 stream_open = False
             else:
+                last_activity = time.monotonic()
                 persist_output(job["id"], line)
         except queue.Empty:
             pass
@@ -162,11 +231,22 @@ def run_job(job):
                 process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid, signal.SIGKILL)
+        elif STALL_SECONDS and time.monotonic() - last_activity > STALL_SECONDS and process.poll() is None:
+            stalled = True
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
 
     return_code = process.wait()
     with transaction() as conn:
         current = row_dict(conn.execute("SELECT status FROM jobs WHERE id=?", (job["id"],)).fetchone())
-        if cancelled:
+        if stalled:
+            message = f"Conversion engine produced no heartbeat for {STALL_SECONDS} seconds"
+            conn.execute("UPDATE jobs SET status='failed', finished_at=?, current_archive=NULL, error_message=? WHERE id=?", (utc_now(), message, job["id"]))
+            add_event(conn, job["id"], "error", "stalled", message)
+        elif cancelled:
             conn.execute("UPDATE jobs SET status='cancelled', finished_at=?, current_archive=NULL WHERE id=?", (utc_now(), job["id"]))
             add_event(conn, job["id"], "warning", "cancelled", "Scan cancelled")
         elif current.get("status") in {"running", "stopping"}:
@@ -174,6 +254,7 @@ def run_job(job):
             message = f"Worker exited with status {return_code}" if return_code else "Scan completed"
             conn.execute("UPDATE jobs SET status=?, finished_at=?, current_archive=NULL, error_message=? WHERE id=?", (status, utc_now(), message if return_code else None, job["id"]))
             add_event(conn, job["id"], "error" if return_code else "success", status, message)
+    STRUCTURED_JOBS.discard(job["id"])
 
 
 def main():

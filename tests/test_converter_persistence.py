@@ -40,6 +40,7 @@ class ConverterPersistenceTests(unittest.TestCase):
             self.assertEqual(check.execute("SELECT bytes_saved FROM archives").fetchone()[0], 300)
             self.assertEqual(check.execute("SELECT COUNT(*) FROM archive_results").fetchone()[0], 1)
             self.assertEqual(check.execute("SELECT status FROM jobs WHERE id=?", (self.job_id,)).fetchone()[0], "succeeded")
+            self.assertEqual(check.execute("SELECT COUNT(*) FROM job_progress_samples WHERE job_id=?", (self.job_id,)).fetchone()[0], 1)
 
 
 if __name__ == "__main__":

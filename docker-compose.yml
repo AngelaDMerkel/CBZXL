@@ -11,6 +11,8 @@ x-cbzxl-common: &cbzxl-common
     DB_PATH: /config/cbzxl-v2.sqlite3
     LIBRARY_PATH: /data
     SCRATCH_DIR: /dev/shm/cbzxl
+    RESUME_DIR: /config/resume
+    WORKER_STALL_SECONDS: "900"
     TMPDIR: /dev/shm
     TEMP: /dev/shm
     TMP: /dev/shm

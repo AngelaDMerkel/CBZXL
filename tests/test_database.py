@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -20,7 +21,7 @@ class DatabaseTests(unittest.TestCase):
             version = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
             library = database.default_library(conn)
             profile = database.default_profile(conn)
-        self.assertEqual(version, 1)
+        self.assertEqual(version, 3)
         self.assertEqual(library["root_path"], database.LIBRARY_PATH)
         self.assertEqual(profile["name"], "Balanced lossless")
 
@@ -49,6 +50,22 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(claimed["id"], job_id)
         self.assertEqual(claimed["status"], "running")
         self.assertEqual(database.claim_next_job(), {})
+
+    def test_jobs_cannot_enable_filename_changing_operations(self):
+        with database.transaction() as conn:
+            library = database.default_library(conn)
+            profile = database.default_profile(conn)
+            job_id = database.create_job(
+                conn,
+                source="manual",
+                library_id=library["id"],
+                profile_id=profile["id"],
+                options={"no_flatten": False, "delete_empty": True},
+            )
+            stored = conn.execute("SELECT options_json FROM jobs WHERE id=?", (job_id,)).fetchone()[0]
+        options = json.loads(stored)
+        self.assertTrue(options["no_flatten"])
+        self.assertFalse(options["delete_empty"])
 
 
 if __name__ == "__main__":
