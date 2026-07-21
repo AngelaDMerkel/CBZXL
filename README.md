@@ -1,42 +1,43 @@
-# CBZXL
+# CBZXL Web 2.0
 
-This Python script unpacks CBZ archives and converts .JPEG and .PNG files to JXL using lossless compression at a user configurable effort level. The script includes basic logging and error handling. 
+CBZXL is a self-hosted CBZ-to-JPEG XL archive optimizer with a portable SQLite database, durable scheduling, a separate conversion worker, and a responsive operations interface.
 
-## Features
+## What changed
 
-- Converts JPEG and PNG to JXL losslessly
-- (Optionally and Intelligently) converts images lossily
-- Renames incorrect extensions using MIME type
-- Corrects atypical or unusual colour spaces or metadata
-- SQLite to skip reviously processed archives
-- SQLite for data visualisation with companion script
-- Basic logging
-- Basic archive error handling
-- User configurable timeout
+- Application state lives in `/config/cbzxl-v2.sqlite3`.
+- The web API and conversion worker are separate processes.
+- Scan requests, progress, cancellation, results, reviews, schedules, and activity survive restarts.
+- Schedules use daily, weekly, monthly, or repeating interval choices—no cron expressions.
+- Existing `converted_archives`, `runs`, and `archive_results` tables can be imported from the previous SQLite database.
+- Database exports use SQLite's online backup mechanism to produce a consistent single-file snapshot.
 
-## Usage
+## Run with Docker Compose
 
-- `--effort` overrides the default effort level of `10` and automatically sets the correct flags for effort `11`
-- `--threads` overrides the default of `10` threads
-- `--verbose` for more info including per archive savings and percent saved. I recommend you pass this flag
-- `--quiet` supresses all console messages except for critical errors
-- `--suppress-skipped` overrides `--verbose` and supresses any messages indicating when an archive has been skipped
-- `--backup` creates backups of the CBZ archives
-- `--dry-run`
-- `--no-flatten` prevents the script from flattening internal archive structure
-- `--no-convert` prevent conversion to JXL but allows all other functions (including flattening)
-- `--stats` displays database statistics
-- `--reprocess-failed`
-- `--reset-db` will delete both databases and allow the script to reinspect each archive from scratch
-- `--recheck-all` will force every archive to be rescanned without requiring the database to be deleted first
-- `--delete-empty-archives` will delete all archives which do not contain image files, even if they contain other file types
-- `--distance` will enable lossy conversion at the specified distance e.g. `0.1`
-- `--smart-distance` triggers a lossy conversion only for images above 10MB or 5 megapixels and defaults to a distance of `0.1` or whatever distance has been specified in `--distance`
+Update the two host paths in `docker-compose.yml`, then pull and run the published x86-64 image:
 
-## Visualise.py
+```sh
+docker compose pull
+docker compose up -d
+```
 
-Can be run using `python visualise.py` and will look for a appropriately named .db file in the working directory and use that to print some statistics inside the terminal. Additionally, `--html-report MyConversionReport.html` can be appended to write an HTML file containing both the statistics normally output to the console alongside embedded graphs. 
+Open `http://localhost:5000`. The web and worker containers share `/data` and `/config`; keep `/config` on storage local to the Docker host so SQLite WAL locking remains reliable.
 
-## Caveats
+## Import the existing database
 
-The script is pretty unsophisticated and it's up to the user to have `magic`, `cjxl` etc in their path for the script to use. As far as I can tell, it catches every edge case you're likely to encounter. 
+In **Data & settings**, enter the old database path as it appears inside the container—by default `/data/converted_archives.db`—and choose **Inspect first**. CBZXL checks database integrity and reports the available record counts before import. The source file is opened read-only and is never changed.
+
+The importer is idempotent. The same source snapshot will not be imported twice. A command-line dry run is also available:
+
+```sh
+docker compose run --rm cbzxl-web python -m cbzxl_web.legacy /data/converted_archives.db --dry-run
+```
+
+## Development checks
+
+```sh
+python -m unittest discover -s tests -v
+cd frontend && pnpm install && pnpm run build
+docker compose config
+```
+
+The published `angeladmerkel/cbzxl-web:latest` image targets `linux/amd64`. The production Dockerfile builds the React interface first, then packages it with the FastAPI application and Python worker.

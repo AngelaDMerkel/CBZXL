@@ -5,7 +5,9 @@ import tempfile
 import zipfile
 import subprocess
 import argparse
+import stat
 import time
+import uuid
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -13,16 +15,20 @@ from rich.console import Console
 from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn, SpinnerColumn
 from enum import Enum, auto
 
+from cbzxl_web.database import initialize as initialize_database, utc_now
+
 # Default Constants (can be overwritten by args)
 DEFAULT_JXL_EFFORT = 10
 DEFAULT_THREADS = 10
-SCRIPT_VERSION = "1.6"  # Versioning for tracking script changes
+SCRIPT_VERSION = "2.0.0"
 
-# Fixed Constants
-DB_FILE = "converted_archives.db"
-FAILED_DB_FILE = "failed_archives.db"
-LOG_FILE = "cbz_jxl_conversion.log"
+# Constants for use only in the Docker Container.
+CONFIG_DIR = os.getenv("CONFIG_DIR", "/config")
+DB_FILE = os.getenv("DB_PATH", os.path.join(CONFIG_DIR, "cbzxl-v2.sqlite3"))
+LOG_FILE = os.getenv("LOG_FILE", os.path.join(CONFIG_DIR, "cbzxl.log"))
 SUBPROCESS_TIMEOUT = 600 # Timeout — Will kill healthy conversions, so set high enough based on longest conversion duration on your hardware
+MAX_ARCHIVE_UNCOMPRESSED_BYTES = int(os.getenv("MAX_ARCHIVE_UNCOMPRESSED_MB", "8192")) * 1024 * 1024
+SCRATCH_DIR = Path(os.getenv("SCRATCH_DIR", "/dev/shm/cbzxl"))
 
 # Global variables - will be set in main()
 console = Console()
@@ -32,10 +38,13 @@ DRY_RUN = False
 BACKUP_ENABLED = False
 RECHECK_ALL = False
 DELETE_EMPTY_ARCHIVES = False
+RUN_ID = None
+LIBRARY_ID = os.getenv("LIBRARY_ID", "library-default")
 
 # These will be populated from args or defaults
 JXL_EFFORT = DEFAULT_JXL_EFFORT
 THREADS = DEFAULT_THREADS
+
 
 def get_cjxl_version():
     """Get the version of the cjxl encoder for tracking."""
@@ -50,20 +59,58 @@ def get_cjxl_version():
 
 JXL_VERSION = get_cjxl_version()
 
+def bounded_int(value, minimum, maximum, label):
+    try:
+        parsed = int(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"{label} must be a whole number") from e
+    if parsed < minimum or parsed > maximum:
+        raise argparse.ArgumentTypeError(f"{label} must be between {minimum} and {maximum}")
+    return parsed
+
+def bounded_float(value, minimum, maximum, label):
+    try:
+        parsed = float(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"{label} must be a number") from e
+    if parsed < minimum or parsed > maximum:
+        raise argparse.ArgumentTypeError(f"{label} must be between {minimum} and {maximum}")
+    return parsed
+
 
 class ConversionStatus(Enum):
     PROCESSED_SAVED_SPACE = auto()
     PROCESSED_NO_SPACE_SAVED = auto()
-    ALREADY_JXL_NO_CONVERTIBLES = auto()
-    NO_JPG_PNG_FOUND = auto()
+    NO_CONVERTIBLE_RECOGNIZED_IMAGES = auto()
     NO_IMAGES_RECOGNIZED = auto()
-    CONTAIN_OTHER_FORMATS = auto()
+
+
+def image_type_summary(counts):
+    present_types = [image_type for image_type, count in counts.items() if count > 0]
+    if not present_types:
+        return "N/A"
+    if len(present_types) > 1:
+        return "Mixed"
+    return present_types[0]
+
+
+def format_summary(paths):
+    ext_counts = {}
+    for path in paths:
+        ext = path.suffix.lower().lstrip(".")
+        ext_counts[ext] = ext_counts.get(ext, 0) + 1
+    if not ext_counts:
+        return ""
+    if len(ext_counts) == 1:
+        return next(iter(ext_counts)).upper()
+    return "recognized"
 
 
 def log(msg, level="info", msg_type="general"):
     """Log messages to console and log file, with optional [DRY RUN] prefix"""
     log_prefix = "[DRY RUN] " if DRY_RUN else ""
     full_msg = f"{log_prefix}{msg}"
+    Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
 
     if msg_type == "skipped" and SUPPRESS_SKIPPED and not DRY_RUN:
         with open(LOG_FILE, 'a', encoding='utf-8') as f:
@@ -78,69 +125,222 @@ def log(msg, level="info", msg_type="general"):
 
 
 def init_db(db_path):
-    """Initialize the SQLite database with the enhanced schema."""
+    """Open the versioned application database used by the worker."""
     if DRY_RUN and not Path(db_path).exists():
         log(f"Would initialize database at {db_path}")
         return None
+    initialize_database()
     conn = sqlite3.connect(db_path)
-    with conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS converted_archives (
-                path TEXT PRIMARY KEY,
-                original_size INTEGER,
-                final_size INTEGER,
-                bytes_saved INTEGER,
-                percent_saved REAL,
-                converted_at TEXT,
-                status TEXT DEFAULT 'processed',
-                dominant_type TEXT,
-                jxl_effort INTEGER,
-                processing_duration_seconds REAL,
-                image_count INTEGER,
-                jpg_count INTEGER,
-                png_count INTEGER,
-                script_version TEXT,
-                jxl_version TEXT,
-                error_message TEXT,
-                conversion_mode TEXT,
-                megapixels_info TEXT
-            )
-        """)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 
-def mark_processed(conn, path_str, original_size, final_size, saved_bytes, dominant_type, jxl_effort_level, duration, img_count, num_jpg, num_png, conversion_mode, megapixels_info):
+def conversion_run_mode(args):
+    if args.dry_run:
+        return "Dry run"
+    if args.no_convert:
+        return "No conversion"
+    if args.smart_distance:
+        return "Smart lossy"
+    if args.distance is not None:
+        return "Lossy"
+    return "Lossless"
+
+
+def archive_mtime(path_obj):
+    try:
+        return path_obj.stat().st_mtime
+    except OSError:
+        return None
+
+
+def iso_to_timestamp(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def archive_is_current(cbz_path_obj, db_row):
+    current_mtime = archive_mtime(cbz_path_obj)
+    if current_mtime is None:
+        return False
+
+    stored_mtime = db_row.get("archive_mtime")
+    try:
+        stored_mtime = float(stored_mtime) if stored_mtime is not None else None
+    except (TypeError, ValueError):
+        stored_mtime = None
+
+    processed_timestamp = stored_mtime or iso_to_timestamp(db_row.get("converted_at"))
+    if processed_timestamp is None:
+        return False
+    return current_mtime <= processed_timestamp + 1
+
+
+def start_run(conn, args, total_files):
+    if conn is None or not RUN_ID:
+        return
+    conn.execute("""
+        UPDATE jobs SET started_at=COALESCE(started_at, ?), status='running', archives_found=?
+        WHERE id=?
+    """, (utc_now(), total_files, RUN_ID))
+    conn.commit()
+
+
+def finish_run(conn, status, processed, skipped, failed, flattened, deleted, saved_bytes, increased_bytes, net_bytes):
+    if conn is None or not RUN_ID:
+        return
+    conn.execute("""
+        UPDATE jobs
+        SET finished_at = ?,
+            status = ?,
+            processed = ?,
+            skipped = ?,
+            failed = ?,
+            flattened = ?,
+            deleted = ?,
+            bytes_saved = ?,
+            bytes_increased = ?,
+            net_bytes_saved = ?
+        WHERE id = ?
+    """, (
+        utc_now(),
+        "partial" if status == "finished_with_errors" else "succeeded" if status == "finished" else status,
+        processed,
+        skipped,
+        failed,
+        flattened,
+        deleted,
+        saved_bytes,
+        increased_bytes,
+        net_bytes,
+        RUN_ID,
+    ))
+    conn.commit()
+
+
+def update_run_progress(conn, processed, skipped, failed, flattened, deleted, saved_bytes, increased_bytes, net_bytes):
+    if conn is None or not RUN_ID:
+        return
+    conn.execute("""
+        UPDATE jobs
+        SET processed = ?,
+            skipped = ?,
+            failed = ?,
+            flattened = ?,
+            deleted = ?,
+            bytes_saved = ?,
+            bytes_increased = ?,
+            net_bytes_saved = ?
+        WHERE id = ?
+    """, (
+        processed,
+        skipped,
+        failed,
+        flattened,
+        deleted,
+        saved_bytes,
+        increased_bytes,
+        net_bytes,
+        RUN_ID,
+    ))
+    conn.commit()
+
+
+def record_archive_result(conn, path_str, original_size, final_size, saved_bytes, status, dominant_type, jxl_effort_level, duration, img_count, num_jpg, num_png, conversion_mode, megapixels_info, error_message=None, archive_mtime_value=None):
+    if DRY_RUN or conn is None or not RUN_ID:
+        return
+    percent_saved = (saved_bytes / original_size) * 100 if original_size else 0
+    conn.execute("""
+        INSERT INTO archive_results
+        (job_id, archive_id, path, original_size, final_size, bytes_saved, percent_saved, status, dominant_type,
+         jxl_effort, processing_duration_seconds, image_count, jpg_count, png_count, conversion_mode,
+         megapixels_info, error_message, converted_at, archive_mtime)
+        VALUES (?, (SELECT id FROM archives WHERE library_id=? AND path=?), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(job_id, path) DO UPDATE SET archive_id=excluded.archive_id, original_size=excluded.original_size,
+          final_size=excluded.final_size, bytes_saved=excluded.bytes_saved, percent_saved=excluded.percent_saved,
+          status=excluded.status, dominant_type=excluded.dominant_type, jxl_effort=excluded.jxl_effort,
+          processing_duration_seconds=excluded.processing_duration_seconds, image_count=excluded.image_count,
+          jpg_count=excluded.jpg_count, png_count=excluded.png_count, conversion_mode=excluded.conversion_mode,
+          megapixels_info=excluded.megapixels_info, error_message=excluded.error_message,
+          converted_at=excluded.converted_at, archive_mtime=excluded.archive_mtime
+    """, (
+        RUN_ID,
+        LIBRARY_ID,
+        path_str,
+        path_str,
+        original_size,
+        final_size,
+        saved_bytes,
+        percent_saved,
+        status,
+        dominant_type,
+        jxl_effort_level,
+        duration,
+        img_count,
+        num_jpg,
+        num_png,
+        conversion_mode,
+        megapixels_info,
+        error_message,
+        utc_now(),
+        archive_mtime_value,
+    ))
+
+
+def mark_processed(conn, cbz_path_obj, path_str, original_size, final_size, saved_bytes, dominant_type, jxl_effort_level, duration, img_count, num_jpg, num_png, conversion_mode, megapixels_info):
     """Mark an archive as processed with enhanced metadata."""
     if DRY_RUN or conn is None:
         log(f"Would mark as processed: {path_str} (Duration: {duration:.2f}s, Images: {img_count})")
         return
 
     percent_saved = (saved_bytes / original_size) * 100 if original_size > 0 else 0
-    converted_at_iso = datetime.now().isoformat()
+    converted_at_iso = utc_now()
+    archive_mtime_value = archive_mtime(cbz_path_obj)
     try:
         conn.execute("""
-            INSERT OR REPLACE INTO converted_archives
-            (path, original_size, final_size, bytes_saved, percent_saved, converted_at, status, dominant_type, jxl_effort,
-             processing_duration_seconds, image_count, jpg_count, png_count, script_version, jxl_version, conversion_mode, megapixels_info)
-            VALUES (?, ?, ?, ?, ?, ?, 'processed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (path_str, original_size, final_size, saved_bytes, percent_saved, converted_at_iso, dominant_type, jxl_effort_level,
-              duration, img_count, num_jpg, num_png, SCRIPT_VERSION, JXL_VERSION, conversion_mode, megapixels_info))
+            INSERT INTO archives
+            (library_id, path, original_size, final_size, bytes_saved, percent_saved, converted_at, archive_mtime, status, dominant_type, jxl_effort,
+             processing_duration_seconds, image_count, jpg_count, png_count, script_version, jxl_version, conversion_mode, megapixels_info, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'processed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(library_id, path) DO UPDATE SET original_size=excluded.original_size, final_size=excluded.final_size,
+              bytes_saved=excluded.bytes_saved, percent_saved=excluded.percent_saved, converted_at=excluded.converted_at,
+              archive_mtime=excluded.archive_mtime, status='processed', dominant_type=excluded.dominant_type,
+              jxl_effort=excluded.jxl_effort, processing_duration_seconds=excluded.processing_duration_seconds,
+              image_count=excluded.image_count, jpg_count=excluded.jpg_count, png_count=excluded.png_count,
+              script_version=excluded.script_version, jxl_version=excluded.jxl_version, error_message=NULL,
+              conversion_mode=excluded.conversion_mode, megapixels_info=excluded.megapixels_info, updated_at=excluded.updated_at
+        """, (LIBRARY_ID, path_str, original_size, final_size, saved_bytes, percent_saved, converted_at_iso, archive_mtime_value, dominant_type, jxl_effort_level,
+              duration, img_count, num_jpg, num_png, SCRIPT_VERSION, JXL_VERSION, conversion_mode, megapixels_info, converted_at_iso, converted_at_iso))
+        record_archive_result(conn, path_str, original_size, final_size, saved_bytes, "processed", dominant_type, jxl_effort_level, duration, img_count, num_jpg, num_png, conversion_mode, megapixels_info, archive_mtime_value=archive_mtime_value)
         conn.commit()
     except sqlite3.DatabaseError as e:
         log(f"[red]❌ Failed to mark as processed in DB: {path_str} — {e}", level="error")
 
 
-def mark_failed(conn, path_str, duration, error_msg):
+def mark_failed(conn, cbz_path_obj, path_str, duration, error_msg):
     """Mark an archive as failed with duration and a specific error message."""
     if DRY_RUN or conn is None:
         log(f"Would mark as FAILED: {path_str} (Reason: {error_msg})")
         return
+    archive_mtime_value = archive_mtime(cbz_path_obj)
     try:
         conn.execute("""
-            INSERT OR REPLACE INTO converted_archives
-            (path, status, converted_at, script_version, jxl_version, processing_duration_seconds, error_message)
-            VALUES (?, 'failed', ?, ?, ?, ?, ?)
-        """, (path_str, datetime.now().isoformat(), SCRIPT_VERSION, JXL_VERSION, duration, error_msg))
+            INSERT INTO archives
+            (library_id, path, status, converted_at, archive_mtime, script_version, jxl_version,
+             processing_duration_seconds, error_message, created_at, updated_at)
+            VALUES (?, ?, 'failed', ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(library_id, path) DO UPDATE SET status='failed', converted_at=excluded.converted_at,
+              archive_mtime=excluded.archive_mtime, script_version=excluded.script_version, jxl_version=excluded.jxl_version,
+              processing_duration_seconds=excluded.processing_duration_seconds, error_message=excluded.error_message,
+              updated_at=excluded.updated_at
+        """, (LIBRARY_ID, path_str, utc_now(), archive_mtime_value, SCRIPT_VERSION, JXL_VERSION, duration, error_msg, utc_now(), utc_now()))
+        record_archive_result(conn, path_str, 0, 0, 0, "failed", "N/A", JXL_EFFORT, duration, 0, 0, 0, "N/A", "N/A", error_msg, archive_mtime_value=archive_mtime_value)
         conn.commit()
     except sqlite3.DatabaseError as e:
         log(f"[red]❌ Failed to mark as failed in DB: {path_str} — {e}", level="error")
@@ -151,6 +351,45 @@ def get_size(file_path):
     if not Path(file_path).exists():
         return 0
     return os.path.getsize(file_path)
+
+def get_scratch_dir():
+    SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
+    return SCRATCH_DIR
+
+def is_zip_symlink(zip_info):
+    mode = zip_info.external_attr >> 16
+    return stat.S_ISLNK(mode)
+
+def safe_extract_archive(zip_ref, destination):
+    """Extract a CBZ while blocking path traversal, symlinks, and oversized payloads."""
+    destination = Path(destination).resolve()
+    total_uncompressed = 0
+
+    for member in zip_ref.infolist():
+        member_name = member.filename.replace("\\", "/")
+        member_path = Path(member_name)
+
+        if member_name.startswith("/") or member_path.is_absolute() or ".." in member_path.parts:
+            raise ValueError(f"Unsafe archive path: {member.filename}")
+        if is_zip_symlink(member):
+            raise ValueError(f"Symlinks are not allowed in archives: {member.filename}")
+
+        total_uncompressed += member.file_size
+        if total_uncompressed > MAX_ARCHIVE_UNCOMPRESSED_BYTES:
+            max_mb = MAX_ARCHIVE_UNCOMPRESSED_BYTES // (1024 * 1024)
+            raise ValueError(f"Archive expands past configured limit of {max_mb} MB")
+
+        target_path = (destination / member_path).resolve()
+        if os.path.commonpath([destination, target_path]) != str(destination):
+            raise ValueError(f"Unsafe archive path: {member.filename}")
+
+        if member.is_dir():
+            target_path.mkdir(parents=True, exist_ok=True)
+            continue
+
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        with zip_ref.open(member) as source, open(target_path, "wb") as target:
+            shutil.copyfileobj(source, target)
 
 def run_magick_command(cmd_list, dry_run_log_msg):
     if DRY_RUN:
@@ -201,6 +440,10 @@ def correct_extension(img_path, mime):
         "image/png": ".png",
         "image/webp": ".webp",
         "image/avif": ".avif",
+        "image/tiff": ".tiff",
+        "image/bmp": ".bmp",
+        "image/x-bmp": ".bmp",
+        "image/x-ms-bmp": ".bmp",
     }
     correct_ext = ext_map.get(mime)
     if correct_ext and img_path.suffix.lower() != correct_ext:
@@ -213,8 +456,36 @@ def correct_extension(img_path, mime):
             except OSError as e:
                 log(f"[red]❌ Failed to rename {img_path} to {new_path}: {e}", level="error")
                 return img_path
-        return new_path
+        return img_path
     return img_path
+
+
+def cjxl_input_path(img_path_obj, mime):
+    if mime not in ("image/tiff", "image/bmp", "image/x-bmp", "image/x-ms-bmp"):
+        return img_path_obj, None
+
+    normalized_path = img_path_obj.with_suffix(f"{img_path_obj.suffix}.cbzxl.png")
+    try:
+        result = subprocess.run(
+            ["magick", str(img_path_obj), str(normalized_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=SUBPROCESS_TIMEOUT,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        log(f"[red]❌ Failed to prepare {img_path_obj.name} for JXL conversion: {e}", level="error")
+        return img_path_obj, None
+
+    if result.returncode != 0 or not normalized_path.exists() or get_size(normalized_path) == 0:
+        log(f"[red]❌ Failed to prepare {img_path_obj.name} for JXL conversion.", level="error")
+        if result.stderr:
+            log(f"[red]   magick stderr: {result.stderr.strip()}", level="error")
+        if normalized_path.exists():
+            os.remove(normalized_path)
+        return img_path_obj, None
+
+    return normalized_path, normalized_path
 
 
 def convert_single_image(img_path_obj, cli_args):
@@ -223,7 +494,8 @@ def convert_single_image(img_path_obj, cli_args):
 
     default_return = (0, 0.0, "N/A", 0)
 
-    if mime not in ("image/jpeg", "image/png"):
+    convertible_mimes = ("image/jpeg", "image/png", "image/tiff", "image/bmp", "image/x-bmp", "image/x-ms-bmp")
+    if mime not in convertible_mimes:
         return default_return
 
     img_path_obj = correct_extension(img_path_obj, mime)
@@ -269,8 +541,8 @@ def convert_single_image(img_path_obj, cli_args):
         conversion_mode = "Lossy"
     # Smart distance logic
     elif cli_args.smart_distance:
-        is_large_file = orig_size > (10 * 1024 * 1024)  # 10MB
-        is_high_res = megapixels > 5.0
+        is_large_file = orig_size > (cli_args.smart_mb * 1024 * 1024)
+        is_high_res = megapixels > cli_args.smart_mp
         if is_large_file or is_high_res:
             # Use distance from --distance flag if provided, otherwise default to 0.1
             final_distance = cli_args.distance if cli_args.distance is not None else 0.1
@@ -282,7 +554,15 @@ def convert_single_image(img_path_obj, cli_args):
         log(f"   Would convert image to JXL: {img_path_obj.name} (Effort: {JXL_EFFORT}, Distance: {final_distance})")
         return default_return
 
-    cjxl_cmd = ["cjxl", "-d", str(final_distance), f"--effort={JXL_EFFORT}", img_path_str, str(jxl_path)]
+    encoder_input_path, cleanup_path = cjxl_input_path(img_path_obj, mime)
+    encoder_input_str = str(encoder_input_path)
+
+    # Base cjxl command
+    cjxl_cmd = ["cjxl", "-d", str(final_distance), f"--effort={JXL_EFFORT}"]
+    if JXL_EFFORT == 11:
+        cjxl_cmd.append("--allow_expert_options")
+    cjxl_cmd.extend([encoder_input_str, str(jxl_path)])
+    
     result = None
     try:
         result = subprocess.run(cjxl_cmd, capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT)
@@ -291,7 +571,12 @@ def convert_single_image(img_path_obj, cli_args):
             log(f"[yellow]   ⚠️ Retrying {img_path_obj.name} with --allow_jpeg_reconstruction 0 due to error: {result.stderr.strip()}", level="error")
             if jxl_path.exists(): os.remove(jxl_path)
             
-            cjxl_cmd_retry = ["cjxl", "-d", str(final_distance), f"--effort={JXL_EFFORT}", "--allow_jpeg_reconstruction", "0", img_path_str, str(jxl_path)]
+            # Base retry command
+            cjxl_cmd_retry = ["cjxl", "-d", str(final_distance), f"--effort={JXL_EFFORT}"]
+            if JXL_EFFORT == 11:
+                cjxl_cmd_retry.append("--allow_expert_options")
+            cjxl_cmd_retry.extend(["--allow_jpeg_reconstruction", "0", encoder_input_str, str(jxl_path)])
+            
             result = subprocess.run(cjxl_cmd_retry, capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT)
     except subprocess.TimeoutExpired:
         log(f"[red]❌ cjxl timed out after {SUBPROCESS_TIMEOUT}s on {img_path_obj.name}", level="error")
@@ -321,6 +606,9 @@ def convert_single_image(img_path_obj, cli_args):
     except Exception as e:
         log(f"[red]❌ Unexpected error converting {img_path_obj.name}: {e}", level="error")
         return default_return
+    finally:
+        if cleanup_path and cleanup_path.exists():
+            os.remove(cleanup_path)
 
 
 def convert_images(temp_dir_path, cli_args):
@@ -334,12 +622,18 @@ def convert_images(temp_dir_path, cli_args):
     
     jpg_count = 0
     png_count = 0
+    tiff_count = 0
+    bmp_count = 0
+    jxl_count = 0
+    other_count = 0
     dominant_type = "N/A"
 
     known_jpg_exts = ('.jpg', '.jpeg')
     known_png_exts = ('.png',)
+    known_tiff_exts = ('.tif', '.tiff')
+    known_bmp_exts = ('.bmp',)
     known_jxl_exts = ('.jxl',)
-    known_other_image_exts = ('.webp', '.avif', '.gif', '.tiff', '.bmp')
+    known_other_image_exts = ('.webp', '.avif', '.gif')
 
     for p in all_files_in_temp:
         if not p.is_file():
@@ -351,35 +645,44 @@ def convert_images(temp_dir_path, cli_args):
         elif ext in known_png_exts:
             convertible_paths.append(p)
             png_count += 1
+        elif ext in known_tiff_exts:
+            convertible_paths.append(p)
+            tiff_count += 1
+        elif ext in known_bmp_exts:
+            convertible_paths.append(p)
+            bmp_count += 1
         elif ext in known_jxl_exts:
             jxl_paths.append(p)
+            jxl_count += 1
         elif ext in known_other_image_exts:
             other_image_paths.append(p)
+            other_count += 1
     
-    image_count = jpg_count + png_count
-
-    if jpg_count > png_count:
-        dominant_type = "JPG"
-    elif png_count > jpg_count:
-        dominant_type = "PNG"
-    elif jpg_count > 0:
-        dominant_type = "Mixed"
+    other_type = format_summary(other_image_paths) if other_image_paths else "Other"
+    image_count = jpg_count + png_count + tiff_count + bmp_count + jxl_count + other_count
+    dominant_type = image_type_summary({
+        "JPG": jpg_count,
+        "PNG": png_count,
+        "TIFF": tiff_count,
+        "BMP": bmp_count,
+        "JXL": jxl_count,
+        other_type: other_count,
+    })
 
     base_return = (0, "", dominant_type, image_count, jpg_count, png_count, "N/A", "N/A")
 
     if not convertible_paths:
-        if jxl_paths:
-            return ConversionStatus.ALREADY_JXL_NO_CONVERTIBLES, *base_return
-        elif other_image_paths:
-            ext_counts = {p.suffix.lower(): 0 for p in other_image_paths}
-            for p in other_image_paths: ext_counts[p.suffix.lower()] += 1
-            most_frequent_ext = max(ext_counts, key=ext_counts.get) if ext_counts else ""
-            return ConversionStatus.CONTAIN_OTHER_FORMATS, 0, most_frequent_ext[1:].upper(), dominant_type, image_count, jpg_count, png_count, "N/A", "N/A"
+        recognized_nonconvertible_paths = jxl_paths + other_image_paths
+        if recognized_nonconvertible_paths:
+            dominant_nonconvertible = format_summary(recognized_nonconvertible_paths)
+            if VERBOSE or DRY_RUN:
+                log(f"   Found {len(recognized_nonconvertible_paths)} existing {dominant_nonconvertible} image(s). No conversion needed.")
+            return ConversionStatus.NO_CONVERTIBLE_RECOGNIZED_IMAGES, 0, dominant_nonconvertible, dominant_type, image_count, jpg_count, png_count, "N/A", "N/A"
         else:
             return ConversionStatus.NO_IMAGES_RECOGNIZED, *base_return
 
     if VERBOSE or DRY_RUN:
-        log(f"   Found {len(convertible_paths)} JPEG/PNG images for potential conversion...")
+        log(f"   Found {len(convertible_paths)} JPEG/PNG/TIFF/BMP images for potential conversion...")
     
     results = []
     with ThreadPoolExecutor(max_workers=THREADS) as executor:
@@ -489,24 +792,25 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args):
             except Exception as e:
                 duration = time.monotonic() - start_time
                 log(f"[red]❌ Failed to backup {rel_path_str}: {e}", level="error")
-                mark_failed(conn_fail, rel_path_str, duration, str(e))
-                return 0, False, False
+                mark_failed(conn_fail, cbz_path_obj, rel_path_str, duration, str(e))
+                mark_failed(conn_main, cbz_path_obj, rel_path_str, duration, str(e))
+                return 0, False, False, "failed"
 
     temp_dir_obj = None
     original_cbz_size = get_size(cbz_path_obj)
     
     try:
-        temp_dir_obj = Path(tempfile.mkdtemp())
+        temp_dir_obj = Path(tempfile.mkdtemp(prefix="cbzxl-", dir=get_scratch_dir()))
 
-        if not DRY_RUN:
-            try:
-                with zipfile.ZipFile(cbz_path_obj, 'r') as zip_ref:
-                    zip_ref.extractall(temp_dir_obj)
-            except Exception as e:
-                duration = time.monotonic() - start_time
-                log(f"[red]❌ Failed to extract {rel_path_str}: {e}", level="error")
-                mark_failed(conn_fail, rel_path_str, duration, str(e))
-                return 0, False, False
+        try:
+            with zipfile.ZipFile(cbz_path_obj, 'r') as zip_ref:
+                safe_extract_archive(zip_ref, temp_dir_obj)
+        except Exception as e:
+            duration = time.monotonic() - start_time
+            log(f"[red]❌ Failed to extract {rel_path_str}: {e}", level="error")
+            mark_failed(conn_fail, cbz_path_obj, rel_path_str, duration, str(e))
+            mark_failed(conn_main, cbz_path_obj, rel_path_str, duration, str(e))
+            return 0, False, False, "failed"
 
         # --- Conversion Step ---
         conversion_saved_bytes = 0
@@ -515,9 +819,7 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args):
         if not cli_args.no_convert:
             status, saved_bytes, dominant_other, dominant_type, img_count, num_jpg, num_png, conv_mode, mp_info = convert_images(temp_dir_obj, cli_args)
             conversion_saved_bytes = saved_bytes
-            if status == ConversionStatus.ALREADY_JXL_NO_CONVERTIBLES: log(f"   ℹ️  Already JXL. No conversion needed.")
-            elif status == ConversionStatus.CONTAIN_OTHER_FORMATS: log(f"   ℹ️  Contains {dominant_other} images. No JPEG/PNG found.")
-            elif status == ConversionStatus.NO_JPG_PNG_FOUND: log(f"   ⚠️ No JPEG/PNG images found for conversion.")
+            if status == ConversionStatus.NO_CONVERTIBLE_RECOGNIZED_IMAGES: log(f"   ℹ️  Contains {dominant_other} image(s). No conversion needed.")
             elif status == ConversionStatus.NO_IMAGES_RECOGNIZED: log(f"   ⚠️ No processable images found in the archive.")
         else:
             log("   ⏩ Conversion skipped by user command.")
@@ -532,16 +834,17 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args):
                 try:
                     os.remove(cbz_path_obj)
                     log(f"[green]   ✅ Deleted empty archive: {rel_path_str}[/green]")
-                    mark_processed(conn_main, rel_path_str, original_cbz_size, 0, original_cbz_size, "DELETED", JXL_EFFORT, duration, 0, 0, 0, "N/A", "N/A")
-                    return 0, False, True
+                    mark_processed(conn_main, cbz_path_obj, rel_path_str, original_cbz_size, 0, original_cbz_size, "DELETED", JXL_EFFORT, duration, 0, 0, 0, "N/A", "N/A")
+                    return 0, False, True, "deleted"
                 except Exception as e:
                     log(f"[red]❌ Failed to delete empty archive {rel_path_str}: {e}", level="error")
-                    mark_failed(conn_fail, rel_path_str, duration, str(e))
-                    return 0, False, False
+                    mark_failed(conn_fail, cbz_path_obj, rel_path_str, duration, str(e))
+                    mark_failed(conn_main, cbz_path_obj, rel_path_str, duration, str(e))
+                    return 0, False, False, "failed"
             else:
                 log(f"[DRY RUN]   Would delete empty archive: {rel_path_str}")
-                mark_processed(conn_main, rel_path_str, original_cbz_size, 0, original_cbz_size, "WOULD_DELETE", JXL_EFFORT, duration, 0, 0, 0, "N/A", "N/A")
-                return 0, False, True
+                mark_processed(conn_main, cbz_path_obj, rel_path_str, original_cbz_size, 0, original_cbz_size, "WOULD_DELETE", JXL_EFFORT, duration, 0, 0, 0, "N/A", "N/A")
+                return 0, False, True, "deleted"
 
         # --- Flattening Step ---
         flattened_this_archive = False
@@ -557,39 +860,55 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args):
         if action_taken:
             final_size = original_cbz_size - conversion_saved_bytes # Dry run estimate
             if not DRY_RUN:
-                new_cbz_path_str = tempfile.mktemp(suffix=".cbz", dir=cbz_path_obj.parent)
-                with zipfile.ZipFile(new_cbz_path_str, 'w', zipfile.ZIP_DEFLATED) as zip_out:
-                    for file_path in temp_dir_obj.rglob("*"):
-                        if file_path.is_file():
-                            zip_out.write(file_path, file_path.relative_to(temp_dir_obj).as_posix())
-                shutil.move(new_cbz_path_str, cbz_path_obj)
+                tmp_file = tempfile.NamedTemporaryFile(prefix="cbzxl-repack-", suffix=".cbz", dir=get_scratch_dir(), delete=False)
+                new_cbz_path_str = tmp_file.name
+                tmp_file.close()
+                try:
+                    with zipfile.ZipFile(new_cbz_path_str, 'w', zipfile.ZIP_STORED) as zip_out:
+                        for file_path in temp_dir_obj.rglob("*"):
+                            if file_path.is_file():
+                                zip_out.write(file_path, file_path.relative_to(temp_dir_obj).as_posix())
+                    replace_path = cbz_path_obj.with_name(f".{cbz_path_obj.name}.cbzxl-replace")
+                    try:
+                        shutil.copy2(new_cbz_path_str, replace_path)
+                        os.replace(replace_path, cbz_path_obj)
+                    finally:
+                        if replace_path.exists():
+                            os.remove(replace_path)
+                except Exception:
+                    if os.path.exists(new_cbz_path_str):
+                        os.remove(new_cbz_path_str)
+                    raise
+                if os.path.exists(new_cbz_path_str):
+                    os.remove(new_cbz_path_str)
                 final_size = get_size(cbz_path_obj)
 
             actual_saved_bytes = original_cbz_size - final_size
             reduction_percentage = (actual_saved_bytes / original_cbz_size) * 100 if original_cbz_size > 0 else 0
             log_msg = f"Repacked. Final Size: {final_size / (1024*1024):.2f} MB. Change: {actual_saved_bytes / (1024*1024):.2f} MB ({reduction_percentage:.2f}%)"
             log(f"   ✅ {log_msg}")
-            mark_processed(conn_main, rel_path_str, original_cbz_size, final_size, actual_saved_bytes, dominant_type, JXL_EFFORT, duration, img_count, num_jpg, num_png, conv_mode, mp_info)
-            return actual_saved_bytes, flattened_this_archive, False
+            mark_processed(conn_main, cbz_path_obj, rel_path_str, original_cbz_size, final_size, actual_saved_bytes, dominant_type, JXL_EFFORT, duration, img_count, num_jpg, num_png, conv_mode, mp_info)
+            return actual_saved_bytes, flattened_this_archive, False, "processed"
         else:
             log("   No actions performed that require repacking.")
-            mark_processed(conn_main, rel_path_str, original_cbz_size, original_cbz_size, 0, dominant_type, JXL_EFFORT, duration, img_count, num_jpg, num_png, conv_mode, mp_info)
-            return 0, flattened_this_archive, False
+            mark_processed(conn_main, cbz_path_obj, rel_path_str, original_cbz_size, original_cbz_size, 0, dominant_type, JXL_EFFORT, duration, img_count, num_jpg, num_png, conv_mode, mp_info)
+            return 0, flattened_this_archive, False, "processed"
 
     except Exception as e:
         duration = time.monotonic() - start_time
         log(f"[red]❌❌ UNHANDLED EXCEPTION while processing {rel_path_str}: {e}", level="error")
         import traceback
         log(f"[red]Traceback: {traceback.format_exc()}", level="error")
-        if conn_fail: mark_failed(conn_fail, rel_path_str, duration, str(e))
-        return 0, False, False
+        if conn_fail: mark_failed(conn_fail, cbz_path_obj, rel_path_str, duration, str(e))
+        if conn_main: mark_failed(conn_main, cbz_path_obj, rel_path_str, duration, str(e))
+        return 0, False, False, "failed"
     finally:
         if temp_dir_obj and temp_dir_obj.exists() and not (DRY_RUN and os.environ.get("CBZJXL_KEEP_DRY_RUN_TEMP")):
             shutil.rmtree(temp_dir_obj)
 
 
 def main():
-    global VERBOSE, SUPPRESS_SKIPPED, DRY_RUN, BACKUP_ENABLED, JXL_EFFORT, THREADS, RECHECK_ALL, DELETE_EMPTY_ARCHIVES
+    global VERBOSE, SUPPRESS_SKIPPED, DRY_RUN, BACKUP_ENABLED, JXL_EFFORT, THREADS, RECHECK_ALL, DELETE_EMPTY_ARCHIVES, RUN_ID
 
     parser = argparse.ArgumentParser(description="Convert images in CBZ files to JPEG XL and flatten structure.")
     parser.add_argument("input_dir", nargs="?", default=".", help="Directory to scan for CBZ files (default: current directory)")
@@ -600,12 +919,15 @@ def main():
     action_group.add_argument("--backup", action="store_true", help="Backup original CBZ files (as .cbz.bak).")
     action_group.add_argument("--dry-run", action="store_true", help="Simulate processing without modifying files.")
     action_group.add_argument("--delete-empty-archives", action="store_true", help="Delete CBZ archives with no recognized images.")
-    action_group.add_argument("--smart-distance", action="store_true", help="Apply lossy conversion only to images >10MB or >5MP.")
+    action_group.add_argument("--smart-distance", action="store_true", help="Apply lossy conversion only to images meeting size/resolution thresholds.")
+    action_group.add_argument("--only-path", help=argparse.SUPPRESS)
 
     tuning_group = parser.add_argument_group('Conversion Tuning')
-    tuning_group.add_argument("--effort", type=int, default=DEFAULT_JXL_EFFORT, choices=range(0,11), metavar="[0-10]", help=f"JXL encoding effort (default: {DEFAULT_JXL_EFFORT})")
-    tuning_group.add_argument("--threads", type=int, default=DEFAULT_THREADS, help=f"Number of threads for image conversion (default: {DEFAULT_THREADS})")
-    tuning_group.add_argument("--distance", type=float, help="Set JXL lossy distance (e.g., 1.0). Overrides default lossless.")
+    tuning_group.add_argument("--effort", "-e", type=int, default=DEFAULT_JXL_EFFORT, choices=range(0,12), metavar="[0-11]", help=f"JXL encoding effort (0-10 standard, 11 for expert mode; default: {DEFAULT_JXL_EFFORT})")
+    tuning_group.add_argument("--threads", type=lambda value: bounded_int(value, 1, 32, "threads"), default=DEFAULT_THREADS, help=f"Number of threads for image conversion (default: {DEFAULT_THREADS})")
+    tuning_group.add_argument("--distance", type=lambda value: bounded_float(value, 0, 15, "distance"), help="Set JXL lossy distance (e.g., 1.0). Overrides default lossless.")
+    tuning_group.add_argument("--smart-mb", type=lambda value: bounded_float(value, 0.1, 1000, "smart-mb"), default=10.0, help="Set the file size threshold in MB for --smart-distance (default: 10.0)")
+    tuning_group.add_argument("--smart-mp", type=lambda value: bounded_float(value, 0.1, 1000, "smart-mp"), default=5.0, help="Set the megapixel threshold for --smart-distance (default: 5.0)")
 
     output_group = parser.add_argument_group('Output Control')
     output_group.add_argument("--quiet", "-q", action="store_true", help="Suppress all console output except critical errors.")
@@ -617,6 +939,7 @@ def main():
     db_group.add_argument("--reprocess-failed", action="store_true", help="Run processing only on files listed in the failed DB.")
     db_group.add_argument("--reset-db", action="store_true", help="Delete both databases to reprocess everything.")
     db_group.add_argument("--recheck-all", action="store_true", help="Process all CBZ files, overwriting existing DB entries.")
+    db_group.add_argument("--run-id", default=None, help="Run identifier supplied by the web API.")
     
     args = parser.parse_args()
     
@@ -626,8 +949,9 @@ def main():
     BACKUP_ENABLED = args.backup
     JXL_EFFORT = args.effort
     THREADS = args.threads
-    RECHECK_ALL = args.recheck_all
+    RECHECK_ALL = args.recheck_all or bool(args.only_path)
     DELETE_EMPTY_ARCHIVES = args.delete_empty_archives
+    RUN_ID = args.run_id or str(uuid.uuid4())
 
     if DRY_RUN: console.print("[bold yellow] DRY RUN MODE ENABLED [/bold yellow] - No actual changes will be made.")
 
@@ -650,63 +974,85 @@ def main():
             return 1
 
     conn = init_db(DB_FILE)
-    fail_conn = init_db(FAILED_DB_FILE)
+    fail_conn = None
     
-    processed_paths = set()
+    processed_paths = {}
     if conn and not RECHECK_ALL:
         try:
-            cursor = conn.execute("SELECT path FROM converted_archives WHERE status = 'processed'")
-            processed_paths.update(row[0] for row in cursor)
-            if VERBOSE and processed_paths: log(f"Found {len(processed_paths)} successfully processed archives in the database to be skipped.")
+            cursor = conn.execute(
+                "SELECT path, converted_at, archive_mtime FROM archives WHERE library_id=? AND status='processed'",
+                (LIBRARY_ID,),
+            )
+            processed_paths.update({row[0]: {"converted_at": row[1], "archive_mtime": row[2]} for row in cursor})
+            if VERBOSE and processed_paths: log(f"Found {len(processed_paths)} successfully processed archives in the database to check for updates.")
         except sqlite3.Error as e:
             log(f"[red]Could not pre-load paths from DB: {e}", level="error")
 
     resolved_input_dir = Path(args.input_dir).resolve()
     cbz_files_path_obj_list = list(resolved_input_dir.rglob('*.cbz'))
+    if args.only_path:
+        requested = Path(args.only_path).as_posix()
+        cbz_files_path_obj_list = [
+            path for path in cbz_files_path_obj_list
+            if os.path.relpath(path, resolved_input_dir).replace(os.sep, "/") == requested
+        ]
     total_files = len(cbz_files_path_obj_list)
 
     if total_files == 0:
         log(f"No CBZ files found in '{resolved_input_dir}'. Exiting.")
+        start_run(conn, args, 0)
+        finish_run(conn, "finished", 0, 0, 0, 0, 0, 0, 0, 0)
         return 0
 
     log(f"🛠️ Starting CBZ processing for {total_files} file(s) in '{resolved_input_dir}'...")
     log(f"   Script Version: {SCRIPT_VERSION}, JXL Version: {JXL_VERSION}")
     log(f"   JXL Effort: {JXL_EFFORT}, Conversion Threads: {THREADS}")
-    if args.distance: log(f"   JXL Distance: {args.distance}")
-    if args.smart_distance: log("   Mode: SMART DISTANCE ENABLED")
+    if args.distance is not None: log(f"   JXL Distance: {args.distance}")
+    if args.smart_distance:
+        log("   Mode: SMART DISTANCE ENABLED")
+        log(f"     Thresholds: >{args.smart_mb:.1f} MB or >{args.smart_mp:.1f} MP")
     if BACKUP_ENABLED: log("   Backup: ENABLED")
     if RECHECK_ALL: log("   Mode: RECHECK ALL ARCHIVES (Overwriting DB entries)")
     if DELETE_EMPTY_ARCHIVES: log("   Action: DELETE EMPTY ARCHIVES ENABLED")
 
     # ... (rest of the main processing loop is largely unchanged, as the new logic is in process_cbz) ...
-    total_bytes_saved_overall, processed_count, skipped_count, flattened_archives_count, deleted_empty_archives_count = 0, 0, 0, 0, 0
+    start_run(conn, args, total_files)
+    total_bytes_saved_overall, total_bytes_increased_overall = 0, 0
+    processed_count, skipped_count, failed_to_process_count, flattened_archives_count, deleted_empty_archives_count = 0, 0, 0, 0, 0
 
     with Progress(SpinnerColumn(), TextColumn("[cyan]{task.description}[/cyan]"), BarColumn(), TextColumn("{task.completed}/{task.total} archives"), TimeRemainingColumn(), console=console, disable=args.quiet and not DRY_RUN) as progress_bar:
         task_id = progress_bar.add_task("Processing CBZs...", total=total_files)
 
         for cbz_path in cbz_files_path_obj_list:
             rel_path_for_db = os.path.relpath(cbz_path, resolved_input_dir)
-            if rel_path_for_db in processed_paths:
+            processed_row = processed_paths.get(rel_path_for_db)
+            if processed_row and archive_is_current(cbz_path, processed_row):
                 skipped_count += 1
                 log(f"[yellow]⚠️ Skipping already processed archive: {rel_path_for_db}", msg_type="skipped")
+                update_run_progress(conn, processed_count, skipped_count, failed_to_process_count, flattened_archives_count, deleted_empty_archives_count, total_bytes_saved_overall, total_bytes_increased_overall, total_bytes_saved_overall - total_bytes_increased_overall)
                 progress_bar.update(task_id, advance=1)
                 continue
+            if processed_row and VERBOSE:
+                log(f"[blue]↻ Rechecking updated archive: {rel_path_for_db}")
             
-            bytes_saved, was_flattened, was_deleted = process_cbz(cbz_path, conn, fail_conn, args)
+            bytes_saved, was_flattened, was_deleted, outcome = process_cbz(cbz_path, conn, fail_conn, args)
             
-            if was_deleted: deleted_empty_archives_count += 1
+            if outcome == "failed":
+                failed_to_process_count += 1
+            elif was_deleted:
+                deleted_empty_archives_count += 1
             else:
                 processed_count += 1
-                total_bytes_saved_overall += bytes_saved
+                total_bytes_saved_overall += max(bytes_saved, 0)
+                total_bytes_increased_overall += max(-bytes_saved, 0)
                 if was_flattened: flattened_archives_count += 1
+            update_run_progress(conn, processed_count, skipped_count, failed_to_process_count, flattened_archives_count, deleted_empty_archives_count, total_bytes_saved_overall, total_bytes_increased_overall, total_bytes_saved_overall - total_bytes_increased_overall)
             progress_bar.update(task_id, advance=1)
 
-    failed_to_process_count = 0
-    if os.path.exists(FAILED_DB_FILE):
-        with sqlite3.connect(FAILED_DB_FILE) as temp_fail_conn:
-            try: failed_to_process_count = temp_fail_conn.execute("SELECT COUNT(*) FROM converted_archives").fetchone()[0]
-            except sqlite3.Error: pass
-    
+    net_bytes_saved = total_bytes_saved_overall - total_bytes_increased_overall
+    run_status = "finished_with_errors" if failed_to_process_count else "finished"
+    finish_run(conn, run_status, processed_count, skipped_count, failed_to_process_count, flattened_archives_count, deleted_empty_archives_count, total_bytes_saved_overall, total_bytes_increased_overall, net_bytes_saved)
+
     if conn: conn.close()
     if fail_conn: fail_conn.close()
 
@@ -718,10 +1064,10 @@ def main():
     log(f"   Archives deleted (no images): {deleted_empty_archives_count}")
     log(f"   Failed to process:        {failed_to_process_count}")
     
-    if total_bytes_saved_overall >= 0:
-        log(f"   Total space saved:        {total_bytes_saved_overall / (1024 ** 3):.3f} GB ({total_bytes_saved_overall / (1024 ** 2):.2f} MB)")
+    if net_bytes_saved >= 0:
+        log(f"   Net space saved:          {net_bytes_saved / (1024 ** 3):.3f} GB ({net_bytes_saved / (1024 ** 2):.2f} MB)")
     else:
-        log(f"   Total space increased by: {-total_bytes_saved_overall / (1024 ** 3):.3f} GB ({-total_bytes_saved_overall / (1024 ** 2):.2f} MB)")
+        log(f"   Net space increased by:   {-net_bytes_saved / (1024 ** 3):.3f} GB ({-net_bytes_saved / (1024 ** 2):.2f} MB)")
 
     log(f"Log file written to: {Path(LOG_FILE).resolve()}")
     if DRY_RUN: console.print("[bold yellow]DRY RUN COMPLETE[/bold yellow] - No actual changes were made to files or databases.")

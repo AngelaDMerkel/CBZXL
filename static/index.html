@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CBZXL</title>
+  <link rel="stylesheet" href="/static/app.css?v=20260525-3">
+  <script src="/static/app.js?v=20260525-3" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="side-rail">
+      <div class="rail-brand">
+        <span class="brand-mark">CX</span>
+        <div>
+          <strong>CBZXL</strong>
+          <small>Archive operations</small>
+        </div>
+      </div>
+      <nav class="rail-nav">
+        <a href="#overview" class="active">Overview</a>
+        <a href="#analytics">Analytics</a>
+        <a href="#review">Review</a>
+        <a href="#scan">Scan</a>
+      </nav>
+      <div class="rail-status">
+        <span class="status-dot"></span>
+        <div>
+          <strong id="runState">Idle</strong>
+          <small id="railReview">No review items</small>
+        </div>
+      </div>
+    </aside>
+
+    <div class="workspace">
+      <header class="topbar">
+        <div class="page-title">
+          <span>Dashboard</span>
+          <h1>Archive Operations</h1>
+        </div>
+        <div class="actions">
+          <button id="refreshBtn" class="ghost">Refresh</button>
+          <button id="stopBtn" class="danger" disabled>Stop</button>
+          <button id="scanBtn" class="primary">Start Scan</button>
+        </div>
+      </header>
+
+      <main>
+        <section id="overview" class="metrics">
+          <article class="metric positive">
+            <span>Net Saved</span>
+            <strong id="netSaved">0 GB</strong>
+            <small id="grossSaved">0 GB saved</small>
+          </article>
+          <article class="metric warning">
+            <span>Review Queue</span>
+            <strong id="reviewTotal">0</strong>
+            <small id="reviewSplit">0 grew, 0 failed</small>
+          </article>
+          <article class="metric">
+            <span>Indexed</span>
+            <strong id="archiveCount">0</strong>
+            <small id="formatHint">archives</small>
+          </article>
+          <article class="metric danger-line">
+            <span>Failures</span>
+            <strong id="failedCount">0</strong>
+            <small>active failed archives</small>
+          </article>
+        </section>
+
+        <section class="hero-grid">
+          <article class="panel run-panel">
+            <div class="panel-head">
+              <div>
+                <h2>Current Run</h2>
+                <span id="runMode">Waiting</span>
+              </div>
+              <strong id="progressPercent">0%</strong>
+            </div>
+            <div class="run-card">
+              <div id="runBanner" class="run-banner idle">
+                <strong id="runBannerTitle">No scan is running</strong>
+                <span id="runBannerDetail">Start a scan to see live progress here.</span>
+              </div>
+              <div class="progress-track"><span id="progressFill"></span></div>
+              <div class="progress-meta">
+                <span id="progressCounts">No run recorded yet</span>
+                <span id="currentArchive">No archive currently processing.</span>
+              </div>
+              <div class="run-timeline">
+                <span><b>Started</b><em id="runStarted">Not started</em></span>
+                <span><b>Elapsed</b><em id="runElapsed">0s</em></span>
+                <span><b>Remaining</b><em id="runRemaining">Unknown</em></span>
+                <span><b>Last update</b><em id="runUpdated">Waiting</em></span>
+              </div>
+              <div class="run-stats">
+                <span><b id="runProcessed">0</b> processed</span>
+                <span><b id="runSkipped">0</b> skipped</span>
+                <span><b id="runFailed">0</b> failed</span>
+                <span><b id="runNet">0 GB</b> net</span>
+              </div>
+            </div>
+          </article>
+
+          <article class="panel activity-panel">
+            <div class="panel-head">
+              <div>
+                <h2>Activity</h2>
+                <span>Clean run events</span>
+              </div>
+            </div>
+            <div id="activity" class="activity-list"></div>
+          </article>
+        </section>
+
+        <section id="analytics" class="layout">
+          <article class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>Compression</h2>
+                <span>Outcome buckets</span>
+              </div>
+            </div>
+            <div id="distribution" class="chart-slot"></div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>Formats</h2>
+                <span>Indexed mix</span>
+              </div>
+            </div>
+            <div id="formats" class="chart-slot"></div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>Modes</h2>
+                <span>Conversion mix</span>
+              </div>
+            </div>
+            <div id="compatibility" class="chart-slot"></div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>Sources</h2>
+                <span>Net savings</span>
+              </div>
+            </div>
+            <div id="sources" class="chart-slot"></div>
+          </article>
+        </section>
+
+        <section id="review" class="review-grid">
+          <article class="panel review-panel">
+            <div class="panel-head">
+              <div>
+                <h2>Archive Review</h2>
+                <span>Grown and failed archives</span>
+              </div>
+              <div class="segmented">
+                <button id="reviewGrewBtn" class="active" data-review-kind="grew">Grew</button>
+                <button id="reviewFailedBtn" data-review-kind="failed">Failed</button>
+              </div>
+            </div>
+            <div class="table-wrap review-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Archive</th>
+                    <th class="numeric">Change</th>
+                    <th class="numeric">Ratio</th>
+                    <th>Mode</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody id="reviewRows"></tbody>
+              </table>
+            </div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>Run History</h2>
+                <span>Net GB by scan</span>
+              </div>
+            </div>
+            <div id="runChart" class="bars"></div>
+          </article>
+        </section>
+
+        <section class="tables">
+          <article class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>Largest Wins</h2>
+                <span>Most space saved</span>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Archive</th><th class="numeric">Saved</th><th class="numeric">Ratio</th><th>Mode</th></tr></thead>
+                <tbody id="topSaved"></tbody>
+              </table>
+            </div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>Largest Losses</h2>
+                <span>Most space increased</span>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Archive</th><th class="numeric">Increased</th><th class="numeric">Ratio</th></tr></thead>
+                <tbody id="topIncreased"></tbody>
+              </table>
+            </div>
+          </article>
+        </section>
+
+        <section id="scan" class="controls">
+          <article class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>Schedule</h2>
+                <span id="scheduleStatus">Daily scan</span>
+              </div>
+            </div>
+            <label class="switch-row">
+              <input id="scheduleEnabled" type="checkbox">
+              <span>Enabled</span>
+            </label>
+            <div class="field-row compact">
+              <label>Hour<input id="scheduleHour" type="number" min="0" max="23" value="4"></label>
+              <label>Minute<input id="scheduleMinute" type="number" min="0" max="59" value="0"></label>
+            </div>
+            <button id="saveScheduleBtn" class="secondary">Save Schedule</button>
+          </article>
+
+          <article class="panel options-panel">
+            <div class="panel-head">
+              <div>
+                <h2>Scan Options</h2>
+                <span>Manual run controls</span>
+              </div>
+            </div>
+            <div class="toggle-grid">
+              <label><input id="dryRun" type="checkbox"> Dry run</label>
+              <label><input id="backup" type="checkbox"> Backup originals</label>
+              <label><input id="recheckAll" type="checkbox"> Recheck all</label>
+              <label><input id="noConvert" type="checkbox"> No conversion</label>
+              <label><input id="noFlatten" type="checkbox"> No flattening</label>
+              <label><input id="deleteEmpty" type="checkbox"> Delete empty</label>
+              <label><input id="smartDistance" type="checkbox"> Smart lossy</label>
+              <label><input id="verbose" type="checkbox" checked> Verbose</label>
+            </div>
+            <div class="field-row">
+              <label>Effort<input id="effort" type="number" min="0" max="11" value="7"></label>
+              <label>Threads<input id="threads" type="number" min="1" max="32" value="4"></label>
+              <label>Distance<input id="distance" type="number" min="0" max="15" step="0.1"></label>
+              <label>Smart MB<input id="smartMb" type="number" min="0.1" max="1000" step="0.1" value="10"></label>
+              <label>Smart MP<input id="smartMp" type="number" min="0.1" max="1000" step="0.1" value="5"></label>
+            </div>
+          </article>
+        </section>
+      </main>
+    </div>
+  </div>
+</body>
+</html>

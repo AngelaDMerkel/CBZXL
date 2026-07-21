@@ -1,0 +1,44 @@
+x-cbzxl-common: &cbzxl-common
+  image: angeladmerkel/cbzxl-web:latest
+  platform: linux/amd64
+  volumes:
+    - /mnt/Array/Media/Manga:/data
+    - /mnt/Array/appdata/cbzxl:/config
+  environment:
+    TZ: America/New_York
+    PYTHONUNBUFFERED: "1"
+    CONFIG_DIR: /config
+    DB_PATH: /config/cbzxl-v2.sqlite3
+    LIBRARY_PATH: /data
+    SCRATCH_DIR: /dev/shm/cbzxl
+    TMPDIR: /dev/shm
+    TEMP: /dev/shm
+    TMP: /dev/shm
+    MAX_ARCHIVE_UNCOMPRESSED_MB: "8192"
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  shm_size: 8g
+  mem_limit: 8g
+  pids_limit: 512
+  restart: unless-stopped
+
+services:
+  cbzxl-web:
+    <<: *cbzxl-common
+    container_name: CBZXL-Web
+    ports:
+      - "5000:5000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  cbzxl-worker:
+    <<: *cbzxl-common
+    container_name: CBZXL-Worker
+    command: ["python", "-m", "cbzxl_web.worker"]
+    cpus: "4.0"
