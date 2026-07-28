@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 CONFIG_DIR = Path(os.getenv("CONFIG_DIR", "/config"))
-DB_PATH = Path(os.getenv("DB_PATH", str(CONFIG_DIR / "cbzxl-v2.sqlite3")))
+DB_PATH = Path(os.getenv("DB_PATH", str(CONFIG_DIR / "cbzxl-v3.sqlite3")))
 LIBRARY_PATH = os.getenv("LIBRARY_PATH", "/data")
 APP_TIMEZONE = os.getenv("TZ", "UTC")
 
@@ -173,6 +173,22 @@ CREATE TABLE IF NOT EXISTS archive_results (
     UNIQUE(job_id, path)
 );
 
+CREATE TABLE IF NOT EXISTS archive_issues (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    archive_id INTEGER NOT NULL UNIQUE REFERENCES archives(id) ON DELETE CASCADE,
+    job_id TEXT REFERENCES jobs(id) ON DELETE SET NULL,
+    kind TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    entry_path TEXT,
+    message TEXT NOT NULL,
+    detail TEXT,
+    status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'queued', 'dismissed', 'resolved')),
+    remedy TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    resolved_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS review_actions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     archive_id INTEGER NOT NULL REFERENCES archives(id) ON DELETE CASCADE,
@@ -204,6 +220,8 @@ CREATE INDEX IF NOT EXISTS idx_archives_status ON archives(status);
 CREATE INDEX IF NOT EXISTS idx_archives_review ON archives(review_status, status);
 CREATE INDEX IF NOT EXISTS idx_archives_saved ON archives(bytes_saved);
 CREATE INDEX IF NOT EXISTS idx_results_job ON archive_results(job_id);
+CREATE INDEX IF NOT EXISTS idx_archive_issues_status ON archive_issues(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_archive_issues_job ON archive_issues(job_id);
 CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(enabled, next_run_at);
 """
 
@@ -222,6 +240,12 @@ DEFAULT_OPTIONS = {
     "distance": None,
     "smart_mb": 10.0,
     "smart_mp": 5.0,
+    "failed_only": False,
+    "compatibility_mode": False,
+    "continue_on_page_error": False,
+    "repair_action": None,
+    "repair_entry": None,
+    "repair_source": None,
 }
 
 
@@ -305,6 +329,7 @@ def initialize() -> None:
             },
             "archives": {"content_fingerprint": "TEXT"},
         }
+        migrations["archives"]["dismissed_until_rescan"] = "INTEGER NOT NULL DEFAULT 0"
         for table, additions in migrations.items():
             existing_columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
             for column, definition in additions.items():
@@ -312,6 +337,10 @@ def initialize() -> None:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (3, ?)",
+            (utc_now(),),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (4, ?)",
             (utc_now(),),
         )
         now = utc_now()
@@ -331,6 +360,96 @@ def initialize() -> None:
             """,
             (profile_id, json.dumps(DEFAULT_OPTIONS, sort_keys=True), now, now),
         )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO archive_issues(
+                archive_id, job_id, kind, stage, entry_path, message, detail,
+                status, remedy, created_at, updated_at, resolved_at
+            )
+            SELECT
+                id, NULL,
+                CASE WHEN status='failed' THEN 'archive_failed' ELSE 'archive_grew' END,
+                CASE WHEN status='failed' THEN 'unknown' ELSE 'size_check' END,
+                NULL,
+                COALESCE(error_message, CASE
+                    WHEN status='failed' THEN 'Archive conversion failed'
+                    ELSE 'Previous conversion increased archive size'
+                END),
+                error_message,
+                CASE WHEN review_status='queued' THEN 'queued' ELSE 'open' END,
+                NULL, updated_at, updated_at, NULL
+            FROM archives
+            WHERE review_status!='reviewed' AND (status='failed' OR bytes_saved < 0)
+            """
+        )
+
+
+def upsert_archive_issue(
+    conn: sqlite3.Connection,
+    *,
+    archive_id: int,
+    job_id: str | None,
+    kind: str,
+    stage: str,
+    message: str,
+    entry_path: str | None = None,
+    detail: str | None = None,
+) -> int:
+    now = utc_now()
+    conn.execute(
+        """
+        INSERT INTO archive_issues(
+            archive_id, job_id, kind, stage, entry_path, message, detail,
+            status, remedy, created_at, updated_at, resolved_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', NULL, ?, ?, NULL)
+        ON CONFLICT(archive_id) DO UPDATE SET
+            job_id=excluded.job_id,
+            kind=excluded.kind,
+            stage=excluded.stage,
+            entry_path=excluded.entry_path,
+            message=excluded.message,
+            detail=excluded.detail,
+            status='open',
+            remedy=NULL,
+            updated_at=excluded.updated_at,
+            resolved_at=NULL
+        """,
+        (archive_id, job_id, kind, stage, entry_path, message[:2000], (detail or "")[:8000] or None, now, now),
+    )
+    conn.execute(
+        """
+        UPDATE archives
+        SET review_status='open', dismissed_until_rescan=0, reviewed_at=NULL, updated_at=?
+        WHERE id=?
+        """,
+        (now, archive_id),
+    )
+    return int(conn.execute("SELECT id FROM archive_issues WHERE archive_id=?", (archive_id,)).fetchone()[0])
+
+
+def resolve_archive_issue(
+    conn: sqlite3.Connection,
+    archive_id: int,
+    *,
+    remedy: str = "completed",
+) -> None:
+    now = utc_now()
+    conn.execute(
+        """
+        UPDATE archive_issues
+        SET status='resolved', remedy=?, updated_at=?, resolved_at=?
+        WHERE archive_id=? AND status IN ('open', 'queued')
+        """,
+        (remedy, now, now, archive_id),
+    )
+    conn.execute(
+        """
+        UPDATE archives
+        SET review_status='reviewed', review_note=?, reviewed_at=?, dismissed_until_rescan=0, updated_at=?
+        WHERE id=?
+        """,
+        (remedy, now, now, archive_id),
+    )
 
 
 def default_library(conn: sqlite3.Connection) -> dict[str, Any]:

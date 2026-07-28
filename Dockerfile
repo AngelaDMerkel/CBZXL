@@ -6,7 +6,7 @@ COPY frontend/ ./
 RUN pnpm run build
 
 FROM python:3.13-alpine
-LABEL name="cbzxl-web" version="3.3.0"
+LABEL name="cbzxl-web" version="3.3.1"
 
 RUN apk add --no-cache libjxl-tools tzdata imagemagick file
 
@@ -20,7 +20,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 ENV PYTHONUNBUFFERED=1 \
     CONFIG_DIR=/config \
-    DB_PATH=/config/cbzxl-v2.sqlite3 \
+    DB_PATH=/config/cbzxl-v3.sqlite3 \
     LIBRARY_PATH=/data \
     LOG_FILE=/config/cbzxl.log \
     SCRATCH_DIR=/dev/shm/cbzxl \

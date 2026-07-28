@@ -23,6 +23,23 @@ class VerificationError(RuntimeError):
     pass
 
 
+class PageConversionError(RuntimeError):
+    def __init__(
+        self,
+        message,
+        *,
+        entry_path=None,
+        kind="page_encode_failed",
+        stage="encoding",
+        detail=None,
+    ):
+        super().__init__(message)
+        self.entry_path = entry_path
+        self.kind = kind
+        self.stage = stage
+        self.detail = detail
+
+
 class CancellationToken:
     def __init__(self):
         self._event = threading.Event()
@@ -263,6 +280,41 @@ class ResumeWorkspace:
                 "bytes": output_size,
             }
             self._write_manifest()
+
+    def _entry_target(self, entry_path):
+        normalized = PurePosixPath(str(entry_path or ""))
+        if not entry_path or normalized.is_absolute() or ".." in normalized.parts:
+            raise ValueError("Repair entry must be a safe relative archive path")
+        canonical = normalized.as_posix()
+        if canonical not in self.manifest.get("original_files", []):
+            raise ValueError(f"Repair entry is not present in the original archive: {canonical}")
+        target = (self.files / Path(*normalized.parts)).resolve()
+        if os.path.commonpath([self.files.resolve(), target]) != str(self.files.resolve()):
+            raise ValueError("Repair entry escapes the conversion workspace")
+        return canonical, target
+
+    def replace_entry(self, entry_path, replacement_path):
+        canonical, target = self._entry_target(entry_path)
+        replacement = Path(replacement_path or "").resolve()
+        if not replacement.is_file():
+            raise FileNotFoundError(f"Replacement image is unavailable: {replacement}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(f".{target.name}.replacement")
+        shutil.copy2(replacement, temporary)
+        os.replace(temporary, target)
+        self.manifest.setdefault("completed_pages", {}).pop(canonical, None)
+        self.manifest["repair"] = {"action": "replace", "entry": canonical}
+        self._write_manifest()
+
+    def delete_entry(self, entry_path):
+        canonical, target = self._entry_target(entry_path)
+        target.unlink(missing_ok=False)
+        self.manifest["original_files"] = [
+            path for path in self.manifest.get("original_files", []) if path != canonical
+        ]
+        self.manifest.setdefault("completed_pages", {}).pop(canonical, None)
+        self.manifest["repair"] = {"action": "delete", "entry": canonical}
+        self._write_manifest()
 
     def complete(self):
         if self.root.exists():

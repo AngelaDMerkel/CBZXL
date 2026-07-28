@@ -1,5 +1,5 @@
 x-cbzxl-common: &cbzxl-common
-  image: angeladmerkel/cbzxl-web:latest
+  image: angeladmerkel/cbzxl-web:3.3.1
   platform: linux/amd64
   volumes:
     - /mnt/Array/Media/Manga:/data
@@ -8,7 +8,7 @@ x-cbzxl-common: &cbzxl-common
     TZ: America/New_York
     PYTHONUNBUFFERED: "1"
     CONFIG_DIR: /config
-    DB_PATH: /config/cbzxl-v2.sqlite3
+    DB_PATH: /config/cbzxl-v3.sqlite3
     LIBRARY_PATH: /data
     SCRATCH_DIR: /dev/shm/cbzxl
     RESUME_DIR: /config/resume

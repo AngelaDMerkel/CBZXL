@@ -77,6 +77,27 @@ class WorkerProtocolTests(unittest.TestCase):
         self.assertEqual(command.count("--no-flatten"), 1)
         self.assertNotIn("--delete-empty-archives", command)
 
+    def test_worker_passes_contextual_repair_options(self):
+        command = command_for_job(
+            {
+                "id": self.job_id,
+                "options_json": """
+                {
+                  "only_path": "Series/Book.cbz",
+                  "compatibility_mode": true,
+                  "continue_on_page_error": true,
+                  "repair_action": "delete",
+                  "repair_entry": "pages/003.jpg"
+                }
+                """,
+            },
+            {"root_path": "/library"},
+        )
+        self.assertIn("--compatibility-mode", command)
+        self.assertIn("--continue-on-page-error", command)
+        self.assertIn("--repair-action", command)
+        self.assertIn("pages/003.jpg", command)
+
 
 if __name__ == "__main__":
     unittest.main()

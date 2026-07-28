@@ -123,6 +123,33 @@ class SmartPolicyTests(unittest.TestCase):
         self.assertTrue(source.exists())
         self.assertFalse(source.with_suffix(".jxl").exists())
 
+    def test_lossless_policy_also_retains_a_larger_candidate(self):
+        source = self.root / "page.jpg"
+        source.write_bytes(b"jpeg" * 20)
+        args = SimpleNamespace(
+            distance=None,
+            smart_distance=False,
+            smart_mb=10,
+            smart_mp=5,
+            compatibility_mode=False,
+        )
+
+        def encode(command, *_args, **_kwargs):
+            Path(command[-1]).write_bytes(JXL_SIGNATURE + b"x" * 100)
+            return CommandResult(0, "", "")
+
+        with (
+            patch.object(cbzxl, "get_mime_type", return_value="image/jpeg"),
+            patch.object(cbzxl.subprocess, "run", return_value=self.identify),
+            patch.object(cbzxl, "run_cancellable", side_effect=encode),
+        ):
+            result = cbzxl.convert_single_image(source, args)
+
+        self.assertTrue(result[4])
+        self.assertFalse(result[5])
+        self.assertTrue(source.exists())
+        self.assertFalse(source.with_suffix(".jxl").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

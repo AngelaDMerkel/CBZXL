@@ -41,6 +41,9 @@ def command_for_job(job, library):
         "verbose": "--verbose",
         "no_convert": "--no-convert",
         "smart_distance": "--smart-distance",
+        "failed_only": "--reprocess-failed",
+        "compatibility_mode": "--compatibility-mode",
+        "continue_on_page_error": "--continue-on-page-error",
     }
     for key, flag in flags.items():
         if options.get(key):
@@ -52,6 +55,9 @@ def command_for_job(job, library):
         ("distance", "--distance"),
         ("smart_mb", "--smart-mb"),
         ("smart_mp", "--smart-mp"),
+        ("repair_action", "--repair-action"),
+        ("repair_entry", "--repair-entry"),
+        ("repair_source", "--repair-source"),
     ):
         if options.get(key) is not None:
             command.extend([flag, str(options[key])])
@@ -138,7 +144,7 @@ def persist_structured_event(job_id, event):
     durable_types = {
         "job_started", "job_completed", "job_failed", "job_cancelled",
         "archive_started", "archive_resumed", "archive_completed", "archive_failed",
-        "verification_started", "verification_completed",
+        "verification_started", "verification_completed", "page_failed", "repair_applied",
     }
     with transaction() as conn:
         conn.execute(
@@ -193,8 +199,39 @@ def run_job(job):
             add_event(conn, job["id"], "error", "failed", "Library configuration is missing")
         return
 
+    options = json.loads(job["options_json"])
+    if not options.get("only_path") and not options.get("failed_only"):
+        with transaction(immediate=True) as conn:
+            now = utc_now()
+            dismissed = conn.execute(
+                """
+                SELECT id FROM archives
+                WHERE library_id=? AND dismissed_until_rescan=1
+                """,
+                (library["id"],),
+            ).fetchall()
+            archive_ids = [row["id"] for row in dismissed]
+            if archive_ids:
+                placeholders = ",".join("?" for _ in archive_ids)
+                conn.execute(
+                    f"""
+                    UPDATE archive_issues
+                    SET status='open', remedy=NULL, updated_at=?, resolved_at=NULL
+                    WHERE archive_id IN ({placeholders}) AND status='dismissed'
+                    """,
+                    (now, *archive_ids),
+                )
+                conn.execute(
+                    f"""
+                    UPDATE archives
+                    SET review_status='open', dismissed_until_rescan=0, reviewed_at=NULL, updated_at=?
+                    WHERE id IN ({placeholders})
+                    """,
+                    (now, *archive_ids),
+                )
+
     env = os.environ.copy()
-    env.update({"DB_PATH": str(os.getenv("DB_PATH", "/config/cbzxl-v2.sqlite3")), "LIBRARY_ID": library["id"], "CONFIG_DIR": os.getenv("CONFIG_DIR", "/config")})
+    env.update({"DB_PATH": str(os.getenv("DB_PATH", "/config/cbzxl-v3.sqlite3")), "LIBRARY_ID": library["id"], "CONFIG_DIR": os.getenv("CONFIG_DIR", "/config")})
     process = subprocess.Popen(
         command_for_job(job, library),
         stdout=subprocess.PIPE,

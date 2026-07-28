@@ -55,6 +55,38 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(resumed_again)
         self.assertEqual(completed_again, 1)
 
+    def test_replacement_keeps_the_original_internal_filename(self):
+        workspace = ResumeWorkspace(
+            self.root / "resume-replace",
+            self.archive,
+            archive_fingerprint(self.archive),
+            options_fingerprint({"repair": "replace"}),
+        )
+        workspace.prepare(1024 * 1024, CancellationToken())
+        replacement = self.root / "new-image.png"
+        replacement.write_bytes(b"replacement-pixels")
+
+        workspace.replace_entry("001.jpg", replacement)
+
+        self.assertEqual((workspace.files / "001.jpg").read_bytes(), b"replacement-pixels")
+        self.assertFalse((workspace.files / "new-image.png").exists())
+        self.assertEqual(workspace.manifest["repair"], {"action": "replace", "entry": "001.jpg"})
+
+    def test_explicit_delete_removes_only_the_selected_entry(self):
+        workspace = ResumeWorkspace(
+            self.root / "resume-delete",
+            self.archive,
+            archive_fingerprint(self.archive),
+            options_fingerprint({"repair": "delete"}),
+        )
+        workspace.prepare(1024 * 1024, CancellationToken())
+
+        workspace.delete_entry("001.jpg")
+
+        self.assertFalse((workspace.files / "001.jpg").exists())
+        self.assertTrue((workspace.files / "ComicInfo.xml").exists())
+        self.assertNotIn("001.jpg", workspace.manifest["original_files"])
+
     def test_safe_extraction_rejects_parent_traversal(self):
         unsafe = self.root / "unsafe.cbz"
         with zipfile.ZipFile(unsafe, "w") as target:

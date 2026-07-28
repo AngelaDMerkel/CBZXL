@@ -18,12 +18,19 @@ from rich.console import Console
 from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn, SpinnerColumn
 from enum import Enum, auto
 
-from cbzxl_web.database import initialize as initialize_database, utc_now
+from cbzxl_web.database import (
+    initialize as initialize_database,
+    resolve_archive_issue,
+    upsert_archive_issue,
+    utc_now,
+)
 from cbzxl_web.engine import (
     CancellationToken,
     ConversionCancelled,
+    PageConversionError,
     PARTIAL_SUFFIX,
     ResumeWorkspace,
+    VerificationError,
     archive_fingerprint,
     install_signal_handlers,
     jxl_has_valid_signature,
@@ -38,11 +45,11 @@ from cbzxl_web.protocol import EventEmitter
 # Default Constants (can be overwritten by args)
 DEFAULT_JXL_EFFORT = 10
 DEFAULT_THREADS = 10
-SCRIPT_VERSION = "3.3.0"
+SCRIPT_VERSION = "3.3.1"
 
 # Constants for use only in the Docker Container.
 CONFIG_DIR = os.getenv("CONFIG_DIR", "/config")
-DB_FILE = os.getenv("DB_PATH", os.path.join(CONFIG_DIR, "cbzxl-v2.sqlite3"))
+DB_FILE = os.getenv("DB_PATH", os.path.join(CONFIG_DIR, "cbzxl-v3.sqlite3"))
 LOG_FILE = os.getenv("LOG_FILE", os.path.join(CONFIG_DIR, "cbzxl.log"))
 ENCODER_MAX_SECONDS = int(os.getenv("ENCODER_MAX_SECONDS", "0"))
 SUBPROCESS_TIMEOUT = int(os.getenv("AUXILIARY_TIMEOUT_SECONDS", "300"))
@@ -431,13 +438,29 @@ def mark_processed(conn, cbz_path_obj, path_str, original_size, final_size, save
               conversion_mode=excluded.conversion_mode, megapixels_info=excluded.megapixels_info, updated_at=excluded.updated_at
         """, (LIBRARY_ID, path_str, original_size, final_size, saved_bytes, percent_saved, converted_at_iso, archive_mtime_value, content_fingerprint, dominant_type, jxl_effort_level,
               duration, img_count, num_jpg, num_png, SCRIPT_VERSION, JXL_VERSION, conversion_mode, megapixels_info, converted_at_iso, converted_at_iso))
+        archive_id = conn.execute(
+            "SELECT id FROM archives WHERE library_id=? AND path=?",
+            (LIBRARY_ID, path_str),
+        ).fetchone()[0]
+        resolve_archive_issue(conn, archive_id)
         record_archive_result(conn, path_str, original_size, final_size, saved_bytes, "processed", dominant_type, jxl_effort_level, duration, img_count, num_jpg, num_png, conversion_mode, megapixels_info, archive_mtime_value=archive_mtime_value)
         conn.commit()
     except sqlite3.DatabaseError as e:
         log(f"[red]❌ Failed to mark as processed in DB: {path_str} — {e}", level="error")
 
 
-def mark_failed(conn, cbz_path_obj, path_str, duration, error_msg):
+def mark_failed(
+    conn,
+    cbz_path_obj,
+    path_str,
+    duration,
+    error_msg,
+    *,
+    issue_kind="archive_failed",
+    issue_stage="unknown",
+    issue_entry=None,
+    issue_detail=None,
+):
     """Mark an archive as failed with duration and a specific error message."""
     if DRY_RUN or conn is None:
         log(f"Would mark as FAILED: {path_str} (Reason: {error_msg})")
@@ -454,6 +477,20 @@ def mark_failed(conn, cbz_path_obj, path_str, duration, error_msg):
               processing_duration_seconds=excluded.processing_duration_seconds, error_message=excluded.error_message,
               updated_at=excluded.updated_at
         """, (LIBRARY_ID, path_str, utc_now(), archive_mtime_value, SCRIPT_VERSION, JXL_VERSION, duration, error_msg, utc_now(), utc_now()))
+        archive_id = conn.execute(
+            "SELECT id FROM archives WHERE library_id=? AND path=?",
+            (LIBRARY_ID, path_str),
+        ).fetchone()[0]
+        upsert_archive_issue(
+            conn,
+            archive_id=archive_id,
+            job_id=RUN_ID,
+            kind=issue_kind,
+            stage=issue_stage,
+            entry_path=issue_entry,
+            message=error_msg,
+            detail=issue_detail,
+        )
         record_archive_result(conn, path_str, 0, 0, 0, "failed", "N/A", JXL_EFFORT, duration, 0, 0, 0, "N/A", "N/A", error_msg, archive_mtime_value=archive_mtime_value)
         conn.commit()
     except sqlite3.DatabaseError as e:
@@ -465,6 +502,16 @@ def get_size(file_path):
     if not Path(file_path).exists():
         return 0
     return os.path.getsize(file_path)
+
+
+def cleanup_repair_source(cli_args):
+    if getattr(cli_args, "repair_action", None) != "replace":
+        return
+    source = Path(getattr(cli_args, "repair_source", "") or "").resolve()
+    replacement_root = (Path(CONFIG_DIR) / "replacements").resolve()
+    if source.is_file() and os.path.commonpath([replacement_root, source]) == str(replacement_root):
+        source.unlink(missing_ok=True)
+
 
 def get_scratch_dir():
     SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
@@ -518,8 +565,10 @@ def get_mime_type(path_obj):
         return "application/octet-stream"
 
 
-def cjxl_input_path(img_path_obj, mime, colorspace):
+def cjxl_input_path(img_path_obj, mime, colorspace, force_normalize=False):
     needs_png_input = (
+        force_normalize
+        or
         mime in ("image/tiff", "image/bmp", "image/x-bmp", "image/x-ms-bmp")
         or (mime == "image/jpeg" and colorspace == "CMYK")
     )
@@ -604,7 +653,12 @@ def convert_single_image(img_path_obj, cli_args, workspace=None, archive_path=No
         final_distance, conversion_mode = attempts[-1]
         return 0, megapixels, conversion_mode, final_distance, True, True
 
-    encoder_input_path, cleanup_path = cjxl_input_path(img_path_obj, mime, colorspace)
+    encoder_input_path, cleanup_path = cjxl_input_path(
+        img_path_obj,
+        mime,
+        colorspace,
+        bool(getattr(cli_args, "compatibility_mode", False)),
+    )
     encoder_input_str = str(encoder_input_path)
 
     def encode_attempt(distance):
@@ -640,6 +694,7 @@ def convert_single_image(img_path_obj, cli_args, workspace=None, archive_path=No
 
     try:
         last_result = None
+        had_valid_candidate = False
         for final_distance, conversion_mode in attempts:
             if VERBOSE:
                 log(f"   ⚡ Testing {conversion_mode.lower()} for {img_path_obj.name} (d={final_distance}).")
@@ -652,8 +707,9 @@ def convert_single_image(img_path_obj, cli_args, workspace=None, archive_path=No
             )
             if not valid:
                 continue
+            had_valid_candidate = True
             candidate_size = get_size(partial_path)
-            if cli_args.smart_distance and candidate_size >= orig_size:
+            if candidate_size >= orig_size:
                 if VERBOSE:
                     log(f"   ↪ {conversion_mode} did not save space for {img_path_obj.name}.")
                 continue
@@ -672,20 +728,50 @@ def convert_single_image(img_path_obj, cli_args, workspace=None, archive_path=No
                 )
             return saved, megapixels, conversion_mode, final_distance, True, True
 
-        if cli_args.smart_distance:
-            return 0, megapixels, "Smart retained original", 0, True, False
+        if had_valid_candidate:
+            retained_mode = "Smart retained original" if cli_args.smart_distance else "Retained original"
+            return 0, megapixels, retained_mode, 0, True, False
         log(f"[red]❌ Failed to convert with cjxl: {img_path_obj.name}", level="error")
         if last_result and last_result.stderr:
             log(f"[red]   cjxl stderr: {last_result.stderr.strip()}", level="error")
-        return default_return
+        entry_path = (
+            Path(img_path_obj).relative_to(workspace.files).as_posix()
+            if workspace
+            else img_path_obj.name
+        )
+        raise PageConversionError(
+            f"JPEG XL encoding failed for {entry_path}",
+            entry_path=entry_path,
+            kind="page_encode_failed",
+            stage="encoding",
+            detail=last_result.stderr.strip() if last_result and last_result.stderr else None,
+        )
     except ConversionCancelled:
         raise
     except FileNotFoundError:
         log("[red]Error: 'cjxl' command not found.", level="error")
-        return default_return
+        raise PageConversionError(
+            "JPEG XL encoder is unavailable",
+            entry_path=img_path_obj.name,
+            kind="encoder_unavailable",
+            stage="encoding",
+        )
     except Exception as e:
+        if isinstance(e, PageConversionError):
+            raise
         log(f"[red]❌ Unexpected error converting {img_path_obj.name}: {e}", level="error")
-        return default_return
+        entry_path = (
+            Path(img_path_obj).relative_to(workspace.files).as_posix()
+            if workspace
+            else img_path_obj.name
+        )
+        raise PageConversionError(
+            f"Unexpected image conversion error for {entry_path}",
+            entry_path=entry_path,
+            kind="page_conversion_error",
+            stage="encoding",
+            detail=str(e),
+        ) from e
     finally:
         partial_path.unlink(missing_ok=True)
         if cleanup_path and cleanup_path.exists():
@@ -814,18 +900,52 @@ def convert_images(temp_dir_path, cli_args, workspace=None, archive_path=None):
                 raise
             except Exception as e:
                 log(f"[red]❌ Error processing image {futures[future].name} in thread: {e}", level="error")
+                entry_path = (
+                    Path(futures[future]).relative_to(workspace.files).as_posix()
+                    if workspace
+                    else futures[future].name
+                )
+                page_error = e if isinstance(e, PageConversionError) else PageConversionError(
+                    str(e),
+                    entry_path=entry_path,
+                    kind="page_conversion_error",
+                    stage="encoding",
+                    detail=str(e),
+                )
                 emit(
                     "page_failed",
                     level="error",
-                    message=str(e),
+                    message=str(page_error),
                     archive=archive_path,
                     stage="encoding",
                     page=completed_pages,
                     total_pages=total_work_pages,
+                    entry_path=page_error.entry_path,
+                    issue_kind=page_error.kind,
+                    detail=page_error.detail,
                 )
+                retained_entry = getattr(cli_args, "repair_entry", None)
+                may_retain = (
+                    getattr(cli_args, "continue_on_page_error", False)
+                    and (not retained_entry or retained_entry == page_error.entry_path)
+                )
+                if may_retain:
+                    completed_pages += 1
+                    results.append((0, 0.0, "Retained after error", 0, True, False))
+                    emit(
+                        "page_completed",
+                        level="warning",
+                        message=f"Retained {entry_path} after conversion failure",
+                        archive=archive_path,
+                        stage="encoding",
+                        page=completed_pages,
+                        total_pages=total_work_pages,
+                        converted=False,
+                    )
+                    continue
                 for pending in futures:
                     pending.cancel()
-                raise
+                raise page_error
     
     total_saved = sum(r[0] for r in results)
     applied_count = resumed_pages + sum(1 for result in results if result[5])
@@ -879,6 +999,11 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args, fingerprint=None):
         "smart_mb": cli_args.smart_mb,
         "smart_mp": cli_args.smart_mp,
         "effort": JXL_EFFORT,
+        "compatibility_mode": bool(getattr(cli_args, "compatibility_mode", False)),
+        "continue_on_page_error": bool(getattr(cli_args, "continue_on_page_error", False)),
+        "repair_action": getattr(cli_args, "repair_action", None),
+        "repair_entry": getattr(cli_args, "repair_entry", None),
+        "repair_source": getattr(cli_args, "repair_source", None),
     })
     workspace = ResumeWorkspace(RESUME_DIR, cbz_path_obj, fingerprint, option_key)
     original_cbz_size = get_size(cbz_path_obj)
@@ -906,6 +1031,27 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args, fingerprint=None):
                 page=resumed_pages,
                 total_pages=resumed_pages,
             )
+        repair_action = getattr(cli_args, "repair_action", None)
+        repair_entry = getattr(cli_args, "repair_entry", None)
+        repair_applied = False
+        if repair_action in {"replace", "delete"}:
+            expected_repair = {"action": repair_action, "entry": repair_entry}
+            if workspace.manifest.get("repair") != expected_repair:
+                workspace.set_stage("repairing")
+                if repair_action == "replace":
+                    workspace.replace_entry(repair_entry, getattr(cli_args, "repair_source", None))
+                else:
+                    workspace.delete_entry(repair_entry)
+            repair_applied = True
+            emit(
+                "repair_applied",
+                level="warning",
+                message=f"{repair_action.capitalize()} repair staged for {repair_entry}",
+                archive=rel_path_str,
+                stage="repairing",
+                entry_path=repair_entry,
+                repair_action=repair_action,
+            )
         workspace.set_stage("encoding")
 
         conversion_saved_bytes = 0
@@ -926,7 +1072,10 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args, fingerprint=None):
         else:
             log("   ⏩ Conversion skipped by user command.")
 
-        action_taken = status in (ConversionStatus.PROCESSED_SAVED_SPACE, ConversionStatus.PROCESSED_NO_SPACE_SAVED)
+        action_taken = repair_applied or status in (
+            ConversionStatus.PROCESSED_SAVED_SPACE,
+            ConversionStatus.PROCESSED_NO_SPACE_SAVED,
+        )
         workspace.set_stage("assembling")
         emit("heartbeat", archive=rel_path_str, stage="assembling")
 
@@ -977,6 +1126,24 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args, fingerprint=None):
                     stage="committing",
                     **verification,
                 )
+                if not repair_applied and candidate.stat().st_size >= original_cbz_size:
+                    duration_value = time.monotonic() - start_time
+                    mark_processed(
+                        conn_main, cbz_path_obj, rel_path_str, original_cbz_size, original_cbz_size, 0,
+                        dominant_type, JXL_EFFORT, duration_value, img_count, num_jpg, num_png,
+                        "Original retained", mp_info, fingerprint,
+                    )
+                    workspace.complete()
+                    emit(
+                        "archive_completed",
+                        level="warning",
+                        message=f"Retained original because the verified candidate was not smaller: {rel_path_str}",
+                        archive=rel_path_str,
+                        stage="complete",
+                        bytes_saved=0,
+                        duration_seconds=round(duration_value, 3),
+                    )
+                    return 0, False, False, "processed"
                 replace_path = cbz_path_obj.with_name(f".{cbz_path_obj.name}.cbzxl-replace")
                 try:
                     shutil.copy2(candidate, replace_path)
@@ -1002,6 +1169,7 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args, fingerprint=None):
             dominant_type, JXL_EFFORT, duration_value, img_count, num_jpg, num_png, conv_mode, mp_info, final_fingerprint,
         )
         workspace.complete()
+        cleanup_repair_source(cli_args)
         emit(
             "archive_completed",
             level="success",
@@ -1018,11 +1186,62 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args, fingerprint=None):
     except Exception as error:
         duration_value = time.monotonic() - start_time
         log(f"[red]❌ Failed to process {rel_path_str}: {error}", level="error")
-        emit("archive_failed", level="error", message=str(error), archive=rel_path_str, stage="failed")
+        issue_kind = getattr(error, "kind", "archive_failed")
+        issue_stage = getattr(error, "stage", workspace.manifest.get("stage", "failed"))
+        if issue_kind == "archive_failed":
+            lowered_error = str(error).lower()
+            if isinstance(error, VerificationError):
+                issue_kind = "verification_failed"
+                issue_stage = "verifying"
+            elif isinstance(error, zipfile.BadZipFile):
+                issue_kind = "archive_corrupt"
+                issue_stage = "extracting"
+            elif isinstance(error, PermissionError):
+                issue_kind = "permission_denied"
+            elif isinstance(error, FileNotFoundError):
+                issue_kind = "file_missing"
+            elif "unsafe archive path" in lowered_error or "symlinks are not allowed" in lowered_error:
+                issue_kind = "unsafe_archive_path"
+                issue_stage = "extracting"
+            elif "cannot preserve filename" in lowered_error or "duplicate archive path" in lowered_error:
+                issue_kind = "filename_collision"
+                issue_stage = "preparing"
+        issue_entry = getattr(error, "entry_path", None)
+        issue_detail = getattr(error, "detail", None)
+        emit(
+            "archive_failed",
+            level="error",
+            message=str(error),
+            archive=rel_path_str,
+            stage=issue_stage,
+            issue_kind=issue_kind,
+            entry_path=issue_entry,
+            detail=issue_detail,
+        )
         if conn_fail:
-            mark_failed(conn_fail, cbz_path_obj, rel_path_str, duration_value, str(error))
+            mark_failed(
+                conn_fail,
+                cbz_path_obj,
+                rel_path_str,
+                duration_value,
+                str(error),
+                issue_kind=issue_kind,
+                issue_stage=issue_stage,
+                issue_entry=issue_entry,
+                issue_detail=issue_detail,
+            )
         if conn_main:
-            mark_failed(conn_main, cbz_path_obj, rel_path_str, duration_value, str(error))
+            mark_failed(
+                conn_main,
+                cbz_path_obj,
+                rel_path_str,
+                duration_value,
+                str(error),
+                issue_kind=issue_kind,
+                issue_stage=issue_stage,
+                issue_entry=issue_entry,
+                issue_detail=issue_detail,
+            )
         return 0, False, False, "failed"
 
 
@@ -1040,6 +1259,11 @@ def main():
     action_group.add_argument("--delete-empty-archives", action="store_true", help=argparse.SUPPRESS)
     action_group.add_argument("--smart-distance", action="store_true", help="Apply lossy conversion only to images meeting size/resolution thresholds.")
     action_group.add_argument("--only-path", help=argparse.SUPPRESS)
+    action_group.add_argument("--compatibility-mode", action="store_true", help=argparse.SUPPRESS)
+    action_group.add_argument("--continue-on-page-error", action="store_true", help=argparse.SUPPRESS)
+    action_group.add_argument("--repair-action", choices=("replace", "delete"), help=argparse.SUPPRESS)
+    action_group.add_argument("--repair-entry", help=argparse.SUPPRESS)
+    action_group.add_argument("--repair-source", help=argparse.SUPPRESS)
 
     tuning_group = parser.add_argument_group('Conversion Tuning')
     tuning_group.add_argument("--effort", "-e", type=int, default=DEFAULT_JXL_EFFORT, choices=range(0,12), metavar="[0-11]", help=f"JXL encoding effort (0-10 standard, 11 for expert mode; default: {DEFAULT_JXL_EFFORT})")
@@ -1070,7 +1294,7 @@ def main():
     JXL_EFFORT = args.effort
     THREADS = args.threads
     ENCODER_THREADS = args.encoder_threads
-    RECHECK_ALL = args.recheck_all or bool(args.only_path)
+    RECHECK_ALL = args.recheck_all or bool(args.only_path) or args.reprocess_failed
     DELETE_EMPTY_ARCHIVES = False
     RUN_ID = args.run_id or str(uuid.uuid4())
     install_signal_handlers(CANCEL_TOKEN)
@@ -1089,10 +1313,6 @@ def main():
         # ... existing reset_db logic ...
         return 0
     
-    if args.reprocess_failed:
-        # ... existing reprocess_failed logic ...
-        return 0
-
     for tool in ["cjxl", "djxl", "magick", "identify", "file"]:
         if not shutil.which(tool):
             log(f"[red]❌ CRITICAL: '{tool}' command not found. Please ensure it is installed and in your system's PATH.", level="error")
@@ -1118,6 +1338,18 @@ def main():
 
     resolved_input_dir = Path(args.input_dir).resolve()
     cbz_files_path_obj_list = list(resolved_input_dir.rglob('*.cbz'))
+    if args.reprocess_failed:
+        failed_paths = {
+            row[0]
+            for row in conn.execute(
+                "SELECT path FROM archives WHERE library_id=? AND status='failed'",
+                (LIBRARY_ID,),
+            )
+        }
+        cbz_files_path_obj_list = [
+            path for path in cbz_files_path_obj_list
+            if os.path.relpath(path, resolved_input_dir).replace(os.sep, "/") in failed_paths
+        ]
     if args.only_path:
         requested = Path(args.only_path).as_posix()
         cbz_files_path_obj_list = [

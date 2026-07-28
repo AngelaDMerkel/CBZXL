@@ -21,9 +21,34 @@ class DatabaseTests(unittest.TestCase):
             version = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
             library = database.default_library(conn)
             profile = database.default_profile(conn)
-        self.assertEqual(version, 3)
+        self.assertEqual(version, 4)
         self.assertEqual(library["root_path"], database.LIBRARY_PATH)
         self.assertEqual(profile["name"], "Balanced lossless")
+        with database.connect() as conn:
+            issue_columns = {row[1] for row in conn.execute("PRAGMA table_info(archive_issues)")}
+            archive_columns = {row[1] for row in conn.execute("PRAGMA table_info(archives)")}
+        self.assertIn("entry_path", issue_columns)
+        self.assertIn("dismissed_until_rescan", archive_columns)
+
+    def test_new_database_does_not_modify_legacy_v2_file(self):
+        root = Path(self.temp.name)
+        legacy_path = root / "cbzxl-v2.sqlite3"
+        with database.sqlite3.connect(legacy_path) as legacy:
+            legacy.execute("CREATE TABLE archive_results(run_id TEXT, path TEXT)")
+            legacy.execute("INSERT INTO archive_results VALUES ('old-run', 'Series/Book.cbz')")
+
+        database.DB_PATH = root / "cbzxl-v3.sqlite3"
+        database.initialize()
+
+        with database.sqlite3.connect(legacy_path) as legacy:
+            columns = [row[1] for row in legacy.execute("PRAGMA table_info(archive_results)")]
+            row = legacy.execute("SELECT run_id, path FROM archive_results").fetchone()
+        with database.connect() as current:
+            current_columns = [row[1] for row in current.execute("PRAGMA table_info(archive_results)")]
+
+        self.assertEqual(columns, ["run_id", "path"])
+        self.assertEqual(row, ("old-run", "Series/Book.cbz"))
+        self.assertIn("job_id", current_columns)
 
     def test_human_schedule_calculation(self):
         after = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
