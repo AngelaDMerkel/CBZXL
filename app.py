@@ -969,6 +969,23 @@ def list_issues(
 
 @app.post("/api/issues/{issue_id}/action", status_code=201)
 def act_on_issue(issue_id: int, payload: IssueActionPayload):
+    rebuild_diagnostics = None
+    if payload.action == "rebuild":
+        with connect() as conn:
+            candidate = issue_row(conn, issue_id)
+        if not candidate:
+            raise HTTPException(404, "Issue not found")
+        if candidate.get("kind") != "crc_mismatch" or not candidate.get("entry_path"):
+            raise HTTPException(409, "Only an inspected CRC failure can be rebuilt")
+        # Image decoding may take several seconds. Keep it outside the write
+        # transaction so diagnostics can never block the dashboard or workers.
+        rebuild_diagnostics = crc_issue_diagnostics(candidate)
+        if not rebuild_diagnostics.get("repairable"):
+            raise HTTPException(
+                409,
+                "The damaged entry could not be recovered and decoded safely",
+            )
+
     with transaction(immediate=True) as conn:
         issue = issue_row(conn, issue_id)
         if not issue:
@@ -1025,12 +1042,6 @@ def act_on_issue(issue_id: int, payload: IssueActionPayload):
         elif payload.action == "rebuild":
             if issue.get("kind") != "crc_mismatch" or not issue.get("entry_path"):
                 raise HTTPException(409, "Only an inspected CRC failure can be rebuilt")
-            diagnostics = crc_issue_diagnostics(issue)
-            if not diagnostics.get("repairable"):
-                raise HTTPException(
-                    409,
-                    "The damaged entry could not be recovered and decoded safely",
-                )
             overrides.update(
                 {
                     "repair_action": "rebuild",

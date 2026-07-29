@@ -1,4 +1,5 @@
 import os
+import struct
 import tempfile
 import unittest
 import zipfile
@@ -11,6 +12,7 @@ from cbzxl_web.engine import (
     archive_fingerprint,
     options_fingerprint,
     plan_parallelism,
+    recover_zip_entry_bytes,
     safe_extract_archive,
     validate_conversion_paths,
     verify_archive,
@@ -100,6 +102,35 @@ class EngineTests(unittest.TestCase):
             target.writestr("./001.jpg", b"x")
         with self.assertRaisesRegex(ValueError, "cannot be preserved"):
             safe_extract_archive(noncanonical, self.root / "extract-normalized", 1024, CancellationToken())
+
+    def test_crc_mismatch_can_be_recovered_without_renaming_the_entry(self):
+        damaged = self.root / "bad-crc.cbz"
+        payload = b"recoverable-image-payload"
+        with zipfile.ZipFile(damaged, "w", zipfile.ZIP_DEFLATED) as target:
+            target.writestr("Chapter 1/001.png", payload)
+
+        archive_bytes = bytearray(damaged.read_bytes())
+        central_offset = archive_bytes.index(b"PK\x01\x02")
+        original_crc = struct.unpack_from("<L", archive_bytes, central_offset + 16)[0]
+        struct.pack_into("<L", archive_bytes, central_offset + 16, original_crc ^ 0xFFFFFFFF)
+        damaged.write_bytes(archive_bytes)
+
+        with zipfile.ZipFile(damaged, "r") as source:
+            info = source.getinfo("Chapter 1/001.png")
+            with self.assertRaises(zipfile.BadZipFile):
+                source.read(info)
+            self.assertEqual(recover_zip_entry_bytes(damaged, info), payload)
+
+        extracted = self.root / "recovered"
+        names = safe_extract_archive(
+            damaged,
+            extracted,
+            1024 * 1024,
+            CancellationToken(),
+            recover_crc_entry="Chapter 1/001.png",
+        )
+        self.assertEqual(names, ["Chapter 1/001.png"])
+        self.assertEqual((extracted / "Chapter 1/001.png").read_bytes(), payload)
 
     def test_archive_verification_checks_entry_set_and_signatures(self):
         workspace = self.root / "files"

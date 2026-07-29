@@ -1,7 +1,10 @@
 import json
+import struct
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
+from unittest import mock
 
 from fastapi.testclient import TestClient
 
@@ -191,6 +194,113 @@ class ApiTests(unittest.TestCase):
         with database.connect() as conn:
             options = json.loads(conn.execute("SELECT options_json FROM jobs WHERE id=?", (job["id"],)).fetchone()[0])
         self.assertTrue(options["failed_only"])
+
+    def test_detailed_statistics_reports_page_outcomes_and_lifetime_trend(self):
+        bootstrap = self.client.get("/api/bootstrap").json()
+        library_id = bootstrap["libraries"][0]["id"]
+        profile_id = bootstrap["profiles"][0]["id"]
+        now = database.utc_now()
+        with database.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO archives(
+                    library_id, path, status, original_size, final_size, bytes_saved,
+                    percent_saved, dominant_type, processing_duration_seconds,
+                    image_count, converted_pages, lossless_pages, lossy_pages,
+                    retained_pages, conversion_mode, created_at, updated_at
+                ) VALUES
+                    (?, 'Series/One.cbz', 'processed', 1000, 700, 300, 30, 'JPEG',
+                     40, 10, 8, 6, 2, 2, 'Smart', ?, ?),
+                    (?, 'Series/Two.cbz', 'failed', 500, NULL, 0, 0, 'PNG',
+                     80, 4, 0, 0, 0, 0, 'Lossless', ?, ?)
+                """,
+                (library_id, now, now, library_id, now, now),
+            )
+            archive_id = conn.execute(
+                "SELECT id FROM archives WHERE path='Series/One.cbz'"
+            ).fetchone()[0]
+            job_id = "statistics-run"
+            conn.execute(
+                """
+                INSERT INTO jobs(
+                    id, source, library_id, profile_id, status, options_json,
+                    queued_at, started_at, finished_at, net_bytes_saved
+                ) VALUES (?, 'manual', ?, ?, 'succeeded', '{}', ?, ?, ?, 300)
+                """,
+                (job_id, library_id, profile_id, now, now, now),
+            )
+            conn.execute(
+                """
+                INSERT INTO archive_results(
+                    job_id, archive_id, path, status, original_size, final_size,
+                    bytes_saved, percent_saved, processing_duration_seconds,
+                    image_count, converted_pages, lossless_pages, lossy_pages,
+                    retained_pages
+                ) VALUES (?, ?, 'Series/One.cbz', 'processed', 1000, 700, 300,
+                          30, 40, 10, 8, 6, 2, 2)
+                """,
+                (job_id, archive_id),
+            )
+
+        response = self.client.get("/api/statistics")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["library"]["archives"], 2)
+        self.assertEqual(payload["library"]["jxl_coverage_percent"], 80)
+        self.assertEqual(payload["health"]["retained_pages"], 2)
+        outcomes = {row["label"]: row["count"] for row in payload["outcomes"]}
+        self.assertEqual(outcomes["Lossless JXL"], 6)
+        self.assertEqual(outcomes["Smart lossy"], 2)
+        self.assertEqual(payload["run_trend"][0]["cumulative_net_gb"], 0.0)
+        self.assertEqual(payload["processing"]["median_seconds"], 40)
+        self.assertEqual(payload["effort"]["archives_attempted"], 1)
+
+    def test_crc_diagnostics_offer_safe_rebuild_for_a_decodable_entry(self):
+        library_root = Path(self.temp.name) / "library"
+        archive_path = library_root / "Series" / "Book.cbz"
+        archive_path.parent.mkdir(parents=True)
+        payload = b"recoverable-png-payload"
+        with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as target:
+            target.writestr("pages/003.png", payload)
+        archive_bytes = bytearray(archive_path.read_bytes())
+        central_offset = archive_bytes.index(b"PK\x01\x02")
+        original_crc = struct.unpack_from("<L", archive_bytes, central_offset + 16)[0]
+        struct.pack_into("<L", archive_bytes, central_offset + 16, original_crc ^ 0xFFFFFFFF)
+        archive_path.write_bytes(archive_bytes)
+
+        with database.transaction() as conn:
+            library = database.default_library(conn)
+            conn.execute(
+                "UPDATE libraries SET root_path=? WHERE id=?",
+                (str(library_root), library["id"]),
+            )
+        issue_id = self.create_issue(kind="crc_mismatch", entry_path="pages/003.png")
+
+        identify_result = mock.Mock(returncode=0, stdout="PNG 1200 1800", stderr="")
+        with mock.patch.object(web_app.subprocess, "run", return_value=identify_result):
+            diagnostics = self.client.get(f"/api/issues/{issue_id}/diagnostics")
+            rebuilt = self.client.post(
+                f"/api/issues/{issue_id}/action",
+                json={"action": "rebuild"},
+            )
+
+        self.assertEqual(diagnostics.status_code, 200)
+        self.assertTrue(diagnostics.json()["repairable"])
+        self.assertNotEqual(
+            diagnostics.json()["expected_crc32"],
+            diagnostics.json()["calculated_crc32"],
+        )
+        self.assertEqual(rebuilt.status_code, 201)
+        with database.connect() as conn:
+            options = json.loads(
+                conn.execute(
+                    "SELECT options_json FROM jobs WHERE id=?",
+                    (rebuilt.json()["job_id"],),
+                ).fetchone()[0]
+            )
+        self.assertEqual(options["repair_action"], "rebuild")
+        self.assertEqual(options["repair_entry"], "pages/003.png")
 
     def test_homepage_widget_reports_exact_net_savings_and_idle_state(self):
         with database.transaction() as conn:
