@@ -45,6 +45,7 @@ def command_for_job(job, library):
         "failed_only": "--reprocess-failed",
         "compatibility_mode": "--compatibility-mode",
         "continue_on_page_error": "--continue-on-page-error",
+        "integrity_audit": "--integrity-audit",
     }
     for key, flag in flags.items():
         if options.get(key):
@@ -62,6 +63,10 @@ def command_for_job(job, library):
     ):
         if options.get(key) is not None:
             command.extend([flag, str(options[key])])
+    if options.get("repair_entries"):
+        command.extend(
+            ["--repair-entries", json.dumps(options["repair_entries"], separators=(",", ":"))]
+        )
     if options.get("only_path"):
         command.extend(["--only-path", str(options["only_path"])])
     return command

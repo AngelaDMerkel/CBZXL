@@ -25,7 +25,7 @@ class DatabaseTests(unittest.TestCase):
                 row[0]
                 for row in conn.execute("SELECT name FROM conversion_profiles")
             }
-        self.assertEqual(version, 6)
+        self.assertEqual(version, 9)
         self.assertEqual(library["root_path"], database.LIBRARY_PATH)
         self.assertEqual(profile["name"], "Balanced lossless")
         self.assertEqual(
@@ -34,6 +34,7 @@ class DatabaseTests(unittest.TestCase):
                 "Balanced lossless",
                 "Smart lossy fallback",
                 "Recheck without conversion",
+                "Integrity audit",
             },
         )
         with database.connect() as conn:
@@ -43,12 +44,25 @@ class DatabaseTests(unittest.TestCase):
             snapshot_columns = {
                 row[1] for row in conn.execute("PRAGMA table_info(library_stat_snapshots)")
             }
+            format_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(archive_format_stats)")
+            }
+            decision_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(page_decisions)")
+            }
         self.assertIn("entry_path", issue_columns)
+        self.assertIn("related_entry_path", issue_columns)
         self.assertIn("dismissed_until_rescan", archive_columns)
         self.assertIn("converted_pages", archive_columns)
         self.assertIn("generation", archive_columns)
+        self.assertIn("format_inventory_fingerprint", archive_columns)
+        self.assertIn("format_inventory_at", archive_columns)
         self.assertIn("generation", result_columns)
         self.assertIn("average_percent_saved", snapshot_columns)
+        self.assertIn("compressed_bytes", format_columns)
+        self.assertIn("candidate_size", decision_columns)
+        self.assertIn("attempts_json", decision_columns)
+        self.assertEqual(json.loads(profile["options_json"])["effort"], 10)
 
     def test_new_database_does_not_modify_legacy_v2_file(self):
         root = Path(self.temp.name)

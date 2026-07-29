@@ -168,7 +168,7 @@ def import_legacy(path: str | Path, dry_run: bool = False):
             for row in run_rows:
                 job_id = row.get("id") or f"legacy-{uuid.uuid4()}"
                 options = {
-                    "effort": row.get("jxl_effort", 7), "threads": row.get("threads", 4),
+                    "effort": row.get("jxl_effort", 10), "threads": row.get("threads", 4),
                     "smart_distance": bool(row.get("smart_distance")), "distance": row.get("distance"),
                 }
                 target.execute(

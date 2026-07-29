@@ -1,4 +1,5 @@
 import json
+import io
 import struct
 import tempfile
 import unittest
@@ -22,7 +23,13 @@ class ApiTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def create_issue(self, *, kind="page_encode_failed", entry_path="pages/003.jpg"):
+    def create_issue(
+        self,
+        *,
+        kind="page_encode_failed",
+        entry_path="pages/003.jpg",
+        related_entry_path=None,
+    ):
         with database.transaction() as conn:
             library = database.default_library(conn)
             now = database.utc_now()
@@ -42,8 +49,47 @@ class ApiTests(unittest.TestCase):
                 kind=kind,
                 stage="encoding",
                 entry_path=entry_path,
+                related_entry_path=related_entry_path,
                 message="JPEG XL encoding failed",
                 detail="decoder rejected the candidate",
+            )
+
+    def create_growth_issue(self, name="Grew.cbz", *, with_backup=False):
+        library_root = Path(self.temp.name) / "library"
+        archive_path = library_root / "Series" / name
+        archive_path.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_STORED) as archive:
+            archive.writestr("ComicInfo.xml", "<ComicInfo />")
+            archive.writestr("pages/001.jxl", b"\xff\x0a" + b"x" * 256)
+        if with_backup:
+            backup_path = archive_path.with_suffix(archive_path.suffix + ".bak")
+            with zipfile.ZipFile(backup_path, "w", zipfile.ZIP_DEFLATED) as backup:
+                backup.writestr("ComicInfo.xml", "<ComicInfo />")
+                backup.writestr("pages/001.jpg", b"original-page")
+        with database.transaction() as conn:
+            library = database.default_library(conn)
+            now = database.utc_now()
+            conn.execute(
+                "UPDATE libraries SET root_path=? WHERE id=?",
+                (str(library_root), library["id"]),
+            )
+            conn.execute(
+                """
+                INSERT INTO archives(
+                    library_id, path, status, original_size, final_size,
+                    bytes_saved, percent_saved, created_at, updated_at
+                ) VALUES (?, ?, 'processed', 1000, 1200, -200, -20, ?, ?)
+                """,
+                (library["id"], f"Series/{name}", now, now),
+            )
+            archive_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            return database.upsert_archive_issue(
+                conn,
+                archive_id=archive_id,
+                job_id=None,
+                kind="archive_grew",
+                stage="size_check",
+                message="Archive is larger than its original baseline",
             )
 
     def test_create_plain_language_schedule_and_job(self):
@@ -59,6 +105,32 @@ class ApiTests(unittest.TestCase):
         job = self.client.post("/api/jobs", json={})
         self.assertEqual(job.status_code, 201)
         self.assertEqual(self.client.get("/api/dashboard").json()["active_jobs"][0]["status"], "queued")
+
+    def test_integrity_audit_profile_forces_read_only_entire_library_scope(self):
+        bootstrap = self.client.get("/api/bootstrap").json()
+        audit = next(
+            profile
+            for profile in bootstrap["profiles"]
+            if profile["name"] == "Integrity audit"
+        )
+
+        response = self.client.post(
+            "/api/jobs",
+            json={"profile_id": audit["id"], "scope": "unprocessed"},
+        )
+
+        self.assertEqual(response.status_code, 201)
+        with database.connect() as conn:
+            options = json.loads(
+                conn.execute(
+                    "SELECT options_json FROM jobs WHERE id=?",
+                    (response.json()["id"],),
+                ).fetchone()[0]
+            )
+        self.assertTrue(options["integrity_audit"])
+        self.assertTrue(options["no_convert"])
+        self.assertTrue(options["recheck_all"])
+        self.assertFalse(options["failed_only"])
 
     def test_invalid_monthly_schedule_is_explained(self):
         response = self.client.post("/api/schedules", json={"cadence": "monthly", "day_of_month": 40})
@@ -213,6 +285,93 @@ class ApiTests(unittest.TestCase):
         self.assertIn("eta_seconds", hydrated)
         self.assertIn("smooth_percent", hydrated)
 
+    def test_job_history_explains_optimized_retained_and_failed_outcomes(self):
+        job = self.client.post("/api/jobs", json={}).json()
+        now = database.utc_now()
+        with database.transaction() as conn:
+            library_id = conn.execute(
+                "SELECT library_id FROM jobs WHERE id=?",
+                (job["id"],),
+            ).fetchone()[0]
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status='succeeded', processed=2, skipped=2, failed=1,
+                    started_at=?, finished_at=?
+                WHERE id=?
+                """,
+                (now, now, job["id"]),
+            )
+            conn.execute(
+                """
+                INSERT INTO archives(
+                    library_id, path, status, image_count, converted_pages,
+                    lossless_pages, retained_pages, bytes_saved, percent_saved,
+                    dominant_type, conversion_mode, converted_at,
+                    created_at, updated_at
+                ) VALUES
+                    (?, 'Already.cbz', 'processed', 10, 8, 8, 2, 4096, 20,
+                     'JPEG', 'Lossless', ?, ?, ?),
+                    (?, 'Retained.cbz', 'processed', 6, 0, 0, 6, 0, 0,
+                     'PNG', 'Original retained', ?, ?, ?)
+                """,
+                (library_id, now, now, now, library_id, now, now, now),
+            )
+            database.add_event(
+                conn,
+                job["id"],
+                "info",
+                "archive_completed",
+                "Skipped unchanged archive Already.cbz",
+                "Already.cbz",
+                {"stage": "skipped"},
+            )
+            database.add_event(
+                conn,
+                job["id"],
+                "info",
+                "archive_completed",
+                "Skipped unchanged archive Retained.cbz",
+                "Retained.cbz",
+                {"stage": "skipped"},
+            )
+            conn.execute(
+                """
+                INSERT INTO archive_results(
+                    job_id, path, status, image_count, converted_pages,
+                    lossless_pages, retained_pages, bytes_saved, percent_saved,
+                    conversion_mode, converted_at
+                ) VALUES
+                    (?, 'New.cbz', 'processed', 5, 5, 5, 0, 2048, 12,
+                     'Lossless', ?),
+                    (?, 'Larger.cbz', 'processed', 4, 0, 0, 4, 0, 0,
+                     'Original retained', ?),
+                    (?, 'Broken.cbz', 'failed', 0, 0, 0, 0, 0, 0,
+                     'N/A', ?)
+                """,
+                (job["id"], now, job["id"], now, job["id"], now),
+            )
+
+        response = self.client.get(f"/api/jobs/{job['id']}/history")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(
+            payload["outcome_counts"],
+            {
+                "optimized": 1,
+                "already_current": 1,
+                "retained": 2,
+                "failed": 1,
+                "all": 5,
+            },
+        )
+        labels = {row["path"]: row["label"] for row in payload["history_entries"]}
+        self.assertEqual(labels["Already.cbz"], "Already optimized")
+        self.assertEqual(labels["Retained.cbz"], "Original retained")
+        self.assertEqual(labels["New.cbz"], "Optimized")
+        self.assertEqual(labels["Broken.cbz"], "Conversion failed")
+
     def test_issue_retry_is_context_aware_and_path_scoped(self):
         issue_id = self.create_issue()
         listed = self.client.get("/api/issues").json()
@@ -244,6 +403,208 @@ class ApiTests(unittest.TestCase):
                 conn.execute("SELECT options_json FROM jobs WHERE id=?", (response.json()["job_id"],)).fetchone()[0]
             )
         self.assertEqual(options["only_path"], "Series/Book.cbz")
+        self.assertEqual(options["repair_action"], "delete")
+        self.assertEqual(options["repair_entry"], "pages/003.jpg")
+
+    def test_archive_growth_is_a_standard_attention_group_with_safe_remedies(self):
+        self.create_growth_issue(with_backup=True)
+
+        payload = self.client.get("/api/issues?group=growth").json()
+
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual(payload["groups"][0]["id"], "growth")
+        self.assertEqual(
+            payload["rows"][0]["remedies"],
+            ["lossless", "smart_lossy", "restore_original", "repack"],
+        )
+        self.assertTrue(payload["rows"][0]["backup_available"])
+        dashboard = self.client.get("/api/dashboard").json()
+        self.assertEqual(dashboard["review"]["total"], 1)
+        self.assertEqual(dashboard["review"]["grew"], 1)
+
+    def test_archive_growth_hides_backup_remedies_when_original_is_unavailable(self):
+        issue_id = self.create_growth_issue()
+
+        listed = self.client.get("/api/issues?group=growth").json()["rows"][0]
+        restore = self.client.post(
+            f"/api/issues/{issue_id}/action",
+            json={"action": "restore_original"},
+        )
+
+        self.assertEqual(listed["remedies"], ["repack", "dismiss"])
+        self.assertFalse(listed["backup_available"])
+        self.assertEqual(restore.status_code, 409)
+
+    def test_archive_growth_reports_latest_attempt_separately_from_lifetime(self):
+        self.create_growth_issue()
+        with database.transaction() as conn:
+            library = database.default_library(conn)
+            profile = database.default_profile(conn)
+            job_id = database.create_job(
+                conn,
+                source="retry",
+                library_id=library["id"],
+                profile_id=profile["id"],
+                options=database.DEFAULT_OPTIONS,
+            )
+            conn.execute(
+                """
+                INSERT INTO archive_results(
+                    job_id, path, original_size, final_size, bytes_saved,
+                    percent_saved, status, converted_at
+                ) VALUES (?, 'Series/Grew.cbz', 1200, 1150, 50, 4.1667,
+                          'processed', ?)
+                """,
+                (job_id, database.utc_now()),
+            )
+
+        issue = self.client.get("/api/issues?group=growth").json()["rows"][0]
+
+        self.assertEqual(issue["bytes_saved"], -200)
+        self.assertEqual(issue["latest_original_size"], 1200)
+        self.assertEqual(issue["latest_final_size"], 1150)
+        self.assertEqual(issue["latest_bytes_saved"], 50)
+
+    def test_archive_growth_actions_queue_the_matching_safe_engine_mode(self):
+        cases = [
+            (
+                "lossless",
+                {
+                    "repair_action": "restore_reconvert",
+                    "no_convert": False,
+                    "smart_distance": False,
+                    "distance": None,
+                },
+            ),
+            (
+                "smart_lossy",
+                {
+                    "repair_action": "restore_reconvert",
+                    "no_convert": False,
+                    "smart_distance": True,
+                    "distance": 0.5,
+                },
+            ),
+            (
+                "restore_original",
+                {
+                    "repair_action": "restore_original",
+                    "no_convert": True,
+                },
+            ),
+        ]
+        for index, (action, expected) in enumerate(cases):
+            issue_id = self.create_growth_issue(
+                f"Grew-{index}.cbz",
+                with_backup=True,
+            )
+            response = self.client.post(
+                f"/api/issues/{issue_id}/action",
+                json={"action": action},
+            )
+            self.assertEqual(response.status_code, 201)
+            with database.connect() as conn:
+                options = json.loads(
+                    conn.execute(
+                        "SELECT options_json FROM jobs WHERE id=?",
+                        (response.json()["job_id"],),
+                    ).fetchone()[0]
+                )
+            for key, value in expected.items():
+                self.assertEqual(options[key], value)
+
+        repack_issue = self.create_growth_issue("Grew-repack.cbz")
+        response = self.client.post(
+            f"/api/issues/{repack_issue}/action",
+            json={"action": "repack"},
+        )
+        self.assertEqual(response.status_code, 201)
+        with database.connect() as conn:
+            options = json.loads(
+                conn.execute(
+                    "SELECT options_json FROM jobs WHERE id=?",
+                    (response.json()["job_id"],),
+                ).fetchone()[0]
+            )
+        self.assertEqual(options["repair_action"], "repack")
+        self.assertTrue(options["no_convert"])
+
+    def test_filename_collision_lists_both_previews_and_can_keep_primary(self):
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow is required for image preview fixtures")
+
+        issue_id = self.create_issue(
+            kind="filename_collision",
+            entry_path="pages/003.jpg",
+            related_entry_path="pages/003.webp",
+        )
+        archive_path = Path(self.temp.name) / "Series" / "Book.cbz"
+        archive_path.parent.mkdir(parents=True)
+        primary_buffer = io.BytesIO()
+        related_buffer = io.BytesIO()
+        Image.new("RGB", (8, 8), "red").save(primary_buffer, format="WEBP")
+        Image.new("RGB", (8, 8), "blue").save(related_buffer, format="WEBP")
+        with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_STORED) as archive:
+            archive.writestr("pages/003.jpg", primary_buffer.getvalue())
+            archive.writestr("pages/003.webp", related_buffer.getvalue())
+        with database.transaction() as conn:
+            library = database.default_library(conn)
+            conn.execute(
+                "UPDATE libraries SET root_path=? WHERE id=?",
+                (self.temp.name, library["id"]),
+            )
+
+        listed = self.client.get("/api/issues?group=collisions").json()["rows"][0]
+        self.assertEqual(
+            listed["remedies"],
+            ["keep_primary", "keep_related", "dismiss"],
+        )
+        self.assertEqual(listed["related_entry_path"], "pages/003.webp")
+        primary_preview = self.client.get(listed["preview_url"])
+        related_preview = self.client.get(listed["related_preview_url"])
+        self.assertEqual(primary_preview.status_code, 200)
+        self.assertEqual(related_preview.status_code, 200)
+        self.assertEqual(primary_preview.headers["content-type"], "image/webp")
+        self.assertEqual(related_preview.headers["content-type"], "image/webp")
+        self.assertNotEqual(primary_preview.content, related_preview.content)
+
+        response = self.client.post(
+            f"/api/issues/{issue_id}/action",
+            json={"action": "keep_primary"},
+        )
+        self.assertEqual(response.status_code, 201)
+        with database.connect() as conn:
+            options = json.loads(
+                conn.execute(
+                    "SELECT options_json FROM jobs WHERE id=?",
+                    (response.json()["job_id"],),
+                ).fetchone()[0]
+            )
+        self.assertEqual(options["repair_action"], "delete")
+        self.assertEqual(options["repair_entry"], "pages/003.webp")
+
+    def test_filename_collision_can_keep_related_image(self):
+        issue_id = self.create_issue(
+            kind="filename_collision",
+            entry_path="pages/003.jpg",
+            related_entry_path="pages/003.webp",
+        )
+
+        response = self.client.post(
+            f"/api/issues/{issue_id}/action",
+            json={"action": "keep_related"},
+        )
+
+        self.assertEqual(response.status_code, 201)
+        with database.connect() as conn:
+            options = json.loads(
+                conn.execute(
+                    "SELECT options_json FROM jobs WHERE id=?",
+                    (response.json()["job_id"],),
+                ).fetchone()[0]
+            )
         self.assertEqual(options["repair_action"], "delete")
         self.assertEqual(options["repair_entry"], "pages/003.jpg")
         self.assertTrue(options["no_flatten"])
@@ -403,6 +764,27 @@ class ApiTests(unittest.TestCase):
             )
             conn.execute(
                 """
+                UPDATE archives
+                SET format_inventory_fingerprint='inventory-one',
+                    format_inventory_at=?
+                WHERE id=?
+                """,
+                (now, archive_id),
+            )
+            conn.executemany(
+                """
+                INSERT INTO archive_format_stats(
+                    archive_id, format, file_count, compressed_bytes,
+                    uncompressed_bytes, content_fingerprint, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'inventory-one', ?)
+                """,
+                [
+                    (archive_id, "JPEG XL", 8, 700, 800, now),
+                    (archive_id, "JPEG", 2, 200, 240, now),
+                ],
+            )
+            conn.execute(
+                """
                 INSERT INTO library_stat_snapshots(
                     job_id, library_id, recorded_at, archive_count,
                     optimized_count, failed_count, baseline_bytes,
@@ -428,6 +810,27 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(payload["run_trend"][0]["library_snapshot"])
         self.assertEqual(payload["processing"]["median_seconds"], 40)
         self.assertEqual(payload["effort"]["archives_attempted"], 1)
+        self.assertEqual(payload["filetypes"]["total_files"], 10)
+        self.assertEqual(payload["filetypes"]["total_storage_bytes"], 900)
+        self.assertEqual(
+            payload["filetypes"]["rows"],
+            [
+                {
+                    "label": "JPEG XL",
+                    "file_count": 8,
+                    "storage_bytes": 700,
+                    "decoded_bytes": 800,
+                },
+                {
+                    "label": "JPEG",
+                    "file_count": 2,
+                    "storage_bytes": 200,
+                    "decoded_bytes": 240,
+                },
+            ],
+        )
+        self.assertEqual(payload["filetypes"]["inventoried_archives"], 1)
+        self.assertEqual(payload["filetypes"]["archive_count"], 2)
 
     def test_crc_diagnostics_offer_recovery_for_a_decodable_jxl_with_bad_size(self):
         library_root = Path(self.temp.name) / "library"
@@ -492,6 +895,185 @@ class ApiTests(unittest.TestCase):
             )
         self.assertEqual(options["repair_action"], "rebuild")
         self.assertEqual(options["repair_entry"], "pages/009.jxl")
+        self.assertEqual(options["repair_entries"], ["pages/009.jxl"])
+
+    def test_crc_diagnostics_build_one_recovery_plan_for_multiple_bad_entries(self):
+        library_root = Path(self.temp.name) / "library"
+        archive_path = library_root / "Series" / "Book.cbz"
+        archive_path.parent.mkdir(parents=True)
+        with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as target:
+            target.writestr("pages/001.jxl", b"\xff\x0afirst")
+            target.writestr("pages/002.jxl", b"\xff\x0asecond")
+        archive_bytes = bytearray(archive_path.read_bytes())
+        offsets = []
+        start = 0
+        while True:
+            try:
+                start = archive_bytes.index(b"PK\x01\x02", start)
+            except ValueError:
+                break
+            offsets.append(start)
+            start += 4
+        for offset in offsets:
+            crc = struct.unpack_from("<L", archive_bytes, offset + 16)[0]
+            struct.pack_into("<L", archive_bytes, offset + 16, crc ^ 0xFFFFFFFF)
+        archive_path.write_bytes(archive_bytes)
+        with database.transaction() as conn:
+            library = database.default_library(conn)
+            conn.execute(
+                "UPDATE libraries SET root_path=? WHERE id=?",
+                (str(library_root), library["id"]),
+            )
+        issue_id = self.create_issue(
+            kind="crc_mismatch",
+            entry_path="pages/001.jxl",
+        )
+
+        decoded = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(web_app.subprocess, "run", return_value=decoded):
+            diagnostics = self.client.get(
+                f"/api/issues/{issue_id}/diagnostics"
+            ).json()
+            queued = self.client.post(
+                f"/api/issues/{issue_id}/action",
+                json={"action": "rebuild"},
+            )
+
+        self.assertEqual(diagnostics["recoverable_count"], 2)
+        self.assertEqual(diagnostics["needs_decision_count"], 0)
+        self.assertEqual(
+            diagnostics["repair_entries"],
+            ["pages/001.jxl", "pages/002.jxl"],
+        )
+        self.assertEqual(queued.status_code, 201)
+        with database.connect() as conn:
+            options = json.loads(
+                conn.execute(
+                    "SELECT options_json FROM jobs WHERE id=?",
+                    (queued.json()["job_id"],),
+                ).fetchone()[0]
+            )
+        self.assertEqual(
+            options["repair_entries"],
+            ["pages/001.jxl", "pages/002.jxl"],
+        )
+
+    def test_unreadable_archive_can_queue_safe_local_header_salvage(self):
+        library_root = Path(self.temp.name) / "library"
+        archive_path = library_root / "Series" / "Book.cbz"
+        archive_path.parent.mkdir(parents=True)
+        with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as target:
+            target.writestr("pages/001.jpg", b"recoverable-page")
+            target.writestr("ComicInfo.xml", b"<ComicInfo/>")
+        archive_bytes = archive_path.read_bytes()
+        archive_path.write_bytes(archive_bytes[:archive_bytes.index(b"PK\x01\x02")])
+        with database.transaction() as conn:
+            library = database.default_library(conn)
+            conn.execute(
+                "UPDATE libraries SET root_path=? WHERE id=?",
+                (str(library_root), library["id"]),
+            )
+        issue_id = self.create_issue(kind="archive_corrupt", entry_path=None)
+
+        decoded = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(web_app.subprocess, "run", return_value=decoded):
+            diagnostics = self.client.get(
+                f"/api/issues/{issue_id}/diagnostics"
+            ).json()
+            queued = self.client.post(
+                f"/api/issues/{issue_id}/action",
+                json={"action": "salvage"},
+            )
+
+        self.assertTrue(diagnostics["salvageable"])
+        self.assertEqual(diagnostics["recoverable_count"], 2)
+        self.assertEqual(queued.status_code, 201)
+        with database.connect() as conn:
+            options = json.loads(
+                conn.execute(
+                    "SELECT options_json FROM jobs WHERE id=?",
+                    (queued.json()["job_id"],),
+                ).fetchone()[0]
+            )
+        self.assertEqual(options["repair_action"], "salvage")
+
+    def test_truncated_archive_can_explicitly_rebuild_only_verified_entries(self):
+        library_root = Path(self.temp.name) / "library"
+        archive_path = library_root / "Series" / "Book.cbz"
+        archive_path.parent.mkdir(parents=True)
+        with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_STORED) as target:
+            target.writestr("pages/001.jpg", b"complete-page")
+            target.writestr("pages/002.jpg", b"truncated-page")
+        archive_bytes = archive_path.read_bytes()
+        second_header = archive_bytes.index(b"PK\x03\x04", 4)
+        archive_path.write_bytes(archive_bytes[:second_header + 35])
+        with database.transaction() as conn:
+            library = database.default_library(conn)
+            conn.execute(
+                "UPDATE libraries SET root_path=? WHERE id=?",
+                (str(library_root), library["id"]),
+            )
+        issue_id = self.create_issue(kind="archive_corrupt", entry_path=None)
+
+        decoded = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(web_app.subprocess, "run", return_value=decoded):
+            diagnostics = self.client.get(
+                f"/api/issues/{issue_id}/diagnostics"
+            ).json()
+            queued = self.client.post(
+                f"/api/issues/{issue_id}/action",
+                json={"action": "salvage_partial"},
+            )
+
+        self.assertFalse(diagnostics["salvageable"])
+        self.assertTrue(diagnostics["partial_salvageable"])
+        self.assertEqual(diagnostics["recoverable_count"], 1)
+        self.assertEqual(diagnostics["needs_decision_count"], 1)
+        self.assertEqual(queued.status_code, 201)
+        with database.connect() as conn:
+            options = json.loads(
+                conn.execute(
+                    "SELECT options_json FROM jobs WHERE id=?",
+                    (queued.json()["job_id"],),
+                ).fetchone()[0]
+            )
+        self.assertEqual(options["repair_action"], "salvage_partial")
+
+    def test_partial_salvage_is_blocked_if_a_complete_image_is_unreadable(self):
+        library_root = Path(self.temp.name) / "library"
+        archive_path = library_root / "Series" / "Book.cbz"
+        archive_path.parent.mkdir(parents=True)
+        with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_STORED) as target:
+            target.writestr("pages/001.jpg", b"complete-page")
+            target.writestr("pages/002.jpg", b"unreadable-page")
+            target.writestr("pages/003.jpg", b"truncated-page")
+        archive_bytes = archive_path.read_bytes()
+        third_header = archive_bytes.index(
+            b"PK\x03\x04",
+            archive_bytes.index(b"PK\x03\x04", 4) + 4,
+        )
+        archive_path.write_bytes(archive_bytes[:third_header + 35])
+        with database.transaction() as conn:
+            library = database.default_library(conn)
+            conn.execute(
+                "UPDATE libraries SET root_path=? WHERE id=?",
+                (str(library_root), library["id"]),
+            )
+        issue_id = self.create_issue(kind="archive_corrupt", entry_path=None)
+        decoded = [
+            mock.Mock(returncode=0, stdout="", stderr=""),
+            mock.Mock(returncode=1, stdout="", stderr="truncated JPEG"),
+        ]
+
+        with mock.patch.object(web_app.subprocess, "run", side_effect=decoded):
+            diagnostics = self.client.get(
+                f"/api/issues/{issue_id}/diagnostics"
+            ).json()
+
+        self.assertFalse(diagnostics["salvageable"])
+        self.assertFalse(diagnostics["partial_salvageable"])
+        self.assertEqual(diagnostics["recoverable_count"], 1)
+        self.assertEqual(diagnostics["needs_decision_count"], 2)
 
     def test_crc_issue_can_preserve_the_page_and_convert_the_rest(self):
         issue_id = self.create_issue(

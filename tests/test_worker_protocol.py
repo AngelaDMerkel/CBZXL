@@ -87,6 +87,28 @@ class WorkerProtocolTests(unittest.TestCase):
         )
         self.assertIn("--recheck-all", command)
 
+    def test_worker_passes_read_only_integrity_audit_mode(self):
+        with database.transaction() as conn:
+            library = database.default_library(conn)
+            profile = database.default_profile(conn)
+            job_id = database.create_job(
+                conn,
+                source="manual",
+                library_id=library["id"],
+                profile_id=profile["id"],
+                options={
+                    **database.DEFAULT_OPTIONS,
+                    "integrity_audit": True,
+                    "no_convert": True,
+                    "recheck_all": True,
+                },
+            )
+            job = dict(conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
+        command = command_for_job(job, library)
+        self.assertIn("--integrity-audit", command)
+        self.assertIn("--no-convert", command)
+        self.assertIn("--recheck-all", command)
+
     def test_worker_passes_contextual_repair_options(self):
         command = command_for_job(
             {
@@ -97,7 +119,8 @@ class WorkerProtocolTests(unittest.TestCase):
                   "compatibility_mode": true,
                   "continue_on_page_error": true,
                   "repair_action": "delete",
-                  "repair_entry": "pages/003.jpg"
+                  "repair_entry": "pages/003.jpg",
+                  "repair_entries": ["pages/003.jpg", "pages/004.jpg"]
                 }
                 """,
             },
@@ -107,6 +130,8 @@ class WorkerProtocolTests(unittest.TestCase):
         self.assertIn("--continue-on-page-error", command)
         self.assertIn("--repair-action", command)
         self.assertIn("pages/003.jpg", command)
+        self.assertIn("--repair-entries", command)
+        self.assertIn('["pages/003.jpg","pages/004.jpg"]', command)
 
     def test_failure_output_keeps_traceback_after_structured_events(self):
         detail = failure_output(

@@ -183,6 +183,37 @@ CREATE TABLE IF NOT EXISTS archive_results (
     UNIQUE(job_id, path)
 );
 
+CREATE TABLE IF NOT EXISTS page_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    archive_id INTEGER REFERENCES archives(id) ON DELETE SET NULL,
+    path TEXT NOT NULL,
+    entry_path TEXT NOT NULL,
+    source_format TEXT,
+    source_size INTEGER,
+    candidate_size INTEGER,
+    final_size INTEGER,
+    outcome TEXT NOT NULL,
+    mode TEXT,
+    distance REAL,
+    effort INTEGER,
+    reason TEXT,
+    attempts_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    UNIQUE(job_id, path, entry_path)
+);
+
+CREATE TABLE IF NOT EXISTS archive_format_stats (
+    archive_id INTEGER NOT NULL REFERENCES archives(id) ON DELETE CASCADE,
+    format TEXT NOT NULL,
+    file_count INTEGER NOT NULL DEFAULT 0,
+    compressed_bytes INTEGER NOT NULL DEFAULT 0,
+    uncompressed_bytes INTEGER NOT NULL DEFAULT 0,
+    content_fingerprint TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (archive_id, format)
+);
+
 CREATE TABLE IF NOT EXISTS archive_issues (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     archive_id INTEGER NOT NULL UNIQUE REFERENCES archives(id) ON DELETE CASCADE,
@@ -190,6 +221,7 @@ CREATE TABLE IF NOT EXISTS archive_issues (
     kind TEXT NOT NULL,
     stage TEXT NOT NULL,
     entry_path TEXT,
+    related_entry_path TEXT,
     message TEXT NOT NULL,
     detail TEXT,
     status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'queued', 'dismissed', 'resolved')),
@@ -245,6 +277,9 @@ CREATE INDEX IF NOT EXISTS idx_archives_status ON archives(status);
 CREATE INDEX IF NOT EXISTS idx_archives_review ON archives(review_status, status);
 CREATE INDEX IF NOT EXISTS idx_archives_saved ON archives(bytes_saved);
 CREATE INDEX IF NOT EXISTS idx_results_job ON archive_results(job_id);
+CREATE INDEX IF NOT EXISTS idx_page_decisions_job_path ON page_decisions(job_id, path);
+CREATE INDEX IF NOT EXISTS idx_page_decisions_archive ON page_decisions(archive_id);
+CREATE INDEX IF NOT EXISTS idx_archive_format_stats_format ON archive_format_stats(format);
 CREATE INDEX IF NOT EXISTS idx_archive_issues_status ON archive_issues(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_archive_issues_job ON archive_issues(job_id);
 CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(enabled, next_run_at);
@@ -261,7 +296,7 @@ DEFAULT_OPTIONS = {
     "no_flatten": True,
     "delete_empty": False,
     "smart_distance": False,
-    "effort": 7,
+    "effort": 10,
     "threads": 4,
     "distance": None,
     "smart_mb": 10.0,
@@ -269,8 +304,10 @@ DEFAULT_OPTIONS = {
     "failed_only": False,
     "compatibility_mode": False,
     "continue_on_page_error": False,
+    "integrity_audit": False,
     "repair_action": None,
     "repair_entry": None,
+    "repair_entries": [],
     "repair_source": None,
 }
 
@@ -299,6 +336,17 @@ BUILTIN_PROFILES = (
             **DEFAULT_OPTIONS,
             "no_convert": True,
             "recheck_all": True,
+        },
+    },
+    {
+        "id": "profile-integrity",
+        "name": "Integrity audit",
+        "is_default": 0,
+        "options": {
+            **DEFAULT_OPTIONS,
+            "no_convert": True,
+            "recheck_all": True,
+            "integrity_audit": True,
         },
     },
 )
@@ -393,6 +441,11 @@ def initialize() -> None:
         }
         migrations["archives"].update(page_outcome_columns)
         migrations["archives"]["generation"] = "INTEGER NOT NULL DEFAULT 1"
+        migrations["archives"]["format_inventory_fingerprint"] = "TEXT"
+        migrations["archives"]["format_inventory_at"] = "TEXT"
+        migrations["archive_issues"] = {
+            "related_entry_path": "TEXT",
+        }
         migrations["archive_results"] = {
             **page_outcome_columns,
             "generation": "INTEGER NOT NULL DEFAULT 1",
@@ -497,6 +550,14 @@ def initialize() -> None:
                 "INSERT INTO schema_migrations(version, applied_at) VALUES (6, ?)",
                 (utc_now(),),
             )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (7, ?)",
+            (utc_now(),),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (8, ?)",
+            (utc_now(),),
+        )
         now = utc_now()
         library_id = "library-default"
         conn.execute(
@@ -524,6 +585,51 @@ def initialize() -> None:
                         now,
                     ),
                 )
+        if not conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=9"
+        ).fetchone():
+            for profile_id in ("profile-balanced", "profile-smart", "profile-recheck"):
+                row = conn.execute(
+                    "SELECT options_json FROM conversion_profiles WHERE id=?",
+                    (profile_id,),
+                ).fetchone()
+                if not row:
+                    continue
+                options = json.loads(row["options_json"])
+                if int(options.get("effort", 7)) == 7:
+                    options["effort"] = 10
+                    conn.execute(
+                        """
+                        UPDATE conversion_profiles
+                        SET options_json=?, updated_at=?
+                        WHERE id=?
+                        """,
+                        (json.dumps(options, sort_keys=True), now, profile_id),
+                    )
+            audit = next(
+                profile
+                for profile in BUILTIN_PROFILES
+                if profile["id"] == "profile-integrity"
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO conversion_profiles(
+                    id, name, is_default, options_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    audit["id"],
+                    audit["name"],
+                    audit["is_default"],
+                    json.dumps(audit["options"], sort_keys=True),
+                    now,
+                    now,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (9, ?)",
+                (now,),
+            )
         conn.execute(
             """
             INSERT OR IGNORE INTO archive_issues(
@@ -543,8 +649,30 @@ def initialize() -> None:
                 CASE WHEN review_status='queued' THEN 'queued' ELSE 'open' END,
                 NULL, updated_at, updated_at, NULL
             FROM archives
-            WHERE review_status!='reviewed' AND (status='failed' OR bytes_saved < 0)
+            WHERE
+                (review_status!='reviewed' AND status='failed')
+                OR (
+                    status='processed'
+                    AND bytes_saved < 0
+                    AND dismissed_until_rescan=0
+                )
             """
+        )
+        conn.execute(
+            """
+            UPDATE archive_issues
+            SET status='open', remedy=NULL, resolved_at=NULL, updated_at=?
+            WHERE kind='archive_grew'
+              AND status='resolved'
+              AND archive_id IN (
+                  SELECT id
+                  FROM archives
+                  WHERE status='processed'
+                    AND bytes_saved < 0
+                    AND dismissed_until_rescan=0
+              )
+            """,
+            (now,),
         )
 
 
@@ -557,20 +685,23 @@ def upsert_archive_issue(
     stage: str,
     message: str,
     entry_path: str | None = None,
+    related_entry_path: str | None = None,
     detail: str | None = None,
 ) -> int:
     now = utc_now()
     conn.execute(
         """
         INSERT INTO archive_issues(
-            archive_id, job_id, kind, stage, entry_path, message, detail,
+            archive_id, job_id, kind, stage, entry_path, related_entry_path,
+            message, detail,
             status, remedy, created_at, updated_at, resolved_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', NULL, ?, ?, NULL)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, ?, ?, NULL)
         ON CONFLICT(archive_id) DO UPDATE SET
             job_id=excluded.job_id,
             kind=excluded.kind,
             stage=excluded.stage,
             entry_path=excluded.entry_path,
+            related_entry_path=excluded.related_entry_path,
             message=excluded.message,
             detail=excluded.detail,
             status='open',
@@ -578,7 +709,18 @@ def upsert_archive_issue(
             updated_at=excluded.updated_at,
             resolved_at=NULL
         """,
-        (archive_id, job_id, kind, stage, entry_path, message[:2000], (detail or "")[:8000] or None, now, now),
+        (
+            archive_id,
+            job_id,
+            kind,
+            stage,
+            entry_path,
+            related_entry_path,
+            message[:2000],
+            (detail or "")[:8000] or None,
+            now,
+            now,
+        ),
     )
     conn.execute(
         """

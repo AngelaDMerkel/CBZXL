@@ -1,3 +1,3 @@
 """CBZXL web application services."""
 
-__version__ = "4.1.1"
+__version__ = "4.4.0"

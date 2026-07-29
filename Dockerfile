@@ -5,10 +5,25 @@ RUN corepack enable && corepack prepare pnpm@11.9.0 --activate && pnpm install -
 COPY frontend/ ./
 RUN pnpm run build
 
-FROM python:3.13-alpine
-LABEL name="cbzxl-web" version="4.1.1"
+FROM alpine:3.24 AS libjxl
+ARG LIBJXL_VERSION=0.12.0
+RUN apk add --no-cache curl lzip
+RUN curl -fsSL \
+    "https://github.com/libjxl/libjxl/releases/download/v${LIBJXL_VERSION}/jxl-linux-x86_64-static.tar.lz" \
+    -o /tmp/libjxl.tar.lz
+RUN sha256sum /tmp/libjxl.tar.lz \
+    | grep -Fx "5318a1ea40adad76d023e0c17a03d4627f8282f83cb2b575e69be8e74f1ff456  /tmp/libjxl.tar.lz"
+RUN mkdir -p /opt/libjxl \
+    && lzip -dc /tmp/libjxl.tar.lz | tar -xf - -C /opt/libjxl
+RUN /opt/libjxl/tools/cjxl --version 2>&1 | grep -F "v${LIBJXL_VERSION}" \
+    && /opt/libjxl/tools/djxl --version 2>&1 | grep -F "v${LIBJXL_VERSION}"
 
-RUN apk add --no-cache libjxl-tools tzdata imagemagick file
+FROM python:3.13-alpine
+LABEL name="cbzxl-web" version="4.4.0"
+
+RUN apk add --no-cache tzdata imagemagick file
+COPY --from=libjxl /opt/libjxl/tools/cjxl /usr/local/bin/cjxl
+COPY --from=libjxl /opt/libjxl/tools/djxl /usr/local/bin/djxl
 
 WORKDIR /app
 RUN mkdir -p /data /config /dev/shm/cbzxl

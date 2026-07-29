@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import uuid
 import zipfile
+import xml.etree.ElementTree as ElementTree
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from statistics import median
@@ -37,14 +38,21 @@ from cbzxl_web.database import (
     utc_now,
 )
 from cbzxl_web.legacy import import_legacy, inspect_legacy
-from cbzxl_web.engine import VerificationError, crc32_hex, recover_zip_entry_bytes
+from cbzxl_web.engine import (
+    IMAGE_SUFFIXES,
+    VerificationError,
+    crc32_hex,
+    recover_local_zip_entry_bytes,
+    recover_zip_entry_bytes,
+    scan_local_zip_entries,
+)
 
 
 ROOT = Path(__file__).parent
 FRONTEND_DIST = ROOT / "frontend" / "dist"
 LEGACY_STATIC = ROOT / "static"
 
-VERSION = "4.1.1"
+VERSION = "4.4.0"
 LOGGER = logging.getLogger("cbzxl.web")
 DATABASE_STARTUP_ERROR: str | None = None
 
@@ -60,7 +68,7 @@ class ScanOptions(BaseModel):
     no_flatten: bool = True
     delete_empty: bool = False
     smart_distance: bool = False
-    effort: int = Field(7, ge=0, le=11)
+    effort: int = Field(10, ge=0, le=11)
     threads: int = Field(4, ge=1, le=32)
     distance: Optional[float] = Field(None, ge=0, le=15)
     smart_mb: float = Field(10.0, ge=0.1, le=1000)
@@ -68,9 +76,23 @@ class ScanOptions(BaseModel):
     failed_only: bool = False
     compatibility_mode: bool = False
     continue_on_page_error: bool = False
+    integrity_audit: bool = False
     only_path: Optional[str] = None
-    repair_action: Optional[Literal["replace", "delete", "rebuild", "preserve"]] = None
+    repair_action: Optional[
+        Literal[
+            "replace",
+            "delete",
+            "rebuild",
+            "preserve",
+            "salvage",
+            "salvage_partial",
+            "restore_original",
+            "restore_reconvert",
+            "repack",
+        ]
+    ] = None
     repair_entry: Optional[str] = None
+    repair_entries: list[str] = Field(default_factory=list)
     repair_source: Optional[str] = None
 
     @model_validator(mode="after")
@@ -125,7 +147,14 @@ class IssueActionPayload(BaseModel):
         "delete",
         "delete_archive",
         "lossless",
+        "smart_lossy",
+        "restore_original",
+        "repack",
         "rebuild",
+        "salvage",
+        "salvage_partial",
+        "keep_primary",
+        "keep_related",
     ]
 
 
@@ -282,7 +311,7 @@ def dashboard():
             conn.execute(
                 """
                 SELECT
-                    SUM(CASE WHEN ai.kind!='archive_grew' THEN 1 ELSE 0 END) AS total,
+                    COUNT(*) AS total,
                     SUM(CASE WHEN ai.kind='archive_grew' THEN 1 ELSE 0 END) AS grew,
                     SUM(CASE WHEN ai.kind!='archive_grew' THEN 1 ELSE 0 END) AS failed
                 FROM archive_issues ai
@@ -372,6 +401,35 @@ def detailed_statistics():
                 """
             ).fetchall()
         )
+        filetype_rows = rows_dict(
+            conn.execute(
+                """
+                SELECT
+                    afs.format AS label,
+                    COALESCE(SUM(afs.file_count), 0) AS file_count,
+                    COALESCE(SUM(afs.compressed_bytes), 0) AS storage_bytes,
+                    COALESCE(SUM(afs.uncompressed_bytes), 0) AS decoded_bytes
+                FROM archive_format_stats afs
+                JOIN archives a ON a.id=afs.archive_id
+                WHERE a.status!='missing'
+                GROUP BY afs.format
+                ORDER BY file_count DESC, storage_bytes DESC, label
+                """
+            ).fetchall()
+        )
+        filetype_inventory = row_dict(
+            conn.execute(
+                """
+                SELECT
+                    SUM(CASE
+                        WHEN status!='missing' AND format_inventory_at IS NOT NULL
+                        THEN 1 ELSE 0 END
+                    ) AS inventoried_archives,
+                    SUM(CASE WHEN status!='missing' THEN 1 ELSE 0 END) AS archive_count
+                FROM archives
+                """
+            ).fetchone()
+        )
         saving_values = [
             float(row[0])
             for row in conn.execute(
@@ -448,7 +506,7 @@ def detailed_statistics():
                 """
                 SELECT kind, stage, COUNT(*) AS count
                 FROM archive_issues
-                WHERE status IN ('open', 'queued') AND kind!='archive_grew'
+                WHERE status IN ('open', 'queued')
                 GROUP BY kind, stage
                 """
             ).fetchall()
@@ -605,6 +663,27 @@ def detailed_statistics():
             }
             for row in format_rows
         ],
+        "filetypes": {
+            "rows": [
+                {
+                    "label": row["label"],
+                    "file_count": int(row.get("file_count") or 0),
+                    "storage_bytes": int(row.get("storage_bytes") or 0),
+                    "decoded_bytes": int(row.get("decoded_bytes") or 0),
+                }
+                for row in filetype_rows
+            ],
+            "total_files": sum(
+                int(row.get("file_count") or 0) for row in filetype_rows
+            ),
+            "total_storage_bytes": sum(
+                int(row.get("storage_bytes") or 0) for row in filetype_rows
+            ),
+            "inventoried_archives": int(
+                filetype_inventory.get("inventoried_archives") or 0
+            ),
+            "archive_count": int(filetype_inventory.get("archive_count") or 0),
+        },
         "outcomes": [
             {"label": "Lossless JXL", "count": lossless_pages},
             {"label": "Smart lossy", "count": lossy_pages},
@@ -658,6 +737,114 @@ def list_jobs(status: Optional[str] = None, limit: int = Query(50, ge=1, le=200)
     return {"rows": [hydrate_job(row) for row in rows]}
 
 
+def archive_history_context(values, *, skipped=False):
+    values = values or {}
+
+    def history_value(name, default=0):
+        previous = values.get(f"previous_{name}")
+        return previous if previous is not None else values.get(name, default)
+
+    image_count = int(history_value("image_count") or 0)
+    converted_pages = int(history_value("converted_pages") or 0)
+    lossless_pages = int(history_value("lossless_pages") or 0)
+    lossy_pages = int(history_value("lossy_pages") or 0)
+    retained_pages = int(history_value("retained_pages") or 0)
+    bytes_saved = int(history_value("bytes_saved") or 0)
+    percent_saved = float(history_value("percent_saved") or 0)
+    conversion_mode = str(history_value("conversion_mode", "") or "")
+    dominant_type = str(values.get("dominant_type") or "")
+    status = str(values.get("status") or "")
+    if values.get("history_outcome"):
+        outcome = values["history_outcome"]
+        label_text = (
+            values.get("history_label")
+            or str(outcome).replace("_", " ").title()
+        )
+        detail = values.get("history_detail") or ""
+    elif status == "failed":
+        outcome = "failed"
+        label_text = "Conversion failed"
+        detail = values.get("error_message") or "The archive could not be processed"
+    elif status == "audited" or conversion_mode == "Integrity audit":
+        outcome = "already_current"
+        label_text = "Integrity verified"
+        detail = "Every ZIP entry passed CRC validation and every JPEG XL page fully decoded"
+    elif converted_pages > 0:
+        outcome = "already_current" if skipped else "optimized"
+        label_text = "Already optimized" if skipped else "Optimized"
+        page_summary = (
+            f"{converted_pages:,} of {image_count:,} pages"
+            if image_count
+            else f"{converted_pages:,} pages"
+        )
+        detail = (
+            f"{page_summary} were previously converted"
+            if skipped
+            else f"{page_summary} converted during this run"
+        )
+    elif retained_pages > 0 or "retained" in conversion_mode.lower():
+        outcome = "retained"
+        label_text = "Original retained"
+        detail = (
+            f"{retained_pages or image_count:,} pages were assessed; "
+            "JXL candidates were not smaller"
+        )
+    elif dominant_type.upper() == "JXL":
+        outcome = "already_current"
+        label_text = "Already JXL"
+        detail = "The archive already contained JPEG XL pages"
+    elif skipped and all(
+        values.get(key) is None
+        for key in ("image_count", "previous_image_count")
+    ):
+        outcome = "already_current"
+        label_text = "Previously checked"
+        detail = (
+            "The archive is unchanged; this older record does not include "
+            "a page-level outcome"
+        )
+    elif image_count == 0:
+        outcome = "already_current"
+        label_text = "No processable images"
+        detail = (
+            "The previous scan found no images the converter could process"
+            if skipped
+            else "No processable images were found in this archive"
+        )
+    else:
+        outcome = "already_current"
+        label_text = "No conversion required"
+        detail = (
+            "The archive was previously assessed and required no changes"
+            if skipped
+            else "No convertible source images required a change"
+        )
+    return {
+        "outcome": outcome,
+        "label": label_text,
+        "detail": detail,
+        "image_count": image_count,
+        "converted_pages": converted_pages,
+        "lossless_pages": lossless_pages,
+        "lossy_pages": lossy_pages,
+        "retained_pages": retained_pages,
+        "bytes_saved": bytes_saved,
+        "percent_saved": percent_saved,
+        "conversion_mode": conversion_mode or None,
+        "jxl_effort": history_value("jxl_effort", None),
+        "previous_processed_at": (
+            (
+                values.get("previous_processed_at")
+                or values.get("converted_at")
+            )
+            if skipped
+            else None
+        ),
+        "error_message": values.get("error_message"),
+        "decision_summary": values.get("decision_summary"),
+    }
+
+
 @app.get("/api/jobs/{job_id}")
 def get_job(job_id: str):
     with connect() as conn:
@@ -673,6 +860,245 @@ def get_job(job_id: str):
     return {"job": hydrate_job(job, samples), "events": events, "results": results, "progress": samples}
 
 
+@app.get("/api/jobs/{job_id}/history")
+def get_job_history(job_id: str):
+    history = get_job(job_id)
+    job = history["job"]
+    results = history["results"]
+    with connect() as conn:
+        skipped_events = rows_dict(
+            conn.execute(
+                """
+                SELECT *
+                FROM job_events
+                WHERE job_id=?
+                  AND event_type='archive_completed'
+                  AND (
+                    message LIKE 'Skipped unchanged archive %'
+                    OR COALESCE(json_extract(data_json, '$.stage'), '')='skipped'
+                  )
+                ORDER BY id DESC
+                LIMIT 200
+                """,
+                (job_id,),
+            ).fetchall()
+        )
+        archive_paths = sorted(
+            {
+                row["archive_path"]
+                for row in skipped_events
+                if row.get("archive_path")
+            }
+        )
+        archive_rows = []
+        if archive_paths:
+            placeholders = ",".join("?" for _ in archive_paths)
+            archive_rows = rows_dict(
+                conn.execute(
+                    f"""
+                    SELECT *
+                    FROM archives
+                    WHERE library_id=? AND path IN ({placeholders})
+                    """,
+                    (job["library_id"], *archive_paths),
+                ).fetchall()
+            )
+        result_counts = row_dict(
+            conn.execute(
+                """
+                SELECT
+                  SUM(CASE WHEN status!='failed' AND converted_pages>0 THEN 1 ELSE 0 END) AS optimized,
+                  SUM(CASE WHEN status!='failed' AND converted_pages=0
+                                AND (retained_pages>0 OR lower(COALESCE(conversion_mode, '')) LIKE '%retained%')
+                           THEN 1 ELSE 0 END) AS retained,
+                  SUM(CASE WHEN status!='failed' AND converted_pages=0
+                                AND NOT (retained_pages>0 OR lower(COALESCE(conversion_mode, '')) LIKE '%retained%')
+                           THEN 1 ELSE 0 END) AS already_current,
+                  SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed
+                FROM archive_results
+                WHERE job_id=?
+                """,
+                (job_id,),
+            ).fetchone()
+        ) or {}
+        skipped_counts = row_dict(
+            conn.execute(
+                """
+                SELECT
+                  SUM(
+                    CASE WHEN
+                      json_extract(e.data_json, '$.history_outcome')='retained'
+                      OR (
+                        json_extract(e.data_json, '$.history_outcome') IS NULL
+                        AND COALESCE(a.converted_pages, 0)=0
+                        AND (
+                          COALESCE(a.retained_pages, 0)>0
+                          OR lower(COALESCE(a.conversion_mode, '')) LIKE '%retained%'
+                        )
+                      )
+                    THEN 1 ELSE 0 END
+                  ) AS retained,
+                  SUM(
+                    CASE WHEN
+                      json_extract(e.data_json, '$.history_outcome')='retained'
+                      OR (
+                        json_extract(e.data_json, '$.history_outcome') IS NULL
+                        AND COALESCE(a.converted_pages, 0)=0
+                        AND (
+                          COALESCE(a.retained_pages, 0)>0
+                          OR lower(COALESCE(a.conversion_mode, '')) LIKE '%retained%'
+                        )
+                      )
+                    THEN 0 ELSE 1 END
+                  ) AS already_current
+                FROM job_events e
+                LEFT JOIN archives a
+                  ON a.library_id=? AND a.path=e.archive_path
+                WHERE e.job_id=?
+                  AND e.event_type='archive_completed'
+                  AND (
+                    e.message LIKE 'Skipped unchanged archive %'
+                    OR COALESCE(json_extract(e.data_json, '$.stage'), '')='skipped'
+                  )
+                """,
+                (job["library_id"], job_id),
+            ).fetchone()
+        ) or {}
+        decision_rows = rows_dict(
+            conn.execute(
+                """
+                SELECT
+                    path,
+                    COUNT(*) AS examined,
+                    SUM(CASE WHEN outcome='converted' THEN 1 ELSE 0 END)
+                        AS converted,
+                    SUM(CASE WHEN outcome='retained' THEN 1 ELSE 0 END)
+                        AS retained,
+                    SUM(CASE WHEN outcome='failed' THEN 1 ELSE 0 END)
+                        AS failed,
+                    SUM(CASE
+                        WHEN outcome='converted'
+                        THEN MAX(COALESCE(source_size, 0) - COALESCE(final_size, 0), 0)
+                        ELSE 0
+                    END) AS bytes_saved
+                FROM page_decisions
+                WHERE job_id=?
+                GROUP BY path
+                """,
+                (job_id,),
+            ).fetchall()
+        )
+    decisions_by_path = {
+        row["path"]: {
+            key: int(row.get(key) or 0)
+            for key in ("examined", "converted", "retained", "failed", "bytes_saved")
+        }
+        for row in decision_rows
+    }
+    archive_by_path = {row["path"]: row for row in archive_rows}
+    history_entries = []
+    for result in results:
+        decision_summary = decisions_by_path.get(result["path"])
+        context = archive_history_context(
+            {**result, "decision_summary": decision_summary}
+        )
+        if decision_summary:
+            parts = []
+            if decision_summary["converted"]:
+                parts.append(f"{decision_summary['converted']:,} converted")
+            if decision_summary["retained"]:
+                parts.append(
+                    f"{decision_summary['retained']:,} retained because "
+                    "verified JXL was not smaller"
+                )
+            if decision_summary["failed"]:
+                parts.append(f"{decision_summary['failed']:,} failed")
+            if parts:
+                context["detail"] = f"{context['detail']}. " + "; ".join(parts)
+        history_entries.append(
+            {
+                "id": f"result-{result['id']}",
+                "path": result["path"],
+                "recorded_at": result.get("converted_at"),
+                **context,
+            }
+        )
+    for event in skipped_events:
+        event_data = parse_json(event.get("data_json"), {}) or {}
+        fallback = archive_by_path.get(event.get("archive_path"), {})
+        context = archive_history_context(
+            {**fallback, **event_data},
+            skipped=True,
+        )
+        history_entries.append(
+            {
+                "id": f"event-{event['id']}",
+                "path": event.get("archive_path"),
+                "recorded_at": event.get("created_at"),
+                **context,
+            }
+        )
+    history_entries.sort(
+        key=lambda row: str(row.get("recorded_at") or ""),
+        reverse=True,
+    )
+    outcome_counts = {
+        "optimized": int(result_counts.get("optimized") or 0),
+        "already_current": (
+            int(result_counts.get("already_current") or 0)
+            + int(skipped_counts.get("already_current") or 0)
+        ),
+        "retained": (
+            int(result_counts.get("retained") or 0)
+            + int(skipped_counts.get("retained") or 0)
+        ),
+        "failed": max(
+            int(result_counts.get("failed") or 0),
+            int(job.get("failed") or 0),
+        ),
+    }
+    checked = sum(
+        int(job.get(key) or 0)
+        for key in ("processed", "skipped", "failed", "deleted")
+    )
+    outcome_counts["all"] = max(checked, sum(outcome_counts.values()))
+    history["history_entries"] = history_entries[:400]
+    history["outcome_counts"] = outcome_counts
+    return history
+
+
+@app.get("/api/jobs/{job_id}/page-decisions")
+def get_page_decisions(
+    job_id: str,
+    path: Optional[str] = None,
+    limit: int = Query(500, ge=1, le=5000),
+):
+    clauses = ["job_id=?"]
+    parameters: list[object] = [job_id]
+    if path:
+        clauses.append("path=?")
+        parameters.append(path)
+    parameters.append(limit)
+    with connect() as conn:
+        if not conn.execute("SELECT 1 FROM jobs WHERE id=?", (job_id,)).fetchone():
+            raise HTTPException(404, "Scan not found")
+        rows = rows_dict(
+            conn.execute(
+                f"""
+                SELECT *
+                FROM page_decisions
+                WHERE {' AND '.join(clauses)}
+                ORDER BY path, entry_path
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+        )
+    for row in rows:
+        row["attempts"] = parse_json(row.pop("attempts_json", None), [])
+    return {"rows": rows}
+
+
 @app.post("/api/jobs", status_code=201)
 def enqueue_job(payload: JobCreate):
     initialize()
@@ -684,14 +1110,30 @@ def enqueue_job(payload: JobCreate):
         if payload.profile_id and not profile:
             raise HTTPException(400, "Conversion profile not found")
         overrides = payload.options.model_dump() if payload.options else {}
-        overrides["failed_only"] = payload.scope == "failed"
-        overrides["recheck_all"] = payload.scope == "library"
+        integrity_audit = bool(
+            overrides.get("integrity_audit")
+            or parse_json(profile.get("options_json")).get("integrity_audit")
+        )
+        overrides["failed_only"] = payload.scope == "failed" and not integrity_audit
+        overrides["recheck_all"] = payload.scope == "library" or integrity_audit
+        if integrity_audit:
+            overrides["no_convert"] = True
+        options = merged_options(profile, overrides)
+        if integrity_audit:
+            options.update(
+                {
+                    "integrity_audit": True,
+                    "no_convert": True,
+                    "recheck_all": True,
+                    "failed_only": False,
+                }
+            )
         job_id = create_job(
             conn,
             source="manual",
             library_id=library["id"],
             profile_id=profile.get("id"),
-            options=merged_options(profile, overrides),
+            options=options,
         )
     return {"id": job_id, "status": "queued"}
 
@@ -746,11 +1188,26 @@ def issue_row(conn, issue_id: int):
                 a.percent_saved,
                 a.dominant_type,
                 a.image_count,
+                latest_result.original_size AS latest_original_size,
+                latest_result.final_size AS latest_final_size,
+                latest_result.bytes_saved AS latest_bytes_saved,
+                latest_result.percent_saved AS latest_percent_saved,
                 l.root_path
             FROM archive_issues ai
             JOIN archives a ON a.id=ai.archive_id
             JOIN libraries l ON l.id=a.library_id
             LEFT JOIN jobs issue_job ON issue_job.id=ai.job_id
+            LEFT JOIN archive_results latest_result
+              ON latest_result.id=(
+                SELECT ar.id
+                FROM archive_results ar
+                JOIN jobs ar_job ON ar_job.id=ar.job_id
+                WHERE ar.path=a.path
+                  AND ar_job.library_id=a.library_id
+                  AND ar.status='processed'
+                ORDER BY ar.id DESC
+                LIMIT 1
+              )
             WHERE ai.id=?
             """,
             (issue_id,),
@@ -764,17 +1221,31 @@ def issue_row(conn, issue_id: int):
 def remedies_for_issue(issue):
     kind = issue.get("kind") or "archive_failed"
     if kind == "archive_grew":
-        return ["lossless", "dismiss"]
+        if issue.get("backup_available"):
+            return ["lossless", "smart_lossy", "restore_original", "repack"]
+        return ["repack", "dismiss"]
     if kind == "crc_mismatch":
         return ["rebuild", "preserve", "replace", "delete", "dismiss"]
+    if kind == "archive_corrupt":
+        return ["salvage", "salvage_partial", "compatibility", "retry", "dismiss"]
+    if kind == "filename_collision":
+        if issue.get("entry_path") and issue.get("related_entry_path"):
+            return ["keep_primary", "keep_related", "dismiss"]
+        return ["dismiss"]
     if issue.get("entry_path"):
         return ["compatibility", "preserve", "replace", "delete"]
-    if kind in {"unsafe_archive_path", "filename_collision"}:
+    if kind == "unsafe_archive_path":
         return ["dismiss"]
     return ["compatibility", "preserve", "retry", "dismiss"]
 
 
 ISSUE_GROUPS = {
+    "growth": {
+        "label": "Archives larger after conversion",
+        "triage": "Repair available",
+        "recommended": "Retry with a smaller result or accept the current archive",
+        "kinds": {"archive_grew"},
+    },
     "crc": {
         "label": "CRC-32 failures",
         "triage": "Inspect repairability",
@@ -813,7 +1284,7 @@ ISSUE_GROUPS = {
     "collisions": {
         "label": "Filename collisions",
         "triage": "Needs your decision",
-        "recommended": "Correct duplicate paths without automatic renaming",
+        "recommended": "Compare both images and choose which one the archive should keep",
         "kinds": {"filename_collision"},
     },
     "permissions": {
@@ -867,7 +1338,7 @@ def issue_group_where(group_id):
     if group_id == "other":
         known = sorted({kind for group in ISSUE_GROUPS.values() for kind in group["kinds"]})
         placeholders = ",".join("?" for _ in known)
-        return f" AND ai.kind NOT IN ({placeholders}, 'archive_grew')", known
+        return f" AND ai.kind NOT IN ({placeholders})", known
     raise HTTPException(404, "Failure type not found")
 
 
@@ -882,6 +1353,7 @@ def queue_issue_job(conn, issue, action, overrides=None):
             "continue_on_page_error": False,
             "repair_action": None,
             "repair_entry": None,
+            "repair_entries": [],
             "repair_source": None,
         }
     )
@@ -950,12 +1422,28 @@ def list_issues(
                     a.bytes_saved,
                     a.percent_saved,
                     a.dominant_type,
-                    a.image_count
+                    a.image_count,
+                    latest_result.original_size AS latest_original_size,
+                    latest_result.final_size AS latest_final_size,
+                    latest_result.bytes_saved AS latest_bytes_saved,
+                    latest_result.percent_saved AS latest_percent_saved,
+                    l.root_path
                 FROM archive_issues ai
                 JOIN archives a ON a.id=ai.archive_id
+                JOIN libraries l ON l.id=a.library_id
                 LEFT JOIN jobs issue_job ON issue_job.id=ai.job_id
+                LEFT JOIN archive_results latest_result
+                  ON latest_result.id=(
+                    SELECT ar.id
+                    FROM archive_results ar
+                    JOIN jobs ar_job ON ar_job.id=ar.job_id
+                    WHERE ar.path=a.path
+                      AND ar_job.library_id=a.library_id
+                      AND ar.status='processed'
+                    ORDER BY ar.id DESC
+                    LIMIT 1
+                  )
                 WHERE ai.status IN ('open', 'queued')
-                  AND ai.kind!='archive_grew'
                   {group_clause}
                 ORDER BY
                     CASE ai.status WHEN 'open' THEN 0 ELSE 1 END,
@@ -968,7 +1456,7 @@ def list_issues(
         total = conn.execute(
             """
             SELECT COUNT(*) FROM archive_issues
-            WHERE status IN ('open', 'queued') AND kind!='archive_grew'
+            WHERE status IN ('open', 'queued')
             """
         ).fetchone()[0]
         kind_counts = rows_dict(
@@ -976,21 +1464,28 @@ def list_issues(
                 """
                 SELECT kind, stage, COUNT(*) AS count
                 FROM archive_issues
-                WHERE status IN ('open', 'queued') AND kind!='archive_grew'
+                WHERE status IN ('open', 'queued')
                 GROUP BY kind, stage
                 """
             ).fetchall()
         )
     for row in rows:
         row["retry_failed"] = bool(row["retry_failed"])
+        row["backup_available"] = archive_backup_available(row)
         row["remedies"] = remedies_for_issue(row)
         row["preview_url"] = f"/api/issues/{row['id']}/preview" if row.get("entry_path") else None
+        row["related_preview_url"] = (
+            f"/api/issues/{row['id']}/preview?entry=related"
+            if row.get("related_entry_path")
+            else None
+        )
         row["group"] = issue_group(row)
         row["diagnostics_url"] = (
             f"/api/issues/{row['id']}/diagnostics"
-            if row.get("kind") == "crc_mismatch"
+            if row.get("kind") in {"crc_mismatch", "archive_corrupt"}
             else None
         )
+        row.pop("root_path", None)
     groups = {}
     for count_row in kind_counts:
         descriptor = issue_group(count_row)
@@ -1012,20 +1507,28 @@ def list_issues(
 @app.post("/api/issues/{issue_id}/action", status_code=201)
 def act_on_issue(issue_id: int, payload: IssueActionPayload):
     rebuild_diagnostics = None
-    if payload.action == "rebuild":
+    if payload.action in {"rebuild", "salvage", "salvage_partial"}:
         with connect() as conn:
             candidate = issue_row(conn, issue_id)
         if not candidate:
             raise HTTPException(404, "Issue not found")
-        if candidate.get("kind") != "crc_mismatch" or not candidate.get("entry_path"):
-            raise HTTPException(409, "Only an inspected CRC failure can be rebuilt")
-        # Image decoding may take several seconds. Keep it outside the write
-        # transaction so diagnostics can never block the dashboard or workers.
-        rebuild_diagnostics = crc_issue_diagnostics(candidate)
-        if not rebuild_diagnostics.get("repairable"):
+        if payload.action == "rebuild":
+            if candidate.get("kind") != "crc_mismatch" or not candidate.get("entry_path"):
+                raise HTTPException(409, "Only an inspected CRC failure can be rebuilt")
+            rebuild_diagnostics = crc_issue_diagnostics(candidate)
+        else:
+            if candidate.get("kind") != "archive_corrupt":
+                raise HTTPException(409, "Only an unreadable ZIP archive can be salvaged")
+            rebuild_diagnostics = salvage_issue_diagnostics(candidate)
+        required_flag = (
+            "partial_salvageable"
+            if payload.action == "salvage_partial"
+            else "repairable"
+        )
+        if not rebuild_diagnostics.get(required_flag):
             raise HTTPException(
                 409,
-                "The damaged entry could not be recovered and decoded safely",
+                "Not every damaged entry could be recovered and decoded safely",
             )
 
     with transaction(immediate=True) as conn:
@@ -1091,7 +1594,65 @@ def act_on_issue(issue_id: int, payload: IssueActionPayload):
             if issue.get("kind") == "crc_mismatch":
                 overrides["repair_action"] = "preserve"
         elif payload.action == "lossless":
-            overrides.update({"smart_distance": False, "distance": None})
+            overrides.update(
+                {
+                    "no_convert": False,
+                    "smart_distance": False,
+                    "distance": None,
+                }
+            )
+            if issue.get("kind") == "archive_grew":
+                if not archive_backup_available(issue):
+                    raise HTTPException(
+                        409,
+                        "Lossless re-conversion requires the original .cbz.bak archive",
+                    )
+                overrides["repair_action"] = "restore_reconvert"
+        elif payload.action == "smart_lossy":
+            if issue.get("kind") != "archive_grew":
+                raise HTTPException(
+                    409,
+                    "Smart Lossy repair is available only for an archive that grew",
+                )
+            if not archive_backup_available(issue):
+                raise HTTPException(
+                    409,
+                    "Smart Lossy re-conversion requires the original .cbz.bak archive",
+                )
+            overrides.update(
+                {
+                    "repair_action": "restore_reconvert",
+                    "no_convert": False,
+                    "smart_distance": True,
+                    "distance": 0.5,
+                }
+            )
+        elif payload.action == "restore_original":
+            if issue.get("kind") != "archive_grew":
+                raise HTTPException(
+                    409,
+                    "Original restoration is available only for an archive that grew",
+                )
+            if not archive_backup_available(issue):
+                raise HTTPException(409, "The original .cbz.bak archive is unavailable")
+            overrides.update(
+                {
+                    "repair_action": "restore_original",
+                    "no_convert": True,
+                }
+            )
+        elif payload.action == "repack":
+            if issue.get("kind") != "archive_grew":
+                raise HTTPException(
+                    409,
+                    "Archive repacking is available only for an archive that grew",
+                )
+            overrides.update(
+                {
+                    "repair_action": "repack",
+                    "no_convert": True,
+                }
+            )
         elif payload.action == "delete":
             if not issue.get("entry_path"):
                 raise HTTPException(409, "This issue is not tied to an individual image")
@@ -1108,8 +1669,54 @@ def act_on_issue(issue_id: int, payload: IssueActionPayload):
                 {
                     "repair_action": "rebuild",
                     "repair_entry": issue["entry_path"],
+                    "repair_entries": rebuild_diagnostics.get("repair_entries") or [
+                        issue["entry_path"]
+                    ],
                 }
             )
+        elif payload.action == "salvage":
+            if issue.get("kind") != "archive_corrupt":
+                raise HTTPException(409, "This archive does not require structural salvage")
+            overrides["repair_action"] = "salvage"
+        elif payload.action == "salvage_partial":
+            if issue.get("kind") != "archive_corrupt":
+                raise HTTPException(409, "This archive does not require structural salvage")
+            overrides["repair_action"] = "salvage_partial"
+        elif payload.action in {"keep_primary", "keep_related"}:
+            if (
+                issue.get("kind") != "filename_collision"
+                or not issue.get("entry_path")
+                or not issue.get("related_entry_path")
+            ):
+                raise HTTPException(409, "This failure does not contain two selectable images")
+            discarded_entry = (
+                issue["related_entry_path"]
+                if payload.action == "keep_primary"
+                else issue["entry_path"]
+            )
+            overrides.update(
+                {
+                    "repair_action": "delete",
+                    "repair_entry": discarded_entry,
+                }
+            )
+        elif payload.action == "retry" and issue.get("kind") == "archive_grew":
+            if archive_backup_available(issue):
+                overrides.update(
+                    {
+                        "repair_action": "restore_reconvert",
+                        "no_convert": False,
+                        "smart_distance": False,
+                        "distance": None,
+                    }
+                )
+            else:
+                overrides.update(
+                    {
+                        "repair_action": "repack",
+                        "no_convert": True,
+                    }
+                )
         job_id = queue_issue_job(conn, issue, payload.action, overrides)
     return {"status": "queued", "job_id": job_id}
 
@@ -1125,10 +1732,24 @@ def safe_archive_path(issue):
     return archive_path
 
 
-def safe_issue_paths(issue):
+def archive_backup_available(issue):
+    try:
+        archive_path = safe_archive_path(issue)
+        backup_path = archive_path.with_suffix(archive_path.suffix + ".bak")
+        return (
+            backup_path.is_file()
+            and backup_path.stat().st_size > 0
+            and zipfile.is_zipfile(backup_path)
+        )
+    except (HTTPException, OSError):
+        return False
+
+
+def safe_issue_paths(issue, entry_path=None):
     archive_path = safe_archive_path(issue)
-    entry = PurePosixPath(issue.get("entry_path") or "")
-    if not issue.get("entry_path") or entry.is_absolute() or ".." in entry.parts:
+    selected_entry = entry_path or issue.get("entry_path")
+    entry = PurePosixPath(selected_entry or "")
+    if not selected_entry or entry.is_absolute() or ".." in entry.parts:
         raise HTTPException(404, "No image preview is available for this issue")
     return archive_path, entry.as_posix()
 
@@ -1139,42 +1760,23 @@ def cleanup_files(*paths):
             Path(path).unlink(missing_ok=True)
 
 
-def crc_issue_diagnostics(issue):
-    archive_path, entry_path = safe_issue_paths(issue)
-    if not archive_path.is_file():
-        raise HTTPException(404, "Archive is no longer present")
-    try:
-        with zipfile.ZipFile(archive_path, "r") as archive:
-            info = archive.getinfo(entry_path)
-            recovered = recover_zip_entry_bytes(
-                archive_path,
-                info,
-                max_bytes=100 * 1024 * 1024,
-                allow_size_mismatch=True,
-            )
-    except KeyError as exc:
-        raise HTTPException(404, "The failing entry is no longer in the archive") from exc
-    except (zipfile.BadZipFile, OSError, VerificationError) as exc:
-        return {
-            "entry_path": entry_path,
-            "expected_crc32": None,
-            "calculated_crc32": None,
-            "declared_bytes": None,
-            "recovered_bytes": 0,
-            "size_mismatch": False,
-            "image_readable": False,
-            "repairable": False,
-            "detail": str(exc),
-        }
-
+def fully_decode_payload(entry_path, payload):
+    suffix = PurePosixPath(entry_path).suffix.lower()
+    if suffix not in IMAGE_SUFFIXES:
+        if suffix == ".xml":
+            try:
+                ElementTree.fromstring(payload)
+            except ElementTree.ParseError as exc:
+                return False, f"Recovered XML is malformed: {exc}"
+            return True, "Recovered XML parses correctly"
+        return True, "Non-image entry recovered byte-for-byte"
     handle, recovered_path = tempfile.mkstemp(
-        prefix="cbzxl-crc-diagnostic-",
-        suffix=PurePosixPath(entry_path).suffix or ".image",
+        prefix="cbzxl-recovery-diagnostic-",
+        suffix=suffix or ".image",
     )
     os.close(handle)
-    Path(recovered_path).write_bytes(recovered)
-    suffix = PurePosixPath(entry_path).suffix.lower()
-    decode_command = (
+    Path(recovered_path).write_bytes(payload)
+    command = (
         [
             "djxl",
             recovered_path,
@@ -1186,50 +1788,276 @@ def crc_issue_diagnostics(issue):
         else ["magick", recovered_path, "null:"]
     )
     try:
-        check = subprocess.run(
-            decode_command,
+        result = subprocess.run(
+            command,
             capture_output=True,
             text=True,
             timeout=45,
             check=False,
         )
+        return (
+            result.returncode == 0,
+            result.stderr.strip()
+            or (
+                "Recovered image fully decodes"
+                if result.returncode == 0
+                else "Recovered bytes do not fully decode as an image"
+            ),
+        )
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-        check = None
-        check_detail = str(exc)
-    else:
-        check_detail = check.stderr.strip()
+        return False, str(exc)
     finally:
         Path(recovered_path).unlink(missing_ok=True)
 
-    image_readable = bool(check and check.returncode == 0)
-    calculated = crc32_hex(recovered)
+
+def recovered_entry_diagnostic(archive_path, info):
+    entry_path = info.filename.replace("\\", "/")
     expected = f"{info.CRC:08X}"
+    try:
+        recovered = recover_zip_entry_bytes(
+            archive_path,
+            info,
+            max_bytes=100 * 1024 * 1024,
+            allow_size_mismatch=True,
+        )
+    except (OSError, VerificationError) as exc:
+        return {
+            "entry_path": entry_path,
+            "status": "unrecoverable",
+            "expected_crc32": expected,
+            "calculated_crc32": None,
+            "declared_bytes": info.file_size,
+            "recovered_bytes": 0,
+            "size_mismatch": False,
+            "image_readable": False,
+            "repairable": False,
+            "detail": str(exc),
+        }
+    image_readable, decode_detail = fully_decode_payload(entry_path, recovered)
+    calculated = crc32_hex(recovered)
     size_mismatch = len(recovered) != info.file_size
     metadata_mismatch = calculated != expected or size_mismatch
-    if image_readable and size_mismatch:
-        detail = (
-            "Recovered image fully decodes; incorrect ZIP size and CRC metadata "
-            "can be rebuilt"
-        )
-    elif image_readable and calculated != expected:
-        detail = (
-            "Recovered image fully decodes; incorrect ZIP CRC metadata can be rebuilt"
-        )
-    elif image_readable:
-        detail = "Recovered image fully decodes, but no metadata mismatch remains"
-    else:
-        detail = check_detail or "Recovered bytes do not fully decode as an image"
     return {
         "entry_path": entry_path,
+        "status": "recoverable" if image_readable and metadata_mismatch else "unreadable",
         "expected_crc32": expected,
         "calculated_crc32": calculated,
         "declared_bytes": info.file_size,
         "recovered_bytes": len(recovered),
         "size_mismatch": size_mismatch,
         "image_readable": image_readable,
-        "image": suffix.lstrip(".").upper() if image_readable else None,
         "repairable": image_readable and metadata_mismatch,
-        "detail": detail,
+        "detail": (
+            "Recovered image fully decodes; incorrect ZIP size or CRC metadata can be rebuilt"
+            if image_readable and metadata_mismatch
+            else decode_detail
+        ),
+    }
+
+
+def crc_issue_diagnostics(issue):
+    archive_path = safe_archive_path(issue)
+    requested_entry = (issue.get("entry_path") or "").replace("\\", "/")
+    if not archive_path.is_file():
+        raise HTTPException(404, "Archive is no longer present")
+    failures = []
+    checked_entries = 0
+    try:
+        with zipfile.ZipFile(archive_path, "r") as archive:
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                checked_entries += 1
+                if info.file_size > 100 * 1024 * 1024:
+                    failures.append(
+                        {
+                            "entry_path": info.filename,
+                            "status": "unrecoverable",
+                            "repairable": False,
+                            "image_readable": False,
+                            "detail": "Entry exceeds the 100 MB diagnostic limit",
+                        }
+                    )
+                    continue
+                try:
+                    with archive.open(info) as source:
+                        while source.read(1024 * 1024):
+                            pass
+                except (zipfile.BadZipFile, EOFError, OSError):
+                    failures.append(recovered_entry_diagnostic(archive_path, info))
+    except (zipfile.BadZipFile, OSError) as exc:
+        return {
+            "kind": "crc",
+            "entry_path": requested_entry,
+            "entries": [],
+            "checked_entries": checked_entries,
+            "verified_count": max(0, checked_entries - 1),
+            "recoverable_count": 0,
+            "needs_decision_count": 1,
+            "repairable": False,
+            "detail": str(exc),
+        }
+    if not failures and requested_entry:
+        try:
+            with zipfile.ZipFile(archive_path, "r") as archive:
+                failures.append(
+                    recovered_entry_diagnostic(
+                        archive_path,
+                        archive.getinfo(requested_entry),
+                    )
+                )
+        except KeyError as exc:
+            raise HTTPException(
+                404,
+                "The failing entry is no longer in the archive",
+            ) from exc
+    recoverable = [entry for entry in failures if entry.get("repairable")]
+    needs_decision = [entry for entry in failures if not entry.get("repairable")]
+    primary = next(
+        (entry for entry in failures if entry.get("entry_path") == requested_entry),
+        failures[0] if failures else {},
+    )
+    return {
+        "kind": "crc",
+        **{
+            key: primary.get(key)
+            for key in (
+                "entry_path",
+                "expected_crc32",
+                "calculated_crc32",
+                "declared_bytes",
+                "recovered_bytes",
+                "size_mismatch",
+                "image_readable",
+            )
+        },
+        "entries": failures[:100],
+        "checked_entries": checked_entries,
+        "verified_count": checked_entries - len(needs_decision),
+        "recoverable_count": len(recoverable),
+        "needs_decision_count": len(needs_decision),
+        "repair_entries": [entry["entry_path"] for entry in recoverable],
+        "repairable": bool(failures) and not needs_decision,
+        "detail": (
+            f"{len(recoverable)} damaged entr{'y' if len(recoverable) == 1 else 'ies'} "
+            "can be recovered and rebuilt"
+            if failures and not needs_decision
+            else primary.get("detail") or "No damaged ZIP entries remain"
+        ),
+    }
+
+
+def salvage_issue_diagnostics(issue):
+    archive_path = safe_archive_path(issue)
+    if not archive_path.is_file():
+        raise HTTPException(404, "Archive is no longer present")
+    results = []
+    recovered_count = 0
+    truncated_tail = None
+    try:
+        entries = scan_local_zip_entries(archive_path)
+    except (OSError, VerificationError, ValueError) as exc:
+        truncated_tail = str(exc)
+        try:
+            entries = scan_local_zip_entries(archive_path, allow_partial=True)
+        except (OSError, VerificationError, ValueError):
+            entries = []
+    try:
+        for entry in entries:
+            if entry.is_dir():
+                continue
+            entry_path = PurePosixPath(entry.filename)
+            if (
+                entry_path.is_absolute()
+                or ".." in entry_path.parts
+                or "\\" in entry.filename
+                or entry_path.as_posix() != entry.filename
+            ):
+                results.append(
+                    {
+                        "entry_path": entry.filename,
+                        "status": "unrecoverable",
+                        "repairable": False,
+                        "image_readable": False,
+                        "recovered_bytes": 0,
+                        "detail": "Entry name cannot be preserved safely",
+                    }
+                )
+                continue
+            try:
+                payload = recover_local_zip_entry_bytes(
+                    archive_path,
+                    entry,
+                    max_bytes=100 * 1024 * 1024,
+                    allow_size_mismatch=True,
+                )
+                readable, detail = fully_decode_payload(entry.filename, payload)
+                if (
+                    entry.filename
+                    and PurePosixPath(entry.filename).suffix.lower()
+                    not in IMAGE_SUFFIXES | {".xml"}
+                    and entry.CRC
+                    and crc32_hex(payload) != f"{entry.CRC:08X}"
+                ):
+                    readable = False
+                    detail = "Recovered non-image entry does not match its stored CRC-32"
+            except (OSError, VerificationError) as exc:
+                readable, detail = False, str(exc)
+            if readable:
+                recovered_count += 1
+            results.append(
+                {
+                    "entry_path": entry.filename,
+                    "status": "recoverable" if readable else "unrecoverable",
+                    "repairable": readable,
+                    "image_readable": readable,
+                    "recovered_bytes": len(payload) if readable else 0,
+                    "detail": detail,
+                }
+            )
+    except (OSError, VerificationError, ValueError) as exc:
+        return {
+            "kind": "salvage",
+            "entries": [],
+            "checked_entries": 0,
+            "verified_count": 0,
+            "recoverable_count": 0,
+            "needs_decision_count": 1,
+            "repairable": False,
+            "salvageable": False,
+            "partial_salvageable": False,
+            "detail": str(exc),
+        }
+    complete_entries_safe = bool(results) and recovered_count == len(results)
+    if truncated_tail and results:
+        results.append(
+            {
+                "entry_path": "Truncated archive tail",
+                "status": "unrecoverable",
+                "repairable": False,
+                "image_readable": False,
+                "recovered_bytes": 0,
+                "detail": truncated_tail,
+            }
+        )
+    needs_decision = len(results) - recovered_count
+    return {
+        "kind": "salvage",
+        "entries": results[:100],
+        "checked_entries": len(results),
+        "verified_count": recovered_count,
+        "recoverable_count": recovered_count,
+        "needs_decision_count": needs_decision,
+        "repairable": bool(results) and needs_decision == 0,
+        "salvageable": bool(results) and needs_decision == 0,
+        "partial_salvageable": bool(truncated_tail) and complete_entries_safe,
+        "detail": (
+            f"All {recovered_count} entries can be recovered from local ZIP headers"
+            if results and needs_decision == 0
+            else truncated_tail
+            if truncated_tail and not results
+            else f"{needs_decision} entries could not be recovered safely"
+        ),
     }
 
 
@@ -1239,18 +2067,28 @@ def issue_diagnostics(issue_id: int):
         issue = issue_row(conn, issue_id)
     if not issue:
         raise HTTPException(404, "Issue not found")
-    if issue.get("kind") != "crc_mismatch":
-        raise HTTPException(409, "CRC diagnostics are not available for this failure")
-    return crc_issue_diagnostics(issue)
+    if issue.get("kind") == "crc_mismatch":
+        return crc_issue_diagnostics(issue)
+    if issue.get("kind") == "archive_corrupt":
+        return salvage_issue_diagnostics(issue)
+    raise HTTPException(409, "Recovery diagnostics are not available for this failure")
 
 
 @app.get("/api/issues/{issue_id}/preview")
-def preview_issue_image(issue_id: int):
+def preview_issue_image(
+    issue_id: int,
+    entry: Literal["primary", "related"] = "primary",
+):
     with connect() as conn:
         issue = issue_row(conn, issue_id)
     if not issue:
         raise HTTPException(404, "Issue not found")
-    archive_path, entry_path = safe_issue_paths(issue)
+    selected_entry = (
+        issue.get("related_entry_path")
+        if entry == "related"
+        else issue.get("entry_path")
+    )
+    archive_path, entry_path = safe_issue_paths(issue, selected_entry)
     if not archive_path.is_file():
         raise HTTPException(404, "Archive is no longer present")
     extracted_path = None
@@ -1274,16 +2112,35 @@ def preview_issue_image(issue_id: int):
                         archive_path,
                         info,
                         max_bytes=64 * 1024 * 1024,
+                        allow_size_mismatch=True,
                     )
                 )
 
-        browser_suffixes = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif"}
+        browser_mimes = {
+            "image/jpeg",
+            "image/png",
+            "image/gif",
+            "image/webp",
+            "image/avif",
+        }
         suffix = Path(extracted_path).suffix.lower()
-        if suffix in browser_suffixes:
-            media_type = mimetypes.guess_type(entry_path)[0] or "application/octet-stream"
+        detected_mime = ""
+        try:
+            detected = subprocess.run(
+                ["file", "--mime-type", "-b", extracted_path],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            if detected.returncode == 0:
+                detected_mime = detected.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            pass
+        if detected_mime in browser_mimes:
             return FileResponse(
                 extracted_path,
-                media_type=media_type,
+                media_type=detected_mime,
                 background=BackgroundTask(cleanup_files, extracted_path),
             )
 
@@ -1339,15 +2196,12 @@ async def replace_issue_image(issue_id: int, request: Request):
     replacement_path = replacement_root / f"{issue_id}-{uuid.uuid4().hex}{suffix}"
     replacement_path.write_bytes(payload)
     try:
-        check = subprocess.run(
-            ["identify", "-format", "%m %w %h", str(replacement_path)],
-            capture_output=True,
-            text=True,
-            timeout=45,
-            check=False,
-        )
-        if check.returncode != 0:
-            raise HTTPException(400, "The selected file is not a readable image")
+        readable, decode_detail = fully_decode_payload(issue["entry_path"], payload)
+        if not readable:
+            raise HTTPException(
+                400,
+                f"The selected file is not a fully readable image: {decode_detail}",
+            )
         with transaction(immediate=True) as conn:
             current = issue_row(conn, issue_id)
             job_id = queue_issue_job(
@@ -1363,7 +2217,7 @@ async def replace_issue_image(issue_id: int, request: Request):
     except Exception:
         replacement_path.unlink(missing_ok=True)
         raise
-    return {"status": "queued", "job_id": job_id, "image": check.stdout.strip()}
+    return {"status": "queued", "job_id": job_id, "image": decode_detail}
 
 
 @app.get("/api/archives")
@@ -1651,7 +2505,7 @@ def homepage_widget():
             attention_count = conn.execute(
                 """
                 SELECT COUNT(*) FROM archive_issues
-                WHERE status IN ('open', 'queued') AND kind!='archive_grew'
+                WHERE status IN ('open', 'queued')
                 """
             ).fetchone()[0]
             active = row_dict(

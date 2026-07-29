@@ -150,6 +150,7 @@ function LiveConversion({ initial, refresh, notify, onDismiss }: {
 }
 
 function policyStrategy(options: Json = {}) {
+  if (options.integrity_audit) return "audit";
   if (options.no_convert) return "recheck";
   if (options.smart_distance) return "smart";
   if (options.distance !== null && options.distance !== undefined) return "lossy";
@@ -165,8 +166,9 @@ function policyScope(options: Json = {}) {
 function policySummary(profile: Json) {
   const options = profile.options || {};
   const strategy = policyStrategy(options);
-  const effort = Number(options.effort ?? 7);
+  const effort = Number(options.effort ?? 10);
   const threads = Number(options.threads ?? 4);
+  if (strategy === "audit") return `Full CRC check + full JPEG XL decode · ${threads} threads`;
   if (strategy === "recheck") return `Recheck only · ${threads} threads`;
   if (strategy === "smart") {
     return `Lossless first · d${Number(options.distance ?? 0.5)} fallback above ${Number(options.smart_mb ?? 10)} MB or ${Number(options.smart_mp ?? 5)} MP · effort ${effort}`;
@@ -187,7 +189,7 @@ function ManualConversion({ bootstrap, onQueued, notify }: {
   const [profileId, setProfileId] = useState(defaultProfile.id || "");
   const profile = profiles.find((row: Json) => row.id === profileId) || defaultProfile;
   const defaults = profile.options || {};
-  const [effort, setEffort] = useState(Number(defaults.effort ?? 7));
+  const [effort, setEffort] = useState(Number(defaults.effort ?? 10));
   const [threads, setThreads] = useState(Number(defaults.threads ?? 4));
   const [backup, setBackup] = useState(Boolean(defaults.backup));
   const [busy, setBusy] = useState(false);
@@ -201,7 +203,7 @@ function ManualConversion({ bootstrap, onQueued, notify }: {
   const chooseProfile = (nextProfile: Json) => {
     const options = nextProfile.options || {};
     setProfileId(nextProfile.id);
-    setEffort(Number(options.effort ?? 7));
+    setEffort(Number(options.effort ?? 10));
     setThreads(Number(options.threads ?? 4));
     setBackup(Boolean(options.backup));
   };
@@ -250,7 +252,7 @@ function ManualConversion({ bootstrap, onQueued, notify }: {
               key={row.id}
               className={profile.id === row.id ? "selected" : ""}
               onClick={() => chooseProfile(row)}
-            >{policyStrategy(row.options) === "smart" ? "✦" : policyStrategy(row.options) === "recheck" ? "⌕" : "✓"} {row.name}</button>)}
+            >{policyStrategy(row.options) === "smart" ? "✦" : policyStrategy(row.options) === "audit" ? "◎" : policyStrategy(row.options) === "recheck" ? "⌕" : "✓"} {row.name}</button>)}
           </div>
         </div>
         <div className="manual-fields">
@@ -412,6 +414,13 @@ function DetailedStatistics({ data }: { data: Json }) {
   const outcomeClasses = ["one", "two", "three", "four", "five"];
   const summary = data.savings_summary || {};
   const processing = data.processing || {};
+  const filetypes = data.filetypes || {};
+  const filetypeRows = filetypes.rows || [];
+  const totalFiles = Math.max(1, Number(filetypes.total_files || 0));
+  const totalStorage = Math.max(1, Number(filetypes.total_storage_bytes || 0));
+  const maxFileCount = Math.max(1, ...filetypeRows.map((row: Json) => Number(row.file_count || 0)));
+  const maxStorage = Math.max(1, ...filetypeRows.map((row: Json) => Number(row.storage_bytes || 0)));
+  const inventoryIncomplete = Number(filetypes.inventoried_archives || 0) < Number(filetypes.archive_count || 0);
   return <div className="detailed-statistics">
     <section className="health-strip" aria-label="Library conversion health">
       <div><span>Library coverage</span><strong>{Number(health.library_coverage_percent || 0).toFixed(1)}%</strong><small>{Number(library.optimized_archives || 0).toLocaleString()} of {Number(library.archives || 0).toLocaleString()} archives</small></div>
@@ -439,6 +448,37 @@ function DetailedStatistics({ data }: { data: Json }) {
         <div><span>Current size</span><strong>{formatBytes(library.current_bytes)}</strong></div>
         <div><span>JXL coverage</span><strong>{Number(library.jxl_coverage_percent || 0).toFixed(1)}%</strong></div>
       </div>
+      <div className="filetype-heading">
+        <h3>File-type breakdown</h3>
+        <p>Current image files measured by quantity and compressed storage inside their archives.</p>
+      </div>
+      {filetypeRows.length ? <div className="report-grid filetype-grid">
+        <article className="report-panel">
+          <header><h3>File count</h3><p>{Number(filetypes.total_files || 0).toLocaleString()} files</p></header>
+          <div className="filetype-list" role="img" aria-label={`File count across ${filetypeRows.length} image formats`}>
+            {filetypeRows.map((row: Json) => <div className="filetype-row" key={row.label}>
+              <div className="filetype-copy">
+                <strong>{row.label}</strong>
+                <span>{Number(row.file_count || 0).toLocaleString()} · {(Number(row.file_count || 0) / totalFiles * 100).toFixed(1)}%</span>
+              </div>
+              <span className="effectiveness-track"><i style={{ width: `${Number(row.file_count || 0) / maxFileCount * 100}%` }} /></span>
+            </div>)}
+          </div>
+        </article>
+        <article className="report-panel">
+          <header><h3>Storage used</h3><p>{formatBytes(filetypes.total_storage_bytes)}</p></header>
+          <div className="filetype-list" role="img" aria-label={`Compressed storage across ${filetypeRows.length} image formats`}>
+            {filetypeRows.map((row: Json) => <div className="filetype-row" key={row.label}>
+              <div className="filetype-copy">
+                <strong>{row.label}</strong>
+                <span>{formatBytes(row.storage_bytes)} · {(Number(row.storage_bytes || 0) / totalStorage * 100).toFixed(1)}%</span>
+              </div>
+              <span className="effectiveness-track"><i style={{ width: `${Number(row.storage_bytes || 0) / maxStorage * 100}%` }} /></span>
+            </div>)}
+          </div>
+        </article>
+      </div> : <div className="filetype-empty">File-type inventory will appear after the next library scan.</div>}
+      {inventoryIncomplete && <p className="filetype-coverage">Inventory currently covers {Number(filetypes.inventoried_archives || 0).toLocaleString()} of {Number(filetypes.archive_count || 0).toLocaleString()} indexed archives. The next library scan will fill the remainder.</p>}
     </section>
 
     <section className="report-section">
@@ -590,15 +630,34 @@ function issueContext(issue: Json) {
       recommended: "Inspect recovery status",
     };
   }
+  if (issue.kind === "archive_corrupt" && issue.diagnostics?.salvageable) return {
+    title: "This archive can be salvaged safely",
+    text: "Every entry was recovered from intact local ZIP headers and fully checked. CBZXL can rebuild the archive without changing any names.",
+    recommended: "Salvage archive",
+  };
+  if (issue.kind === "archive_corrupt" && issue.diagnostics?.partial_salvageable) return {
+    title: "The complete entries can be recovered",
+    text: "The archive ends in a truncated entry. CBZXL can rebuild every preceding entry that was recovered and fully verified, but the incomplete tail will be omitted only with your confirmation.",
+    recommended: "Review and rebuild viable entries",
+  };
   if (issue.kind === "archive_grew") return {
-    title: "No conversion candidate was beneficial",
-    text: "Larger candidates were discarded. The original archive remains unchanged.",
-    recommended: "Dismiss until the next full rescan",
+    title: Number(issue.latest_bytes_saved || 0) > 0
+      ? `Latest retry saved ${formatBytes(issue.latest_bytes_saved)}, but the archive remains above its lifetime baseline`
+      : Number(issue.latest_bytes_saved || 0) < 0
+        ? `Latest attempt added ${formatBytes(Math.abs(issue.latest_bytes_saved))}`
+        : `Archive remains ${formatBytes(Math.abs(issue.bytes_saved || 0))} above its lifetime baseline`,
+    text: `Lifetime: ${formatBytes(issue.original_size)} → ${formatBytes(issue.final_size)}. Any retry keeps the current archive unless CBZXL produces and verifies a smaller replacement.`,
+    recommended: Number(issue.latest_bytes_saved || 0) > 0 ? "Continue reducing or accept" : "Retry lossless",
   };
   if (issue.kind === "verification_failed") return {
     title: "The converted page failed verification",
     text: "The candidate archive was rejected before replacement. The original remains intact.",
     recommended: "Compatibility retry",
+  };
+  if (issue.kind === "filename_collision" && issue.related_entry_path) return {
+    title: "Two images require the same filename",
+    text: "Compare both pages and choose the one the archive should keep. CBZXL will remove only the other entry, correct the retained extension when necessary, and verify the rebuilt archive before replacing it.",
+    recommended: "Choose one image to keep",
   };
   if (issue.entry_path) return {
     title: "This image could not be processed",
@@ -617,10 +676,12 @@ function issueContext(issue: Json) {
   };
 }
 
-function IssuePreview({ issue }: { issue: Json }) {
+function IssuePreview({ issue, related = false }: { issue: Json; related?: boolean }) {
   const [failed, setFailed] = useState(false);
-  if (!issue.preview_url || failed) return <figure className="issue-preview unavailable"><span>⌁</span><figcaption>{issue.entry_path ? "Preview unavailable" : "Archive-level issue"}</figcaption></figure>;
-  return <figure className="issue-preview"><img src={issue.preview_url} alt={`Problem page ${issue.entry_path}`} onError={() => setFailed(true)} /><figcaption><code>{issue.entry_path}</code></figcaption></figure>;
+  const previewUrl = related ? issue.related_preview_url : issue.preview_url;
+  const entryPath = related ? issue.related_entry_path : issue.entry_path;
+  if (!previewUrl || failed) return <figure className="issue-preview unavailable"><span>⌁</span><figcaption>{entryPath ? `Preview unavailable · ${entryPath}` : "Archive-level issue"}</figcaption></figure>;
+  return <figure className="issue-preview"><img src={previewUrl} alt={`Conflicting page ${entryPath}`} onError={() => setFailed(true)} /><figcaption><code>{entryPath}</code></figcaption></figure>;
 }
 
 const remedyLabels: Record<string, string> = {
@@ -629,8 +690,15 @@ const remedyLabels: Record<string, string> = {
   replace: "Replace image",
   delete: "Delete image",
   lossless: "Lossless retry",
+  smart_lossy: "Try Smart Lossy",
+  restore_original: "Restore original",
+  repack: "Repack archive",
   retry: "Default retry",
   rebuild: "Recover & convert",
+  salvage: "Salvage archive",
+  salvage_partial: "Rebuild viable entries",
+  keep_primary: "Keep this image",
+  keep_related: "Keep this image",
   dismiss: "Accept unchanged",
 };
 
@@ -682,10 +750,16 @@ function Attention({ refreshDashboard, notify }: {
   const act = async (issue: Json, action: string) => {
     if (action === "delete" && !window.confirm(`Delete ${issue.entry_path} from ${archiveName(issue.path)}? The archive name will not change.`)) return;
     if (action === "delete_archive" && !window.confirm(`Permanently delete ${archiveName(issue.path)} from the library? This cannot be undone.`)) return;
+    if (action === "salvage_partial" && !window.confirm(`Rebuild ${archiveName(issue.path)} using only entries that were recovered and fully verified? The truncated archive tail will be omitted.`)) return;
+    if (action === "keep_primary" || action === "keep_related") {
+      const kept = action === "keep_primary" ? issue.entry_path : issue.related_entry_path;
+      const discarded = action === "keep_primary" ? issue.related_entry_path : issue.entry_path;
+      if (!window.confirm(`Keep ${kept} and remove ${discarded} from ${archiveName(issue.path)}? The rebuilt archive will be verified before replacement.`)) return;
+    }
     setBusy(issue.id);
     try {
       await api(`/api/issues/${issue.id}/action`, { method: "POST", body: JSON.stringify({ action }) });
-      notify(action === "dismiss" ? "Dismissed until the next full rescan" : action === "delete_archive" ? "Archive deleted" : "Repair queued");
+      notify(action === "dismiss" ? "Dismissed until the next full rescan" : action === "delete_archive" ? "Archive deleted" : action.startsWith("keep_") ? "Selection queued for verified rebuild" : "Repair queued");
       if (action === "dismiss" || action === "delete_archive") setOpen(null);
       await refreshOpenGroup();
     } catch (error) {
@@ -753,39 +827,67 @@ function Attention({ refreshDashboard, notify }: {
             const hydratedIssue = diagnostic ? { ...issue, diagnostics: diagnostic } : issue;
             const context = issueContext(hydratedIssue);
             const expanded = open === issue.id;
-            const remedies = (issue.remedies || []).filter((remedy: string) => remedy !== "rebuild" || diagnostic?.repairable);
+            const collision = issue.kind === "filename_collision" && Boolean(issue.related_entry_path);
+            const remedies = (issue.remedies || []).filter((remedy: string) =>
+              remedy === "rebuild" ? diagnostic?.repairable :
+              remedy === "salvage" ? diagnostic?.salvageable :
+              remedy === "salvage_partial" ? diagnostic?.partial_salvageable :
+              true
+            );
             return <div className={`issue ${expanded ? "expanded" : ""}`} key={issue.id}>
               <div className="issue-summary">
                 <div><strong>{archiveName(issue.path)}</strong><span className="error-copy">{issue.message}</span>{issue.entry_path && <code>{issue.entry_path}</code>}</div>
                 <time>{dateTime(issue.updated_at)}</time>
                 <div className="issue-actions">
-                  <button className="button primary" disabled={busy === issue.id || issue.status === "queued"} onClick={() => act(issue, "retry")}>{issue.status === "queued" ? "Queued" : "Retry"}</button>
+                  {!collision && <button className="button primary" disabled={busy === issue.id || issue.status === "queued"} onClick={() => act(issue, "retry")}>{issue.status === "queued" ? "Queued" : "Retry"}</button>}
                   <button className="button secondary" aria-expanded={expanded} onClick={() => toggleInspect(issue)}>{expanded ? "Close" : "Inspect"}</button>
                   {issue.retry_failed && <button className="button ghost danger" disabled={busy === issue.id || issue.status === "queued"} onClick={() => act(issue, "delete_archive")}>Delete archive</button>}
                   <button className="button ghost" disabled={busy === issue.id} onClick={() => act(issue, "dismiss")}>Dismiss</button>
                 </div>
               </div>
-              {expanded && <div className={`issue-detail ${issue.entry_path ? "" : "without-preview"}`}>
-                {issue.entry_path && <IssuePreview issue={issue} />}
+              {expanded && <div className={`issue-detail ${issue.entry_path ? "" : "without-preview"} ${collision ? "collision-detail" : ""}`}>
+                {collision ? <div className="collision-comparison" aria-label="Conflicting images">
+                  <div className="collision-choice">
+                    <IssuePreview issue={issue} />
+                    <button className="button primary block" disabled={busy === issue.id || issue.status === "queued"} onClick={() => act(issue, "keep_primary")}>Keep this image</button>
+                  </div>
+                  <div className="collision-choice">
+                    <IssuePreview issue={issue} related />
+                    <button className="button primary block" disabled={busy === issue.id || issue.status === "queued"} onClick={() => act(issue, "keep_related")}>Keep this image</button>
+                  </div>
+                </div> : issue.entry_path && <IssuePreview issue={issue} />}
                 <div className="diagnosis">
                   <div><h3>{context.title}</h3><p>{context.text}</p></div>
                   <div className="diagnosis-facts">
                     <div><span>Failure stage</span><strong>{label(issue.stage)}</strong></div>
                     <div><span>Recommended</span><strong>{context.recommended}</strong></div>
-                    {diagnostic && <>
+                    {diagnostic?.kind === "crc" && <>
                       <div><span>Stored CRC-32</span><strong><code>{diagnostic.expected_crc32 || "Unavailable"}</code></strong></div>
                       <div><span>Calculated CRC-32</span><strong><code>{diagnostic.calculated_crc32 || "Unavailable"}</code></strong></div>
                       <div><span>Recovery status</span><strong>{diagnostic.image_readable ? "Recovered image decodes correctly" : "Recovered image is unreadable"}</strong></div>
                     </>}
                   </div>
                   {diagnosticsLoading === issue.id && <div className="diagnostic-loading">Checking the failing ZIP entry…</div>}
+                  {diagnostic?.entries?.length > 0 && <section className="recovery-assessment">
+                    <header>
+                      <strong>Recovery assessment</strong>
+                      <span>{Number(diagnostic.verified_count || 0).toLocaleString()} of {Number(diagnostic.checked_entries || 0).toLocaleString()} entries verified</span>
+                    </header>
+                    <div className="recovery-entry-list">
+                      {diagnostic.entries.slice(0, 12).map((entry: Json) => <div key={entry.entry_path}>
+                        <code>{entry.entry_path}</code>
+                        <span className={entry.repairable ? "recoverable" : "decision"}>{entry.repairable ? "Recoverable" : "Needs decision"}</span>
+                      </div>)}
+                    </div>
+                    {diagnostic.entries.length > 12 && <small>And {diagnostic.entries.length - 12} more entries in this recovery plan.</small>}
+                  </section>}
                   {(diagnostic?.detail || issue.detail) && <details><summary>Technical detail</summary><code>{diagnostic?.detail || issue.detail}</code></details>}
                   <input className="visually-hidden" type="file" accept="image/*" ref={(node) => { fileInputs.current[issue.id] = node; }} onChange={(event) => replace(issue, event.target.files?.[0])} />
-                  <div className="remedy-grid">
+                  {!collision && <div className="remedy-grid">
                     {remedies.map((remedy: string) => remedy === "replace" ?
                       <button className="button secondary block" key={remedy} disabled={busy === issue.id} onClick={() => fileInputs.current[issue.id]?.click()}>{remedyLabels[remedy]}</button> :
-                      <button className={`button block ${["compatibility", "lossless", "rebuild"].includes(remedy) ? "primary" : remedy === "delete" ? "danger" : "secondary"}`} key={remedy} disabled={busy === issue.id} onClick={() => act(issue, remedy)}>{remedyLabels[remedy] || label(remedy)}</button>)}
-                  </div>
+                      <button className={`button block ${["compatibility", "lossless", "smart_lossy", "rebuild", "salvage", "salvage_partial"].includes(remedy) ? "primary" : remedy === "delete" ? "danger" : "secondary"}`} key={remedy} disabled={busy === issue.id} onClick={() => act(issue, remedy)}>{remedyLabels[remedy] || label(remedy)}</button>)}
+                  </div>}
                 </div>
               </div>}
             </div>;
@@ -799,17 +901,66 @@ function Attention({ refreshDashboard, notify }: {
 
 function HistoryDetail({ id }: { id: string }) {
   const [detail, setDetail] = useState<Json | null>(null);
-  useEffect(() => { api(`/api/jobs/${id}`).then(setDetail).catch(() => setDetail({ events: [] })); }, [id]);
+  const [filter, setFilter] = useState("all");
+  useEffect(() => { api(`/api/jobs/${id}/history`).then(setDetail).catch(() => setDetail({ events: [] })); }, [id]);
   if (!detail) return <div className="history-loading" />;
   const job = detail.job || {};
+  const counts = detail.outcome_counts || {};
+  const entries = detail.history_entries || [];
+  const filteredEntries = filter === "all"
+    ? entries
+    : entries.filter((entry: Json) => entry.outcome === filter);
+  const filters = [
+    ["all", "All"],
+    ["optimized", "Optimized"],
+    ["already_current", "Already current"],
+    ["retained", "Retained"],
+    ["failed", "Failed"],
+  ];
   return <div className="history-detail">
     <div className="history-facts">
       <div><span>Duration</span><strong>{duration(job.elapsed_seconds)}</strong></div>
-      <div><span>Processed</span><strong>{job.processed || 0}</strong></div>
-      <div><span>Skipped</span><strong>{job.skipped || 0}</strong></div>
-      <div><span>Failed</span><strong>{job.failed || 0}</strong></div>
+      <div><span>Checked</span><strong>{Number(counts.all || 0).toLocaleString()}</strong></div>
+      <div><span>Optimized</span><strong>{Number(counts.optimized || 0).toLocaleString()}</strong></div>
+      <div><span>Already current</span><strong>{Number(counts.already_current || 0).toLocaleString()}</strong></div>
+      <div><span>Retained</span><strong>{Number(counts.retained || 0).toLocaleString()}</strong></div>
+      <div><span>Failed</span><strong>{Number(counts.failed || 0).toLocaleString()}</strong></div>
     </div>
-    <div className="event-list">{(detail.events || []).slice(0, 20).map((event: Json) => <div key={event.id}><i className={event.level} /><time>{dateTime(event.created_at)}</time><strong>{event.message}</strong>{event.archive_path && <code>{event.archive_path}</code>}</div>)}</div>
+    <div className="history-outcome-filters" role="group" aria-label="Archive outcome">
+      {filters.map(([value, text]) => <button
+        type="button"
+        className={filter === value ? "selected" : ""}
+        key={value}
+        onClick={() => setFilter(value)}
+      >{text}<span>{Number(counts[value] || 0).toLocaleString()}</span></button>)}
+    </div>
+    <div className="history-outcomes">
+      {filteredEntries.map((entry: Json) => <article className={`history-outcome ${entry.outcome}`} key={entry.id}>
+        <span className="history-outcome-mark" aria-hidden="true">
+          {entry.outcome === "optimized" ? "✓" : entry.outcome === "retained" ? "◇" : entry.outcome === "failed" ? "!" : "↺"}
+        </span>
+        <div>
+          <header><strong>{entry.label}</strong><time>{dateTime(entry.recorded_at)}</time></header>
+          <code>{entry.path}</code>
+          <p>{entry.detail}</p>
+          <footer>
+            {entry.converted_pages > 0 && <span>{Number(entry.converted_pages).toLocaleString()} converted</span>}
+            {entry.lossless_pages > 0 && <span>{Number(entry.lossless_pages).toLocaleString()} lossless</span>}
+            {entry.lossy_pages > 0 && <span>{Number(entry.lossy_pages).toLocaleString()} smart lossy</span>}
+            {entry.retained_pages > 0 && <span>{Number(entry.retained_pages).toLocaleString()} retained</span>}
+            {entry.bytes_saved > 0 && <span>{formatBytes(entry.bytes_saved)} saved</span>}
+            {entry.previous_processed_at && <span>Previously processed {dateTime(entry.previous_processed_at)}</span>}
+            {entry.jxl_effort !== null && entry.jxl_effort !== undefined && <span>Effort {entry.jxl_effort}</span>}
+          </footer>
+        </div>
+      </article>)}
+      {!filteredEntries.length && <div className="history-outcome-empty">No {filter === "all" ? "archive outcomes" : filters.find(([value]) => value === filter)?.[1].toLowerCase()} are available in this history window.</div>}
+      {Number(counts[filter] || 0) > filteredEntries.length && <small className="history-outcome-limit">Showing the latest {filteredEntries.length.toLocaleString()} of {Number(counts[filter] || 0).toLocaleString()} matching archives.</small>}
+    </div>
+    <details className="history-technical">
+      <summary>Technical activity</summary>
+      <div className="event-list">{(detail.events || []).slice(0, 20).map((event: Json) => <div key={event.id}><i className={event.level} /><time>{dateTime(event.created_at)}</time><strong>{event.message}</strong>{event.archive_path && <code>{event.archive_path}</code>}</div>)}</div>
+    </details>
   </div>;
 }
 
@@ -819,17 +970,20 @@ function History({ notify }: { notify: (message: string, kind?: "success" | "err
   const load = useCallback(() => api("/api/jobs?limit=100").then((value) => setRows(value.rows)).catch((error) => notify(error.message, "error")), [notify]);
   useEffect(() => { load(); }, [load]);
   return <div className="history-list">
-    {rows.map((row) => <article key={row.id}>
+    {rows.map((row) => {
+      const checked = Number(row.processed || 0) + Number(row.skipped || 0) + Number(row.failed || 0) + Number(row.deleted || 0);
+      return <article key={row.id}>
       <button className="history-summary" onClick={() => setOpen(open === row.id ? null : row.id)} aria-expanded={open === row.id}>
         <span className={`history-dot ${row.status}`} />
         <div><strong>{row.source === "schedule" ? "Scheduled conversion" : row.source === "retry" ? "Archive repair" : "Library conversion"}</strong><time>{dateTime(row.started_at || row.queued_at)}</time></div>
-        <span>{row.processed || 0} converted · {row.failed || 0} failed</span>
-        <strong>{formatGb(row.net_gb)}</strong>
+        <span>{checked.toLocaleString()} checked · {Number(row.skipped || 0).toLocaleString()} already current · {Number(row.failed || 0).toLocaleString()} failed</span>
+        <strong title="Net savings from this run">{formatGb(row.net_gb)}</strong>
         <span className="status-label">{label(row.status)}</span>
         <b>{open === row.id ? "−" : "+"}</b>
       </button>
       {open === row.id && <HistoryDetail id={row.id} />}
-    </article>)}
+    </article>;
+    })}
   </div>;
 }
 
@@ -885,7 +1039,7 @@ function Settings({ bootstrap, reload, notify }: {
       id: profile?.id || null,
       name: profile?.name || "",
       strategy: policyStrategy(options),
-      effort: Number(options.effort ?? 7),
+      effort: Number(options.effort ?? 10),
       threads: Number(options.threads ?? 4),
       distance: Number(options.distance ?? 0.5),
       smart_mb: Number(options.smart_mb ?? 10),
@@ -911,9 +1065,10 @@ function Settings({ bootstrap, reload, notify }: {
       distance: strategy === "smart" || strategy === "lossy" ? Number(policyForm.distance) : null,
       smart_mb: Number(policyForm.smart_mb),
       smart_mp: Number(policyForm.smart_mp),
-      no_convert: strategy === "recheck",
-      recheck_all: policyForm.scope === "library",
-      failed_only: policyForm.scope === "failed",
+      no_convert: strategy === "recheck" || strategy === "audit",
+      integrity_audit: strategy === "audit",
+      recheck_all: strategy === "audit" || policyForm.scope === "library",
+      failed_only: strategy !== "audit" && policyForm.scope === "failed",
       compatibility_mode: false,
       continue_on_page_error: false,
       only_path: null,
@@ -1043,18 +1198,26 @@ function Settings({ bootstrap, reload, notify }: {
         </header>
         <div className="policy-fields">
           <label><span>Policy name</span><input type="text" value={policyForm.name || ""} onChange={(event) => setPolicyForm({ ...policyForm, name: event.target.value })} required /></label>
-          <label><span>Conversion strategy</span><select value={policyForm.strategy || "lossless"} onChange={(event) => setPolicyForm({ ...policyForm, strategy: event.target.value })}>
+          <label><span>Conversion strategy</span><select value={policyForm.strategy || "lossless"} onChange={(event) => {
+            const strategy = event.target.value;
+            setPolicyForm({
+              ...policyForm,
+              strategy,
+              scope: strategy === "audit" ? "library" : policyForm.scope,
+            });
+          }}>
             <option value="lossless">Lossless</option>
             <option value="smart">Lossless first, smart lossy fallback</option>
             <option value="lossy">Fixed lossy distance</option>
             <option value="recheck">Recheck without conversion</option>
+            <option value="audit">Integrity audit (read only)</option>
           </select></label>
-          <label><span>Scope</span><select value={policyForm.scope || "unprocessed"} onChange={(event) => setPolicyForm({ ...policyForm, scope: event.target.value })}>
+          <label><span>Scope</span><select disabled={policyForm.strategy === "audit"} value={policyForm.strategy === "audit" ? "library" : policyForm.scope || "unprocessed"} onChange={(event) => setPolicyForm({ ...policyForm, scope: event.target.value })}>
             <option value="unprocessed">Unprocessed</option>
             <option value="library">Entire Library</option>
             <option value="failed">Failed</option>
           </select></label>
-          <label><span>Encoder effort · {policyForm.effort ?? 7}</span><input type="range" min="0" max="11" value={policyForm.effort ?? 7} onChange={(event) => setPolicyForm({ ...policyForm, effort: Number(event.target.value) })} /></label>
+          <label><span>Encoder effort · {policyForm.effort ?? 10}</span><input type="range" min="0" max="11" value={policyForm.effort ?? 10} onChange={(event) => setPolicyForm({ ...policyForm, effort: Number(event.target.value) })} /></label>
           <label><span>CPU budget</span><select value={policyForm.threads ?? 4} onChange={(event) => setPolicyForm({ ...policyForm, threads: Number(event.target.value) })}>{[1, 2, 4, 6, 8, 12, 16, 24, 32].map((value) => <option key={value} value={value}>{value} threads</option>)}</select></label>
         </div>
         {["smart", "lossy"].includes(policyForm.strategy) && <div className={`policy-lossy-fields ${policyForm.strategy === "lossy" ? "direct" : ""}`}>

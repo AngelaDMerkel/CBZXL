@@ -1,5 +1,6 @@
 fastapi>=0.115,<1
 httpx2>=2.7,<3
+Pillow>=11,<13
 pydantic>=2.9,<3
 rich>=13.9,<15
 uvicorn[standard]>=0.32,<1

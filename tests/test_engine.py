@@ -10,13 +10,16 @@ from unittest import mock
 
 from cbzxl_web.engine import (
     CancellationToken,
+    PageConversionError,
     ResumeWorkspace,
     VerificationError,
     archive_fingerprint,
     options_fingerprint,
     plan_parallelism,
     recover_zip_entry_bytes,
+    safe_extract_salvage_archive,
     safe_extract_archive,
+    scan_local_zip_entries,
     validate_conversion_paths,
     verify_archive,
     verify_filename_invariants,
@@ -60,6 +63,75 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(resumed_again)
         self.assertEqual(completed_again, 1)
 
+    def test_resume_workspace_persists_page_decision_details(self):
+        fingerprint = archive_fingerprint(self.archive)
+        workspace = ResumeWorkspace(
+            self.root / "resume-decisions",
+            self.archive,
+            fingerprint,
+            options_fingerprint({"effort": 10}),
+        )
+        workspace.prepare(1024 * 1024, CancellationToken())
+
+        workspace.record_decision(
+            "001.jpg",
+            source_format="image/jpeg",
+            source_size=1000,
+            candidate_size=840,
+            final_size=840,
+            outcome="converted",
+            mode="Lossless",
+            distance=0,
+            effort=10,
+            reason="Verified JPEG XL candidate saved 160 bytes",
+            attempts=[{"effort": 10, "verified": True}],
+        )
+
+        reloaded = ResumeWorkspace(
+            self.root / "resume-decisions",
+            self.archive,
+            fingerprint,
+            options_fingerprint({"effort": 10}),
+        )
+        resumed, _completed = reloaded.prepare(
+            1024 * 1024,
+            CancellationToken(),
+        )
+        decision = reloaded.manifest["page_decisions"]["001.jpg"]
+        self.assertTrue(resumed)
+        self.assertEqual(decision["candidate_size"], 840)
+        self.assertEqual(decision["effort"], 10)
+        self.assertEqual(decision["outcome"], "converted")
+
+    def test_resume_workspace_reuses_an_extension_correction(self):
+        fingerprint = archive_fingerprint(self.archive)
+        workspace = ResumeWorkspace(
+            self.root / "resume-extension",
+            self.archive,
+            fingerprint,
+            options_fingerprint({"extension": "correct"}),
+        )
+        workspace.prepare(1024 * 1024, CancellationToken())
+        source = workspace.files / "001.jpg"
+        output = workspace.files / "001.webp"
+        source.replace(output)
+        workspace.record_page(
+            "001.jpg",
+            "001.webp",
+            output.stat().st_size,
+            "Extension corrected",
+            operation="extension_corrected",
+            detected_extension=".webp",
+        )
+
+        resumed, completed = workspace.prepare(
+            1024 * 1024,
+            CancellationToken(),
+        )
+
+        self.assertTrue(resumed)
+        self.assertEqual(completed, 1)
+
     def test_replacement_keeps_the_original_internal_filename(self):
         workspace = ResumeWorkspace(
             self.root / "resume-replace",
@@ -91,6 +163,27 @@ class EngineTests(unittest.TestCase):
         self.assertFalse((workspace.files / "001.jpg").exists())
         self.assertTrue((workspace.files / "ComicInfo.xml").exists())
         self.assertNotIn("001.jpg", workspace.manifest["original_files"])
+
+    def test_deferred_unreadable_entry_can_be_explicitly_deleted(self):
+        workspace = ResumeWorkspace(
+            self.root / "resume-deferred-delete",
+            self.archive,
+            archive_fingerprint(self.archive),
+            options_fingerprint({"repair": "delete-unreadable"}),
+        )
+        workspace.prepare(
+            1024 * 1024,
+            CancellationToken(),
+            defer_entries=["001.jpg"],
+        )
+
+        self.assertFalse((workspace.files / "001.jpg").exists())
+        self.assertIn("001.jpg", workspace.manifest["original_files"])
+
+        workspace.delete_entry("001.jpg")
+
+        self.assertNotIn("001.jpg", workspace.manifest["original_files"])
+        self.assertTrue((workspace.files / "ComicInfo.xml").exists())
 
     def test_safe_extraction_rejects_parent_traversal(self):
         unsafe = self.root / "unsafe.cbz"
@@ -170,6 +263,62 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(names, ["009.jxl"])
         self.assertEqual((extracted / "009.jxl").read_bytes(), payload)
 
+    def test_archive_can_be_salvaged_from_local_headers_without_central_directory(self):
+        damaged = self.root / "missing-central-directory.cbz"
+        with zipfile.ZipFile(damaged, "w", zipfile.ZIP_DEFLATED) as target:
+            target.writestr("001.jpg", b"first-page")
+            target.writestr("ComicInfo.xml", b"<ComicInfo/>")
+        archive_bytes = damaged.read_bytes()
+        damaged.write_bytes(archive_bytes[:archive_bytes.index(b"PK\x01\x02")])
+
+        with self.assertRaises(zipfile.BadZipFile):
+            zipfile.ZipFile(damaged, "r")
+        entries = scan_local_zip_entries(damaged)
+        self.assertEqual([entry.filename for entry in entries], ["001.jpg", "ComicInfo.xml"])
+
+        extracted = self.root / "salvaged"
+        names = safe_extract_salvage_archive(
+            damaged,
+            extracted,
+            1024 * 1024,
+            CancellationToken(),
+        )
+        self.assertEqual(names, ["001.jpg", "ComicInfo.xml"])
+        self.assertEqual((extracted / "001.jpg").read_bytes(), b"first-page")
+        self.assertEqual((extracted / "ComicInfo.xml").read_bytes(), b"<ComicInfo/>")
+
+    def test_partial_local_header_scan_retains_complete_entries_before_truncated_tail(self):
+        damaged = self.root / "truncated-tail.cbz"
+        with zipfile.ZipFile(damaged, "w", zipfile.ZIP_STORED) as target:
+            target.writestr("001.jpg", b"complete")
+            target.writestr("002.jpg", b"truncated-payload")
+        archive_bytes = damaged.read_bytes()
+        second_header = archive_bytes.index(b"PK\x03\x04", 4)
+        damaged.write_bytes(archive_bytes[:second_header + 35])
+
+        with self.assertRaisesRegex(VerificationError, "truncated"):
+            scan_local_zip_entries(damaged)
+        entries = scan_local_zip_entries(damaged, allow_partial=True)
+        self.assertEqual([entry.filename for entry in entries], ["001.jpg"])
+
+        workspace = ResumeWorkspace(
+            self.root / "resume-partial-salvage",
+            damaged,
+            "partial-salvage-fingerprint",
+            options_fingerprint({"repair": "salvage_partial"}),
+        )
+        workspace.prepare(
+            1024 * 1024,
+            CancellationToken(),
+            salvage_archive=True,
+            salvage_partial=True,
+        )
+        workspace.mark_repair("salvage_partial")
+        self.assertEqual(
+            workspace.manifest["repair"],
+            {"action": "salvage_partial", "entry": None, "entries": []},
+        )
+
     def test_archive_verification_checks_entry_set_and_signatures(self):
         workspace = self.root / "files"
         workspace.mkdir()
@@ -216,6 +365,33 @@ class EngineTests(unittest.TestCase):
         )
         self.assertTrue(run.call_args.kwargs["discard_stdout"])
 
+    def test_archive_verification_fully_decodes_every_required_changed_page(self):
+        workspace = self.root / "changed-files"
+        workspace.mkdir()
+        pages = []
+        for index in range(5):
+            page = workspace / f"{index:03}.jxl"
+            page.write_bytes(JXL_SIGNATURE)
+            pages.append(page)
+        candidate = self.root / "changed-candidate.cbz"
+        with zipfile.ZipFile(candidate, "w", zipfile.ZIP_STORED) as target:
+            for page in pages:
+                target.write(page, page.name)
+
+        with mock.patch("cbzxl_web.engine.run_cancellable") as run:
+            run.return_value = mock.Mock(returncode=0, stderr="")
+            result = verify_archive(
+                candidate,
+                workspace,
+                pages,
+                CancellationToken(),
+                deep_samples=0,
+                required_decode_entries=[page.name for page in pages],
+            )
+
+        self.assertEqual(result["decoded_samples"], 5)
+        self.assertEqual(run.call_count, 5)
+
     @unittest.skipUnless(
         shutil.which("cjxl") and shutil.which("djxl"),
         "libjxl command-line tools are required",
@@ -245,6 +421,19 @@ class EngineTests(unittest.TestCase):
         )
 
         self.assertEqual(result["decoded_samples"], 1)
+        decoded = self.root / "grayscale-decoded.ppm"
+        subprocess.run(
+            [
+                "djxl",
+                str(page),
+                str(decoded),
+                "--num_threads=1",
+                "--quiet",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        self.assertTrue(decoded.read_bytes().startswith((b"P5", b"P6")))
 
     def test_filename_invariant_allows_only_extension_change(self):
         verify_filename_invariants(
@@ -258,6 +447,29 @@ class EngineTests(unittest.TestCase):
                 ["004_1.jxl"],
                 {"Chapter 2/004.jpg": {"output": "004_1.jxl"}},
             )
+        verify_filename_invariants(
+            ["Chapter 2/004.jpg", "ComicInfo.xml"],
+            ["Chapter 2/004.webp", "ComicInfo.xml"],
+            {
+                "Chapter 2/004.jpg": {
+                    "output": "Chapter 2/004.webp",
+                    "operation": "extension_corrected",
+                    "detected_extension": ".webp",
+                }
+            },
+        )
+        with self.assertRaisesRegex(VerificationError, "may only become"):
+            verify_filename_invariants(
+                ["Chapter 2/004.jpg"],
+                ["Chapter 2/renamed.webp"],
+                {
+                    "Chapter 2/004.jpg": {
+                        "output": "Chapter 2/renamed.webp",
+                        "operation": "extension_corrected",
+                        "detected_extension": ".webp",
+                    }
+                },
+            )
 
     def test_conversion_path_collision_fails_instead_of_renaming(self):
         workspace = self.root / "collision"
@@ -266,8 +478,13 @@ class EngineTests(unittest.TestCase):
         png = workspace / "page.png"
         jpg.write_bytes(b"jpg")
         png.write_bytes(b"png")
-        with self.assertRaisesRegex(ValueError, "both page.jpg and page.png"):
-            validate_conversion_paths([jpg, png], [jpg, png])
+        with self.assertRaisesRegex(
+            PageConversionError,
+            "both page.jpg and page.png",
+        ) as raised:
+            validate_conversion_paths([jpg, png], [jpg, png], workspace)
+        self.assertEqual(raised.exception.entry_path, "page.png")
+        self.assertEqual(raised.exception.related_entry_path, "page.jpg")
 
     def test_existing_jxl_collision_fails_instead_of_overwriting(self):
         workspace = self.root / "existing"
@@ -276,8 +493,13 @@ class EngineTests(unittest.TestCase):
         existing = workspace / "page.jxl"
         source.write_bytes(b"jpg")
         existing.write_bytes(JXL_SIGNATURE)
-        with self.assertRaisesRegex(ValueError, "path already exists"):
-            validate_conversion_paths([source], [source, existing])
+        with self.assertRaisesRegex(
+            PageConversionError,
+            "path already exists",
+        ) as raised:
+            validate_conversion_paths([source], [source, existing], workspace)
+        self.assertEqual(raised.exception.entry_path, "page.jpg")
+        self.assertEqual(raised.exception.related_entry_path, "page.jxl")
 
     def test_parallelism_never_exceeds_cpu_budget(self):
         workers, encoder_threads = plan_parallelism(8, 100)
