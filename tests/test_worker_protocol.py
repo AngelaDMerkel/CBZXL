@@ -4,7 +4,7 @@ from pathlib import Path
 
 from cbzxl_web import database
 from cbzxl_web.protocol import encode_event
-from cbzxl_web.worker import STRUCTURED_JOBS, command_for_job, persist_output
+from cbzxl_web.worker import STRUCTURED_JOBS, command_for_job, failure_output, persist_output
 
 
 class WorkerProtocolTests(unittest.TestCase):
@@ -97,6 +97,22 @@ class WorkerProtocolTests(unittest.TestCase):
         self.assertIn("--continue-on-page-error", command)
         self.assertIn("--repair-action", command)
         self.assertIn("pages/003.jpg", command)
+
+    def test_failure_output_keeps_traceback_after_structured_events(self):
+        detail = failure_output(
+            [
+                encode_event("archive_completed", message="Skipped"),
+                "ordinary progress output\n",
+                "Traceback (most recent call last):\n",
+                '  File "/app/cbzxl.py", line 1, in main\n',
+                "zipfile.BadZipFile: File is not a zip file\n",
+            ]
+        )
+
+        self.assertNotIn("CBZXL_EVENT", detail)
+        self.assertNotIn("ordinary progress", detail)
+        self.assertTrue(detail.startswith("Traceback"))
+        self.assertIn("zipfile.BadZipFile", detail)
 
 
 if __name__ == "__main__":

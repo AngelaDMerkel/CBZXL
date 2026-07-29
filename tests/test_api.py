@@ -61,6 +61,71 @@ class ApiTests(unittest.TestCase):
         response = self.client.post("/api/schedules", json={"cadence": "monthly", "day_of_month": 40})
         self.assertEqual(response.status_code, 422)
 
+    def test_conversion_policy_can_be_created_edited_and_assigned_to_schedule(self):
+        bootstrap = self.client.get("/api/bootstrap").json()
+        library_id = bootstrap["libraries"][0]["id"]
+        options = {
+            **database.DEFAULT_OPTIONS,
+            "smart_distance": True,
+            "distance": 0.5,
+            "smart_mb": 20,
+            "smart_mp": 8,
+            "effort": 10,
+        }
+        created = self.client.post(
+            "/api/profiles",
+            json={
+                "name": "Conservative smart",
+                "is_default": False,
+                "options": options,
+            },
+        )
+        self.assertEqual(created.status_code, 201)
+        profile_id = created.json()["id"]
+
+        updated = self.client.put(
+            f"/api/profiles/{profile_id}",
+            json={
+                "name": "Conservative smart JXL",
+                "is_default": True,
+                "options": {**options, "smart_mb": 25},
+            },
+        )
+        self.assertEqual(updated.status_code, 200)
+        self.assertTrue(updated.json()["is_default"])
+        self.assertEqual(updated.json()["options"]["smart_mb"], 25)
+
+        schedule = self.client.post(
+            "/api/schedules",
+            json={
+                "name": "Policy schedule",
+                "enabled": True,
+                "cadence": "daily",
+                "hour": 4,
+                "minute": 0,
+                "library_id": library_id,
+                "profile_id": profile_id,
+            },
+        )
+        self.assertEqual(schedule.status_code, 201)
+        schedule_id = schedule.json()["id"]
+        recheck = next(
+            profile
+            for profile in self.client.get("/api/bootstrap").json()["profiles"]
+            if profile["name"] == "Recheck without conversion"
+        )
+        reassigned = self.client.put(
+            f"/api/schedules/{schedule_id}",
+            json={
+                **schedule.json(),
+                "profile_id": recheck["id"],
+            },
+        )
+        self.assertEqual(reassigned.status_code, 200)
+        self.assertEqual(reassigned.json()["profile_id"], recheck["id"])
+        listed = self.client.get("/api/schedules").json()["rows"]
+        self.assertEqual(listed[0]["profile_name"], "Recheck without conversion")
+
     def test_job_progress_includes_rate_metadata(self):
         job = self.client.post("/api/jobs", json={}).json()
         hydrated = self.client.get(f"/api/jobs/{job['id']}").json()["job"]

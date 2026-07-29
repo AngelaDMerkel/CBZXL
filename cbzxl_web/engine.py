@@ -8,11 +8,16 @@ import subprocess
 import threading
 import time
 import zipfile
+import bz2
+import binascii
+import struct
+import zlib
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 
 PARTIAL_SUFFIX = ".cbzxl-partial"
+LOCAL_FILE_HEADER = struct.Struct("<4s5H3L2H")
 
 
 class ConversionCancelled(RuntimeError):
@@ -117,7 +122,60 @@ def options_fingerprint(options):
     return hashlib.blake2b(encoded, digest_size=16).hexdigest()
 
 
-def safe_extract_archive(source, destination, max_uncompressed_bytes, token=None):
+def recover_zip_entry_bytes(source, info, *, max_bytes=None):
+    """Recover one ZIP entry without trusting its stored CRC.
+
+    This is deliberately limited to common CBZ compression methods. Callers
+    must validate the recovered payload before offering an archive rebuild.
+    """
+    if info.flag_bits & 0x1:
+        raise VerificationError(f"Encrypted ZIP entries cannot be recovered: {info.filename}")
+    if max_bytes and info.file_size > max_bytes:
+        raise VerificationError(f"ZIP entry exceeds the recovery limit: {info.filename}")
+    with open(source, "rb") as handle:
+        handle.seek(info.header_offset)
+        header = handle.read(LOCAL_FILE_HEADER.size)
+        if len(header) != LOCAL_FILE_HEADER.size:
+            raise VerificationError(f"Local ZIP header is truncated: {info.filename}")
+        signature, _version, _flags, method, _time, _date, _crc, _compressed, _size, name_len, extra_len = LOCAL_FILE_HEADER.unpack(header)
+        if signature != b"PK\x03\x04":
+            raise VerificationError(f"Local ZIP header is invalid: {info.filename}")
+        handle.seek(name_len + extra_len, os.SEEK_CUR)
+        compressed = handle.read(info.compress_size)
+    if len(compressed) != info.compress_size:
+        raise VerificationError(f"Compressed ZIP entry is truncated: {info.filename}")
+    try:
+        if method == zipfile.ZIP_STORED:
+            recovered = compressed
+        elif method == zipfile.ZIP_DEFLATED:
+            recovered = zlib.decompress(compressed, -15)
+        elif method == zipfile.ZIP_BZIP2:
+            recovered = bz2.decompress(compressed)
+        else:
+            raise VerificationError(
+                f"ZIP compression method {method} is not recoverable: {info.filename}"
+            )
+    except (OSError, EOFError, zlib.error) as exc:
+        raise VerificationError(f"ZIP entry could not be decompressed: {info.filename}") from exc
+    if len(recovered) != info.file_size:
+        raise VerificationError(f"Recovered ZIP entry has the wrong size: {info.filename}")
+    if max_bytes and len(recovered) > max_bytes:
+        raise VerificationError(f"Recovered ZIP entry exceeds the recovery limit: {info.filename}")
+    return recovered
+
+
+def crc32_hex(payload):
+    return f"{binascii.crc32(payload) & 0xFFFFFFFF:08X}"
+
+
+def safe_extract_archive(
+    source,
+    destination,
+    max_uncompressed_bytes,
+    token=None,
+    *,
+    recover_crc_entry=None,
+):
     destination = Path(destination).resolve()
     total_uncompressed = 0
     extracted_files = []
@@ -152,8 +210,17 @@ def safe_extract_archive(source, destination, max_uncompressed_bytes, token=None
                 target.mkdir(parents=True, exist_ok=True)
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
-            with archive.open(member) as source_stream, open(target, "wb") as target_stream:
-                shutil.copyfileobj(source_stream, target_stream, length=1024 * 1024)
+            if recover_crc_entry and normalized_name == recover_crc_entry:
+                target.write_bytes(
+                    recover_zip_entry_bytes(
+                        source,
+                        member,
+                        max_bytes=max_uncompressed_bytes,
+                    )
+                )
+            else:
+                with archive.open(member) as source_stream, open(target, "wb") as target_stream:
+                    shutil.copyfileobj(source_stream, target_stream, length=1024 * 1024)
             extracted_files.append(normalized_name)
     return extracted_files
 
@@ -227,13 +294,13 @@ class ResumeWorkspace:
             os.fsync(handle.fileno())
         os.replace(temporary, self.manifest_path)
 
-    def prepare(self, max_uncompressed_bytes, token):
+    def prepare(self, max_uncompressed_bytes, token, *, recover_crc_entry=None):
         resumed = False
         if self.manifest_path.is_file() and self.files.is_dir():
             try:
                 self.manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
                 resumed = (
-                    self.manifest.get("version") == 3
+                    self.manifest.get("version") == 4
                     and self.manifest.get("archive_path") == self.archive_path
                     and self.manifest.get("fingerprint") == self.fingerprint
                     and self.manifest.get("options") == self.option_key
@@ -250,9 +317,15 @@ class ResumeWorkspace:
             if self.root.exists():
                 shutil.rmtree(self.root)
             self.files.mkdir(parents=True)
-            original_files = safe_extract_archive(self.archive_path, self.files, max_uncompressed_bytes, token)
+            original_files = safe_extract_archive(
+                self.archive_path,
+                self.files,
+                max_uncompressed_bytes,
+                token,
+                recover_crc_entry=recover_crc_entry,
+            )
             self.manifest = {
-                "version": 3,
+                "version": 4,
                 "archive_path": self.archive_path,
                 "fingerprint": self.fingerprint,
                 "options": self.option_key,
@@ -273,11 +346,12 @@ class ResumeWorkspace:
             self.manifest["stage"] = stage
             self._write_manifest()
 
-    def record_page(self, source_relative, output_relative, output_size):
+    def record_page(self, source_relative, output_relative, output_size, mode="Lossless"):
         with self._lock:
             self.manifest.setdefault("completed_pages", {})[source_relative] = {
                 "output": output_relative,
                 "bytes": output_size,
+                "mode": mode,
             }
             self._write_manifest()
 
@@ -314,6 +388,11 @@ class ResumeWorkspace:
         ]
         self.manifest.setdefault("completed_pages", {}).pop(canonical, None)
         self.manifest["repair"] = {"action": "delete", "entry": canonical}
+        self._write_manifest()
+
+    def mark_repair(self, action, entry_path):
+        canonical, _target = self._entry_target(entry_path)
+        self.manifest["repair"] = {"action": action, "entry": canonical}
         self._write_manifest()
 
     def complete(self):

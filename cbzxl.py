@@ -7,6 +7,7 @@ import threading
 import zipfile
 import subprocess
 import argparse
+import re
 import stat
 import sys
 import time
@@ -45,7 +46,7 @@ from cbzxl_web.protocol import EventEmitter
 # Default Constants (can be overwritten by args)
 DEFAULT_JXL_EFFORT = 10
 DEFAULT_THREADS = 10
-SCRIPT_VERSION = "3.3.1"
+SCRIPT_VERSION = "4.0.0"
 
 # Constants for use only in the Docker Container.
 CONFIG_DIR = os.getenv("CONFIG_DIR", "/config")
@@ -372,21 +373,46 @@ def update_run_progress(conn, processed, skipped, failed, flattened, deleted, sa
     conn.commit()
 
 
-def record_archive_result(conn, path_str, original_size, final_size, saved_bytes, status, dominant_type, jxl_effort_level, duration, img_count, num_jpg, num_png, conversion_mode, megapixels_info, error_message=None, archive_mtime_value=None):
+def record_archive_result(
+    conn,
+    path_str,
+    original_size,
+    final_size,
+    saved_bytes,
+    status,
+    dominant_type,
+    jxl_effort_level,
+    duration,
+    img_count,
+    num_jpg,
+    num_png,
+    conversion_mode,
+    megapixels_info,
+    converted_pages=0,
+    lossless_pages=0,
+    lossy_pages=0,
+    retained_pages=0,
+    error_message=None,
+    archive_mtime_value=None,
+):
     if DRY_RUN or conn is None or not RUN_ID:
         return
     percent_saved = (saved_bytes / original_size) * 100 if original_size else 0
     conn.execute("""
         INSERT INTO archive_results
         (job_id, archive_id, path, original_size, final_size, bytes_saved, percent_saved, status, dominant_type,
-         jxl_effort, processing_duration_seconds, image_count, jpg_count, png_count, conversion_mode,
+         jxl_effort, processing_duration_seconds, image_count, jpg_count, png_count,
+         converted_pages, lossless_pages, lossy_pages, retained_pages, conversion_mode,
          megapixels_info, error_message, converted_at, archive_mtime)
-        VALUES (?, (SELECT id FROM archives WHERE library_id=? AND path=?), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, (SELECT id FROM archives WHERE library_id=? AND path=?), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(job_id, path) DO UPDATE SET archive_id=excluded.archive_id, original_size=excluded.original_size,
           final_size=excluded.final_size, bytes_saved=excluded.bytes_saved, percent_saved=excluded.percent_saved,
           status=excluded.status, dominant_type=excluded.dominant_type, jxl_effort=excluded.jxl_effort,
           processing_duration_seconds=excluded.processing_duration_seconds, image_count=excluded.image_count,
-          jpg_count=excluded.jpg_count, png_count=excluded.png_count, conversion_mode=excluded.conversion_mode,
+          jpg_count=excluded.jpg_count, png_count=excluded.png_count,
+          converted_pages=excluded.converted_pages, lossless_pages=excluded.lossless_pages,
+          lossy_pages=excluded.lossy_pages, retained_pages=excluded.retained_pages,
+          conversion_mode=excluded.conversion_mode,
           megapixels_info=excluded.megapixels_info, error_message=excluded.error_message,
           converted_at=excluded.converted_at, archive_mtime=excluded.archive_mtime
     """, (
@@ -405,6 +431,10 @@ def record_archive_result(conn, path_str, original_size, final_size, saved_bytes
         img_count,
         num_jpg,
         num_png,
+        converted_pages,
+        lossless_pages,
+        lossy_pages,
+        retained_pages,
         conversion_mode,
         megapixels_info,
         error_message,
@@ -413,7 +443,28 @@ def record_archive_result(conn, path_str, original_size, final_size, saved_bytes
     ))
 
 
-def mark_processed(conn, cbz_path_obj, path_str, original_size, final_size, saved_bytes, dominant_type, jxl_effort_level, duration, img_count, num_jpg, num_png, conversion_mode, megapixels_info, content_fingerprint=None):
+def mark_processed(
+    conn,
+    cbz_path_obj,
+    path_str,
+    original_size,
+    final_size,
+    saved_bytes,
+    dominant_type,
+    jxl_effort_level,
+    duration,
+    img_count,
+    num_jpg,
+    num_png,
+    conversion_mode,
+    megapixels_info,
+    content_fingerprint=None,
+    *,
+    converted_pages=0,
+    lossless_pages=0,
+    lossy_pages=0,
+    retained_pages=0,
+):
     """Mark an archive as processed with enhanced metadata."""
     if DRY_RUN or conn is None:
         log(f"Would mark as processed: {path_str} (Duration: {duration:.2f}s, Images: {img_count})")
@@ -426,24 +477,50 @@ def mark_processed(conn, cbz_path_obj, path_str, original_size, final_size, save
         conn.execute("""
             INSERT INTO archives
             (library_id, path, original_size, final_size, bytes_saved, percent_saved, converted_at, archive_mtime, content_fingerprint, status, dominant_type, jxl_effort,
-             processing_duration_seconds, image_count, jpg_count, png_count, script_version, jxl_version, conversion_mode, megapixels_info, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'processed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             processing_duration_seconds, image_count, jpg_count, png_count,
+             converted_pages, lossless_pages, lossy_pages, retained_pages,
+             script_version, jxl_version, conversion_mode, megapixels_info, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'processed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(library_id, path) DO UPDATE SET original_size=excluded.original_size, final_size=excluded.final_size,
               bytes_saved=excluded.bytes_saved, percent_saved=excluded.percent_saved, converted_at=excluded.converted_at,
               archive_mtime=excluded.archive_mtime, content_fingerprint=excluded.content_fingerprint,
               status='processed', dominant_type=excluded.dominant_type,
               jxl_effort=excluded.jxl_effort, processing_duration_seconds=excluded.processing_duration_seconds,
               image_count=excluded.image_count, jpg_count=excluded.jpg_count, png_count=excluded.png_count,
+              converted_pages=excluded.converted_pages, lossless_pages=excluded.lossless_pages,
+              lossy_pages=excluded.lossy_pages, retained_pages=excluded.retained_pages,
               script_version=excluded.script_version, jxl_version=excluded.jxl_version, error_message=NULL,
               conversion_mode=excluded.conversion_mode, megapixels_info=excluded.megapixels_info, updated_at=excluded.updated_at
         """, (LIBRARY_ID, path_str, original_size, final_size, saved_bytes, percent_saved, converted_at_iso, archive_mtime_value, content_fingerprint, dominant_type, jxl_effort_level,
-              duration, img_count, num_jpg, num_png, SCRIPT_VERSION, JXL_VERSION, conversion_mode, megapixels_info, converted_at_iso, converted_at_iso))
+              duration, img_count, num_jpg, num_png, converted_pages, lossless_pages, lossy_pages,
+              retained_pages, SCRIPT_VERSION, JXL_VERSION, conversion_mode, megapixels_info,
+              converted_at_iso, converted_at_iso))
         archive_id = conn.execute(
             "SELECT id FROM archives WHERE library_id=? AND path=?",
             (LIBRARY_ID, path_str),
         ).fetchone()[0]
         resolve_archive_issue(conn, archive_id)
-        record_archive_result(conn, path_str, original_size, final_size, saved_bytes, "processed", dominant_type, jxl_effort_level, duration, img_count, num_jpg, num_png, conversion_mode, megapixels_info, archive_mtime_value=archive_mtime_value)
+        record_archive_result(
+            conn,
+            path_str,
+            original_size,
+            final_size,
+            saved_bytes,
+            "processed",
+            dominant_type,
+            jxl_effort_level,
+            duration,
+            img_count,
+            num_jpg,
+            num_png,
+            conversion_mode,
+            megapixels_info,
+            converted_pages,
+            lossless_pages,
+            lossy_pages,
+            retained_pages,
+            archive_mtime_value=archive_mtime_value,
+        )
         conn.commit()
     except sqlite3.DatabaseError as e:
         log(f"[red]❌ Failed to mark as processed in DB: {path_str} — {e}", level="error")
@@ -491,10 +568,106 @@ def mark_failed(
             message=error_msg,
             detail=issue_detail,
         )
-        record_archive_result(conn, path_str, 0, 0, 0, "failed", "N/A", JXL_EFFORT, duration, 0, 0, 0, "N/A", "N/A", error_msg, archive_mtime_value=archive_mtime_value)
+        record_archive_result(
+            conn,
+            path_str,
+            0,
+            0,
+            0,
+            "failed",
+            "N/A",
+            JXL_EFFORT,
+            duration,
+            0,
+            0,
+            0,
+            "N/A",
+            "N/A",
+            error_message=error_msg,
+            archive_mtime_value=archive_mtime_value,
+        )
         conn.commit()
     except sqlite3.DatabaseError as e:
         log(f"[red]❌ Failed to mark as failed in DB: {path_str} — {e}", level="error")
+
+
+def classify_archive_error(error, workspace=None):
+    """Return stable issue metadata for an archive-scoped failure."""
+    issue_kind = getattr(error, "kind", "archive_failed")
+    workspace_stage = workspace.manifest.get("stage", "failed") if workspace else "preparing"
+    issue_stage = getattr(error, "stage", workspace_stage)
+    issue_entry = getattr(error, "entry_path", None)
+    issue_detail = getattr(error, "detail", None)
+    if issue_kind == "archive_failed":
+        lowered_error = str(error).lower()
+        if isinstance(error, VerificationError):
+            issue_kind = "verification_failed"
+            issue_stage = "verifying"
+        elif isinstance(error, zipfile.BadZipFile):
+            crc_match = re.search(
+                r"bad crc-32 for file ['\"](.+?)['\"]",
+                str(error),
+                flags=re.IGNORECASE,
+            )
+            issue_kind = "crc_mismatch" if crc_match else "archive_corrupt"
+            issue_stage = "extracting"
+            if crc_match:
+                issue_entry = crc_match.group(1).replace("\\", "/")
+        elif isinstance(error, PermissionError):
+            issue_kind = "permission_denied"
+        elif isinstance(error, FileNotFoundError):
+            issue_kind = "file_missing"
+        elif "unsafe archive path" in lowered_error or "symlinks are not allowed" in lowered_error:
+            issue_kind = "unsafe_archive_path"
+            issue_stage = "extracting"
+        elif "cannot preserve filename" in lowered_error or "duplicate archive path" in lowered_error:
+            issue_kind = "filename_collision"
+            issue_stage = "preparing"
+    return (
+        issue_kind,
+        issue_stage,
+        issue_entry,
+        issue_detail,
+    )
+
+
+def record_archive_failure(conn_main, conn_fail, cbz_path_obj, path_str, error, duration, workspace=None):
+    """Persist and publish a failure without turning it into a run-level failure."""
+    issue_kind, issue_stage, issue_entry, issue_detail = classify_archive_error(error, workspace)
+    emit(
+        "archive_failed",
+        level="error",
+        message=str(error),
+        archive=path_str,
+        stage=issue_stage,
+        issue_kind=issue_kind,
+        entry_path=issue_entry,
+        detail=issue_detail,
+    )
+    if conn_fail:
+        mark_failed(
+            conn_fail,
+            cbz_path_obj,
+            path_str,
+            duration,
+            str(error),
+            issue_kind=issue_kind,
+            issue_stage=issue_stage,
+            issue_entry=issue_entry,
+            issue_detail=issue_detail,
+        )
+    if conn_main:
+        mark_failed(
+            conn_main,
+            cbz_path_obj,
+            path_str,
+            duration,
+            str(error),
+            issue_kind=issue_kind,
+            issue_stage=issue_stage,
+            issue_entry=issue_entry,
+            issue_detail=issue_detail,
+        )
 
 
 def get_size(file_path):
@@ -720,7 +893,12 @@ def convert_single_image(img_path_obj, cli_args, workspace=None, archive_path=No
             if workspace:
                 source_relative = Path(img_path_obj).relative_to(workspace.files).as_posix()
                 output_relative = Path(jxl_path).relative_to(workspace.files).as_posix()
-                workspace.record_page(source_relative, output_relative, get_size(jxl_path))
+                workspace.record_page(
+                    source_relative,
+                    output_relative,
+                    get_size(jxl_path),
+                    conversion_mode,
+                )
             if VERBOSE:
                 log(
                     f"   🖼️  Converted image: {img_path_obj.name} "
@@ -836,7 +1014,20 @@ def convert_images(temp_dir_path, cli_args, workspace=None, archive_path=None):
         other_type: other_count,
     })
 
-    base_return = (0, "", dominant_type, image_count, jpg_count, png_count, "N/A", "N/A")
+    base_return = (
+        0,
+        "",
+        dominant_type,
+        image_count,
+        jpg_count,
+        png_count,
+        "N/A",
+        "N/A",
+        0,
+        0,
+        0,
+        0,
+    )
 
     if not convertible_paths:
         recognized_nonconvertible_paths = jxl_paths + other_image_paths
@@ -844,7 +1035,21 @@ def convert_images(temp_dir_path, cli_args, workspace=None, archive_path=None):
             dominant_nonconvertible = format_summary(recognized_nonconvertible_paths)
             if VERBOSE or DRY_RUN:
                 log(f"   Found {len(recognized_nonconvertible_paths)} existing {dominant_nonconvertible} image(s). No conversion needed.")
-            return ConversionStatus.NO_CONVERTIBLE_RECOGNIZED_IMAGES, 0, dominant_nonconvertible, dominant_type, image_count, jpg_count, png_count, "N/A", "N/A"
+            return (
+                ConversionStatus.NO_CONVERTIBLE_RECOGNIZED_IMAGES,
+                0,
+                dominant_nonconvertible,
+                dominant_type,
+                image_count,
+                jpg_count,
+                png_count,
+                "N/A",
+                "N/A",
+                0,
+                0,
+                0,
+                0,
+            )
         else:
             return ConversionStatus.NO_IMAGES_RECOGNIZED, *base_return
 
@@ -853,7 +1058,8 @@ def convert_images(temp_dir_path, cli_args, workspace=None, archive_path=None):
 
     validate_conversion_paths(convertible_paths, all_files_in_temp)
 
-    resumed_pages = len(workspace.manifest.get("completed_pages", {})) if workspace else 0
+    resumed_records = list(workspace.manifest.get("completed_pages", {}).values()) if workspace else []
+    resumed_pages = len(resumed_records)
     total_work_pages = resumed_pages + len(convertible_paths)
     image_workers, encoder_threads = plan_parallelism(THREADS, len(convertible_paths), ENCODER_THREADS)
     emit(
@@ -949,6 +1155,13 @@ def convert_images(temp_dir_path, cli_args, workspace=None, archive_path=None):
     
     total_saved = sum(r[0] for r in results)
     applied_count = resumed_pages + sum(1 for result in results if result[5])
+    lossless_pages = sum(
+        1 for page in resumed_records if "Lossless" in str(page.get("mode") or "")
+    ) + sum(1 for result in results if result[5] and "Lossless" in result[2])
+    lossy_pages = sum(
+        1 for page in resumed_records if "Lossy" in str(page.get("mode") or "")
+    ) + sum(1 for result in results if result[5] and "Lossy" in result[2])
+    retained_pages = sum(1 for result in results if not result[5])
     megapixels_list = [r[1] for r in results if r[1] > 0]
     modes_set = {r[2] for r in results if r[5] and r[2] != "N/A"}
     distances_set = {r[3] for r in results if r[5] and r[2] != "N/A"}
@@ -976,7 +1189,20 @@ def convert_images(temp_dir_path, cli_args, workspace=None, archive_path=None):
          final_conversion_mode = "N/A"
 
 
-    final_return = (total_saved, "", dominant_type, image_count, jpg_count, png_count, final_conversion_mode, megapixels_info)
+    final_return = (
+        total_saved,
+        "",
+        dominant_type,
+        image_count,
+        jpg_count,
+        png_count,
+        final_conversion_mode,
+        megapixels_info,
+        applied_count,
+        lossless_pages,
+        lossy_pages,
+        retained_pages,
+    )
     if applied_count == 0:
         return ConversionStatus.NO_CHANGE_NEEDED, *final_return
     if total_saved > 0:
@@ -989,28 +1215,28 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args, fingerprint=None):
     """Convert one archive through a resumable, verified, atomic pipeline."""
     start_time = time.monotonic()
     rel_path_str = os.path.relpath(cbz_path_obj, Path(cli_args.input_dir).resolve()).replace(os.sep, "/")
-    fingerprint = fingerprint or archive_fingerprint(cbz_path_obj)
-    option_key = options_fingerprint({
-        "no_convert": cli_args.no_convert,
-        "preserve_paths": True,
-        "smart_policy": "per-file-smaller-v2",
-        "distance": cli_args.distance,
-        "smart_distance": cli_args.smart_distance,
-        "smart_mb": cli_args.smart_mb,
-        "smart_mp": cli_args.smart_mp,
-        "effort": JXL_EFFORT,
-        "compatibility_mode": bool(getattr(cli_args, "compatibility_mode", False)),
-        "continue_on_page_error": bool(getattr(cli_args, "continue_on_page_error", False)),
-        "repair_action": getattr(cli_args, "repair_action", None),
-        "repair_entry": getattr(cli_args, "repair_entry", None),
-        "repair_source": getattr(cli_args, "repair_source", None),
-    })
-    workspace = ResumeWorkspace(RESUME_DIR, cbz_path_obj, fingerprint, option_key)
-    original_cbz_size = get_size(cbz_path_obj)
-    emit("archive_started", message=f"Preparing {rel_path_str}", archive=rel_path_str, stage="preparing", page=0, total_pages=0)
-    log(f"\n[bold]📦 Processing: {rel_path_str}[/bold]")
-
+    workspace = None
     try:
+        emit("archive_started", message=f"Preparing {rel_path_str}", archive=rel_path_str, stage="preparing", page=0, total_pages=0)
+        log(f"\n[bold]📦 Processing: {rel_path_str}[/bold]")
+        fingerprint = fingerprint or archive_fingerprint(cbz_path_obj)
+        option_key = options_fingerprint({
+            "no_convert": cli_args.no_convert,
+            "preserve_paths": True,
+            "smart_policy": "per-file-smaller-v2",
+            "distance": cli_args.distance,
+            "smart_distance": cli_args.smart_distance,
+            "smart_mb": cli_args.smart_mb,
+            "smart_mp": cli_args.smart_mp,
+            "effort": JXL_EFFORT,
+            "compatibility_mode": bool(getattr(cli_args, "compatibility_mode", False)),
+            "continue_on_page_error": bool(getattr(cli_args, "continue_on_page_error", False)),
+            "repair_action": getattr(cli_args, "repair_action", None),
+            "repair_entry": getattr(cli_args, "repair_entry", None),
+            "repair_source": getattr(cli_args, "repair_source", None),
+        })
+        workspace = ResumeWorkspace(RESUME_DIR, cbz_path_obj, fingerprint, option_key)
+        original_cbz_size = get_size(cbz_path_obj)
         CANCEL_TOKEN.check()
         if BACKUP_ENABLED:
             backup_path = cbz_path_obj.with_suffix(cbz_path_obj.suffix + ".bak")
@@ -1020,7 +1246,13 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args, fingerprint=None):
                 shutil.copy2(cbz_path_obj, backup_path)
 
         emit("heartbeat", archive=rel_path_str, stage="extracting")
-        resumed, resumed_pages = workspace.prepare(MAX_ARCHIVE_UNCOMPRESSED_BYTES, CANCEL_TOKEN)
+        repair_action = getattr(cli_args, "repair_action", None)
+        repair_entry = getattr(cli_args, "repair_entry", None)
+        resumed, resumed_pages = workspace.prepare(
+            MAX_ARCHIVE_UNCOMPRESSED_BYTES,
+            CANCEL_TOKEN,
+            recover_crc_entry=repair_entry if repair_action == "rebuild" else None,
+        )
         temp_dir_obj = workspace.files
         if resumed:
             emit(
@@ -1031,17 +1263,17 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args, fingerprint=None):
                 page=resumed_pages,
                 total_pages=resumed_pages,
             )
-        repair_action = getattr(cli_args, "repair_action", None)
-        repair_entry = getattr(cli_args, "repair_entry", None)
         repair_applied = False
-        if repair_action in {"replace", "delete"}:
+        if repair_action in {"replace", "delete", "rebuild"}:
             expected_repair = {"action": repair_action, "entry": repair_entry}
             if workspace.manifest.get("repair") != expected_repair:
                 workspace.set_stage("repairing")
                 if repair_action == "replace":
                     workspace.replace_entry(repair_entry, getattr(cli_args, "repair_source", None))
-                else:
+                elif repair_action == "delete":
                     workspace.delete_entry(repair_entry)
+                else:
+                    workspace.mark_repair("rebuild", repair_entry)
             repair_applied = True
             emit(
                 "repair_applied",
@@ -1055,13 +1287,51 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args, fingerprint=None):
         workspace.set_stage("encoding")
 
         conversion_saved_bytes = 0
-        status, saved_bytes, dominant_other, dominant_type, img_count, num_jpg, num_png, conv_mode, mp_info = (
-            ConversionStatus.NO_IMAGES_RECOGNIZED, 0, "", "N/A", 0, 0, 0, "N/A", "N/A"
+        (
+            status,
+            saved_bytes,
+            dominant_other,
+            dominant_type,
+            img_count,
+            num_jpg,
+            num_png,
+            conv_mode,
+            mp_info,
+            converted_pages,
+            lossless_pages,
+            lossy_pages,
+            retained_pages,
+        ) = (
+            ConversionStatus.NO_IMAGES_RECOGNIZED,
+            0,
+            "",
+            "N/A",
+            0,
+            0,
+            0,
+            "N/A",
+            "N/A",
+            0,
+            0,
+            0,
+            0,
         )
         if not cli_args.no_convert:
-            status, saved_bytes, dominant_other, dominant_type, img_count, num_jpg, num_png, conv_mode, mp_info = convert_images(
-                temp_dir_obj, cli_args, workspace, rel_path_str
-            )
+            (
+                status,
+                saved_bytes,
+                dominant_other,
+                dominant_type,
+                img_count,
+                num_jpg,
+                num_png,
+                conv_mode,
+                mp_info,
+                converted_pages,
+                lossless_pages,
+                lossy_pages,
+                retained_pages,
+            ) = convert_images(temp_dir_obj, cli_args, workspace, rel_path_str)
             conversion_saved_bytes = saved_bytes
             if status == ConversionStatus.NO_CONVERTIBLE_RECOGNIZED_IMAGES:
                 log(f"   ℹ️  Contains {dominant_other} image(s). No conversion needed.")
@@ -1084,6 +1354,10 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args, fingerprint=None):
             mark_processed(
                 conn_main, cbz_path_obj, rel_path_str, original_cbz_size, original_cbz_size, 0,
                 dominant_type, JXL_EFFORT, duration_value, img_count, num_jpg, num_png, conv_mode, mp_info, fingerprint,
+                converted_pages=converted_pages,
+                lossless_pages=lossless_pages,
+                lossy_pages=lossy_pages,
+                retained_pages=retained_pages,
             )
             workspace.complete()
             emit("archive_completed", message=f"No changes required for {rel_path_str}", archive=rel_path_str, stage="complete", bytes_saved=0)
@@ -1132,6 +1406,10 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args, fingerprint=None):
                         conn_main, cbz_path_obj, rel_path_str, original_cbz_size, original_cbz_size, 0,
                         dominant_type, JXL_EFFORT, duration_value, img_count, num_jpg, num_png,
                         "Original retained", mp_info, fingerprint,
+                        converted_pages=0,
+                        lossless_pages=0,
+                        lossy_pages=0,
+                        retained_pages=img_count,
                     )
                     workspace.complete()
                     emit(
@@ -1167,6 +1445,10 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args, fingerprint=None):
         mark_processed(
             conn_main, cbz_path_obj, rel_path_str, original_cbz_size, final_size, actual_saved_bytes,
             dominant_type, JXL_EFFORT, duration_value, img_count, num_jpg, num_png, conv_mode, mp_info, final_fingerprint,
+            converted_pages=converted_pages,
+            lossless_pages=lossless_pages,
+            lossy_pages=lossy_pages,
+            retained_pages=retained_pages,
         )
         workspace.complete()
         cleanup_repair_source(cli_args)
@@ -1186,62 +1468,59 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args, fingerprint=None):
     except Exception as error:
         duration_value = time.monotonic() - start_time
         log(f"[red]❌ Failed to process {rel_path_str}: {error}", level="error")
-        issue_kind = getattr(error, "kind", "archive_failed")
-        issue_stage = getattr(error, "stage", workspace.manifest.get("stage", "failed"))
-        if issue_kind == "archive_failed":
-            lowered_error = str(error).lower()
-            if isinstance(error, VerificationError):
-                issue_kind = "verification_failed"
-                issue_stage = "verifying"
-            elif isinstance(error, zipfile.BadZipFile):
-                issue_kind = "archive_corrupt"
-                issue_stage = "extracting"
-            elif isinstance(error, PermissionError):
-                issue_kind = "permission_denied"
-            elif isinstance(error, FileNotFoundError):
-                issue_kind = "file_missing"
-            elif "unsafe archive path" in lowered_error or "symlinks are not allowed" in lowered_error:
-                issue_kind = "unsafe_archive_path"
-                issue_stage = "extracting"
-            elif "cannot preserve filename" in lowered_error or "duplicate archive path" in lowered_error:
-                issue_kind = "filename_collision"
-                issue_stage = "preparing"
-        issue_entry = getattr(error, "entry_path", None)
-        issue_detail = getattr(error, "detail", None)
-        emit(
-            "archive_failed",
-            level="error",
-            message=str(error),
-            archive=rel_path_str,
-            stage=issue_stage,
-            issue_kind=issue_kind,
-            entry_path=issue_entry,
-            detail=issue_detail,
+        record_archive_failure(
+            conn_main,
+            conn_fail,
+            cbz_path_obj,
+            rel_path_str,
+            error,
+            duration_value,
+            workspace,
         )
-        if conn_fail:
-            mark_failed(
-                conn_fail,
-                cbz_path_obj,
-                rel_path_str,
-                duration_value,
-                str(error),
-                issue_kind=issue_kind,
-                issue_stage=issue_stage,
-                issue_entry=issue_entry,
-                issue_detail=issue_detail,
+        return 0, False, False, "failed"
+
+
+def attempt_archive(cbz_path, resolved_input_dir, processed_paths, conn, fail_conn, args):
+    """Attempt one scoped archive and always return an outcome unless cancelled."""
+    started_at = time.monotonic()
+    try:
+        rel_path_for_db = os.path.relpath(cbz_path, resolved_input_dir).replace(os.sep, "/")
+    except (OSError, ValueError):
+        rel_path_for_db = Path(cbz_path).name
+
+    try:
+        processed_row = processed_paths.get(rel_path_for_db)
+        try:
+            fingerprint = archive_fingerprint(cbz_path)
+        except (OSError, zipfile.BadZipFile):
+            fingerprint = None
+        if processed_row and archive_is_current(cbz_path, processed_row, fingerprint):
+            emit(
+                "archive_completed",
+                message=f"Skipped unchanged archive {rel_path_for_db}",
+                archive=rel_path_for_db,
+                stage="skipped",
             )
-        if conn_main:
-            mark_failed(
-                conn_main,
-                cbz_path_obj,
-                rel_path_str,
-                duration_value,
-                str(error),
-                issue_kind=issue_kind,
-                issue_stage=issue_stage,
-                issue_entry=issue_entry,
-                issue_detail=issue_detail,
-            )
+            log(f"[yellow]⚠️ Skipping already processed archive: {rel_path_for_db}", msg_type="skipped")
+            return 0, False, False, "skipped"
+
+        return process_cbz(cbz_path, conn, fail_conn, args, fingerprint)
+    except ConversionCancelled:
+        raise
+    except Exception as error:
+        duration_value = time.monotonic() - started_at
+        log(
+            f"[red]❌ Unexpected archive failure for {rel_path_for_db}; continuing with the next archive: {error}",
+            level="error",
+        )
+        record_archive_failure(
+            conn,
+            fail_conn,
+            cbz_path,
+            rel_path_for_db,
+            error,
+            duration_value,
+        )
         return 0, False, False, "failed"
 
 
@@ -1261,7 +1540,7 @@ def main():
     action_group.add_argument("--only-path", help=argparse.SUPPRESS)
     action_group.add_argument("--compatibility-mode", action="store_true", help=argparse.SUPPRESS)
     action_group.add_argument("--continue-on-page-error", action="store_true", help=argparse.SUPPRESS)
-    action_group.add_argument("--repair-action", choices=("replace", "delete"), help=argparse.SUPPRESS)
+    action_group.add_argument("--repair-action", choices=("replace", "delete", "rebuild"), help=argparse.SUPPRESS)
     action_group.add_argument("--repair-entry", help=argparse.SUPPRESS)
     action_group.add_argument("--repair-source", help=argparse.SUPPRESS)
 
@@ -1385,24 +1664,17 @@ def main():
 
             for cbz_path in cbz_files_path_obj_list:
                 CANCEL_TOKEN.check()
-                rel_path_for_db = os.path.relpath(cbz_path, resolved_input_dir).replace(os.sep, "/")
-                processed_row = processed_paths.get(rel_path_for_db)
-                try:
-                    fingerprint = archive_fingerprint(cbz_path)
-                except (OSError, zipfile.BadZipFile):
-                    fingerprint = None
-                if processed_row and archive_is_current(cbz_path, processed_row, fingerprint):
-                    skipped_count += 1
-                    emit("archive_completed", message=f"Skipped unchanged archive {rel_path_for_db}", archive=rel_path_for_db, stage="skipped")
-                    log(f"[yellow]⚠️ Skipping already processed archive: {rel_path_for_db}", msg_type="skipped")
-                    update_run_progress(conn, processed_count, skipped_count, failed_to_process_count, flattened_archives_count, deleted_empty_archives_count, total_bytes_saved_overall, total_bytes_increased_overall, total_bytes_saved_overall - total_bytes_increased_overall)
-                    progress_bar.update(task_id, advance=1)
-                    continue
-
-                bytes_saved, was_flattened, was_deleted, outcome = process_cbz(
-                    cbz_path, conn, fail_conn, args, fingerprint
+                bytes_saved, was_flattened, was_deleted, outcome = attempt_archive(
+                    cbz_path,
+                    resolved_input_dir,
+                    processed_paths,
+                    conn,
+                    fail_conn,
+                    args,
                 )
-                if outcome == "failed":
+                if outcome == "skipped":
+                    skipped_count += 1
+                elif outcome == "failed":
                     failed_to_process_count += 1
                 elif was_deleted:
                     deleted_empty_archives_count += 1

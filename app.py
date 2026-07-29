@@ -10,6 +10,7 @@ import uuid
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
+from statistics import median
 from typing import Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -36,13 +37,14 @@ from cbzxl_web.database import (
     utc_now,
 )
 from cbzxl_web.legacy import import_legacy, inspect_legacy
+from cbzxl_web.engine import VerificationError, crc32_hex, recover_zip_entry_bytes
 
 
 ROOT = Path(__file__).parent
 FRONTEND_DIST = ROOT / "frontend" / "dist"
 LEGACY_STATIC = ROOT / "static"
 
-VERSION = "3.3.1"
+VERSION = "4.0.0"
 LOGGER = logging.getLogger("cbzxl.web")
 DATABASE_STARTUP_ERROR: str | None = None
 
@@ -67,7 +69,7 @@ class ScanOptions(BaseModel):
     compatibility_mode: bool = False
     continue_on_page_error: bool = False
     only_path: Optional[str] = None
-    repair_action: Optional[Literal["replace", "delete"]] = None
+    repair_action: Optional[Literal["replace", "delete", "rebuild"]] = None
     repair_entry: Optional[str] = None
     repair_source: Optional[str] = None
 
@@ -115,7 +117,7 @@ class ReviewPayload(BaseModel):
 
 
 class IssueActionPayload(BaseModel):
-    action: Literal["retry", "dismiss", "compatibility", "preserve", "delete", "lossless"]
+    action: Literal["retry", "dismiss", "compatibility", "preserve", "delete", "lossless", "rebuild"]
 
 
 class ProfilePayload(BaseModel):
@@ -196,6 +198,13 @@ def hydrate_schedule(schedule):
     return schedule
 
 
+def hydrate_profile(profile):
+    if profile:
+        profile["is_default"] = bool(profile.get("is_default"))
+        profile["options"] = parse_json(profile.pop("options_json", None))
+    return profile
+
+
 @app.get("/api/bootstrap")
 def bootstrap():
     global DATABASE_STARTUP_ERROR
@@ -217,12 +226,9 @@ def bootstrap():
             "database_error": str(exc),
             "timezone": os.getenv("TZ", "UTC"),
         }
-    for profile in profiles:
-        profile["is_default"] = bool(profile["is_default"])
-        profile["options"] = parse_json(profile.pop("options_json"))
     return {
         "libraries": libraries,
-        "profiles": profiles,
+        "profiles": [hydrate_profile(profile) for profile in profiles],
         "schedules": [hydrate_schedule(row) for row in schedules],
         "database_path": str(DB_PATH),
         "database_status": "ok",
@@ -253,28 +259,6 @@ def dashboard():
                 """
             ).fetchone()
         )
-        outcomes = rows_dict(
-            conn.execute("SELECT status, COUNT(*) AS count FROM archives GROUP BY status ORDER BY count DESC").fetchall()
-        )
-        formats = rows_dict(
-            conn.execute(
-                """
-                SELECT COALESCE(NULLIF(dominant_type, ''), 'Unknown') AS label, COUNT(*) AS count
-                FROM archives WHERE status='processed'
-                GROUP BY label ORDER BY count DESC LIMIT 8
-                """
-            ).fetchall()
-        )
-        runs = rows_dict(
-            conn.execute(
-                """
-                SELECT id, source, status, queued_at, started_at, finished_at, archives_found,
-                       processed, skipped, failed, bytes_saved, bytes_increased, net_bytes_saved
-                FROM jobs WHERE status NOT IN ('queued', 'running', 'stopping')
-                ORDER BY COALESCE(finished_at, queued_at) DESC LIMIT 20
-                """
-            ).fetchall()
-        )
         active = rows_dict(
             conn.execute(
                 "SELECT * FROM jobs WHERE status IN ('queued', 'running', 'stopping') ORDER BY queued_at"
@@ -289,24 +273,13 @@ def dashboard():
             conn.execute(
                 """
                 SELECT
-                    COUNT(*) AS total,
+                    SUM(CASE WHEN ai.kind!='archive_grew' THEN 1 ELSE 0 END) AS total,
                     SUM(CASE WHEN ai.kind='archive_grew' THEN 1 ELSE 0 END) AS grew,
                     SUM(CASE WHEN ai.kind!='archive_grew' THEN 1 ELSE 0 END) AS failed
                 FROM archive_issues ai
                 WHERE ai.status IN ('open', 'queued')
                 """
             ).fetchone()
-        )
-    run_trend = []
-    for row in reversed(runs):
-        run_trend.append(
-            {
-                "id": row["id"],
-                "date": row.get("finished_at") or row.get("queued_at"),
-                "saved_gb": gb(row.get("bytes_saved")),
-                "increased_gb": gb(row.get("bytes_increased")),
-                "net_gb": gb(row.get("net_bytes_saved")),
-            }
         )
     return {
         "totals": {
@@ -326,11 +299,319 @@ def dashboard():
             "failed": review.get("failed") or 0,
             "grew": review.get("grew") or 0,
         },
-        "outcomes": outcomes,
-        "formats": formats,
-        "run_trend": run_trend,
         "active_jobs": [hydrate_job(row) for row in active],
         "recent_jobs": [hydrate_job(row) for row in recent],
+    }
+
+
+@app.get("/api/statistics")
+def detailed_statistics():
+    """Lifetime reporting loaded only when the Overview disclosure is opened."""
+    initialize()
+    with connect() as conn:
+        totals = row_dict(
+            conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS archive_count,
+                    SUM(CASE WHEN status='processed' THEN 1 ELSE 0 END) AS optimized_count,
+                    SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed_count,
+                    COALESCE(SUM(original_size), 0) AS source_bytes,
+                    COALESCE(SUM(COALESCE(final_size, original_size)), 0) AS current_bytes,
+                    COALESCE(SUM(CASE WHEN status='processed' THEN image_count ELSE 0 END), 0) AS page_count,
+                    COALESCE(SUM(CASE
+                        WHEN status='processed' AND converted_pages > 0 THEN converted_pages
+                        WHEN status='processed' AND bytes_saved > 0 THEN image_count
+                        ELSE 0 END), 0) AS converted_pages,
+                    COALESCE(SUM(CASE
+                        WHEN status='processed' AND lossless_pages > 0 THEN lossless_pages
+                        WHEN status='processed' AND bytes_saved > 0
+                             AND LOWER(COALESCE(conversion_mode, '')) LIKE '%lossless%'
+                        THEN image_count ELSE 0 END), 0) AS lossless_pages,
+                    COALESCE(SUM(CASE
+                        WHEN status='processed' AND lossy_pages > 0 THEN lossy_pages
+                        WHEN status='processed' AND bytes_saved > 0
+                             AND LOWER(COALESCE(conversion_mode, '')) LIKE '%lossy%'
+                        THEN image_count ELSE 0 END), 0) AS lossy_pages,
+                    COALESCE(SUM(CASE
+                        WHEN status='processed' AND retained_pages > 0 THEN retained_pages
+                        WHEN status='processed' AND bytes_saved = 0 THEN image_count
+                        ELSE 0 END), 0) AS retained_pages,
+                    COALESCE(AVG(CASE
+                        WHEN status='processed' AND original_size > 0 THEN percent_saved END), 0
+                    ) AS average_percent_saved,
+                    COALESCE(SUM(CASE WHEN status='processed' THEN bytes_saved ELSE 0 END), 0) AS net_bytes
+                FROM archives
+                """
+            ).fetchone()
+        )
+        format_rows = rows_dict(
+            conn.execute(
+                """
+                SELECT
+                    COALESCE(NULLIF(dominant_type, ''), 'Unknown') AS label,
+                    COUNT(*) AS archives,
+                    COALESCE(SUM(image_count), 0) AS pages,
+                    COALESCE(SUM(original_size), 0) AS source_bytes,
+                    COALESCE(SUM(bytes_saved), 0) AS net_bytes,
+                    COALESCE(AVG(CASE WHEN original_size > 0 THEN percent_saved END), 0) AS average_percent_saved
+                FROM archives
+                WHERE status='processed'
+                GROUP BY label
+                ORDER BY net_bytes DESC
+                LIMIT 8
+                """
+            ).fetchall()
+        )
+        saving_values = [
+            float(row[0])
+            for row in conn.execute(
+                """
+                SELECT percent_saved FROM archives
+                WHERE status='processed' AND percent_saved IS NOT NULL
+                ORDER BY percent_saved
+                """
+            ).fetchall()
+        ]
+        duration_values = [
+            float(row[0])
+            for row in conn.execute(
+                """
+                SELECT processing_duration_seconds FROM archives
+                WHERE status='processed' AND processing_duration_seconds IS NOT NULL
+                  AND processing_duration_seconds >= 0
+                ORDER BY processing_duration_seconds
+                """
+            ).fetchall()
+        ]
+        policy_rows = rows_dict(
+            conn.execute(
+                """
+                SELECT
+                    COALESCE(p.name, 'Deleted policy') AS policy,
+                    ar.status,
+                    ar.processing_duration_seconds,
+                    ar.percent_saved
+                FROM archive_results ar
+                JOIN jobs j ON j.id=ar.job_id
+                LEFT JOIN conversion_profiles p ON p.id=j.profile_id
+                """
+            ).fetchall()
+        )
+        run_rows = rows_dict(
+            conn.execute(
+                """
+                SELECT
+                    j.id,
+                    COALESCE(j.finished_at, j.queued_at) AS date,
+                    j.net_bytes_saved,
+                    j.status,
+                    COUNT(ar.id) AS result_count,
+                    AVG(CASE WHEN ar.status='processed' THEN ar.percent_saved END) AS average_percent_saved
+                FROM jobs j
+                LEFT JOIN archive_results ar ON ar.job_id=j.id
+                WHERE j.status NOT IN ('queued', 'running', 'stopping')
+                GROUP BY j.id
+                ORDER BY COALESCE(j.finished_at, j.queued_at), j.id
+                """
+            ).fetchall()
+        )
+        effort = row_dict(
+            conn.execute(
+                """
+                SELECT
+                    COUNT(DISTINCT CASE
+                        WHEN j.status NOT IN ('queued', 'running', 'stopping') THEN j.id END
+                    ) AS completed_runs,
+                    COUNT(ar.id) AS archives_attempted,
+                    COALESCE(SUM(ar.image_count), 0) AS pages_examined,
+                    COALESCE(SUM(ar.processing_duration_seconds), 0) AS encoder_seconds
+                FROM jobs j
+                LEFT JOIN archive_results ar ON ar.job_id=j.id
+                """
+            ).fetchone()
+        )
+        issue_counts = rows_dict(
+            conn.execute(
+                """
+                SELECT kind, stage, COUNT(*) AS count
+                FROM archive_issues
+                WHERE status IN ('open', 'queued') AND kind!='archive_grew'
+                GROUP BY kind, stage
+                """
+            ).fetchall()
+        )
+
+    archive_count = int(totals.get("archive_count") or 0)
+    optimized_count = int(totals.get("optimized_count") or 0)
+    failed_count = int(totals.get("failed_count") or 0)
+    page_count = int(totals.get("page_count") or 0)
+    converted_pages = int(totals.get("converted_pages") or 0)
+    lossless_pages = int(totals.get("lossless_pages") or 0)
+    lossy_pages = int(totals.get("lossy_pages") or 0)
+    retained_pages = int(totals.get("retained_pages") or 0)
+    skipped_pages = max(0, page_count - converted_pages - retained_pages)
+
+    def histogram(values, definitions):
+        return [
+            {
+                "label": label_text,
+                "count": sum(1 for value in values if lower(value) and upper(value)),
+            }
+            for label_text, lower, upper in definitions
+        ]
+
+    savings_distribution = histogram(
+        saving_values,
+        [
+            ("<0%", lambda value: value < 0, lambda _value: True),
+            ("0–10%", lambda value: value >= 0, lambda value: value < 10),
+            ("10–20%", lambda value: value >= 10, lambda value: value < 20),
+            ("20–30%", lambda value: value >= 20, lambda value: value < 30),
+            ("30–40%", lambda value: value >= 30, lambda value: value < 40),
+            ("40–50%", lambda value: value >= 40, lambda value: value < 50),
+            ("50%+", lambda value: value >= 50, lambda _value: True),
+        ],
+    )
+    duration_distribution = histogram(
+        duration_values,
+        [
+            ("<30s", lambda value: value < 30, lambda _value: True),
+            ("30–60s", lambda value: value >= 30, lambda value: value < 60),
+            ("1–2m", lambda value: value >= 60, lambda value: value < 120),
+            ("2–5m", lambda value: value >= 120, lambda value: value < 300),
+            ("5–10m", lambda value: value >= 300, lambda value: value < 600),
+            ("10m+", lambda value: value >= 600, lambda _value: True),
+        ],
+    )
+
+    policies = {}
+    for row in policy_rows:
+        bucket = policies.setdefault(
+            row["policy"],
+            {"attempted": 0, "processed": 0, "durations": [], "savings": []},
+        )
+        bucket["attempted"] += 1
+        if row.get("status") == "processed":
+            bucket["processed"] += 1
+            if row.get("processing_duration_seconds") is not None:
+                bucket["durations"].append(float(row["processing_duration_seconds"]))
+            if row.get("percent_saved") is not None:
+                bucket["savings"].append(float(row["percent_saved"]))
+    policy_efficiency = []
+    for name, values in policies.items():
+        attempted = values["attempted"]
+        policy_efficiency.append(
+            {
+                "name": name,
+                "median_seconds": round(median(values["durations"]), 1) if values["durations"] else 0,
+                "average_percent_saved": round(
+                    sum(values["savings"]) / len(values["savings"]), 1
+                ) if values["savings"] else 0,
+                "success_percent": round(values["processed"] / attempted * 100, 1) if attempted else 0,
+                "attempted": attempted,
+            }
+        )
+    policy_efficiency.sort(key=lambda item: (-item["attempted"], item["name"]))
+
+    cumulative_bytes = 0
+    run_trend = []
+    for row in run_rows:
+        cumulative_bytes += int(row.get("net_bytes_saved") or 0)
+        run_trend.append(
+            {
+                "id": row["id"],
+                "date": row["date"],
+                "cumulative_net_gb": gb(cumulative_bytes),
+                "average_percent_saved": round(row.get("average_percent_saved") or 0, 1),
+                "status": row["status"],
+                "result_count": int(row.get("result_count") or 0),
+            }
+        )
+
+    attention_groups = {}
+    for row in issue_counts:
+        descriptor = issue_group(row)
+        group = attention_groups.setdefault(
+            descriptor["id"],
+            {**descriptor, "count": 0},
+        )
+        group["count"] += int(row.get("count") or 0)
+
+    middle_range = [0.0, 0.0]
+    if saving_values:
+        lower_index = round((len(saving_values) - 1) * 0.25)
+        upper_index = round((len(saving_values) - 1) * 0.75)
+        middle_range = [round(saving_values[lower_index], 1), round(saving_values[upper_index], 1)]
+
+    return {
+        "health": {
+            "library_coverage_percent": round(optimized_count / archive_count * 100, 1) if archive_count else 0,
+            "average_percent_saved": round(totals.get("average_percent_saved") or 0, 1),
+            "retained_pages": retained_pages,
+            "success_percent": round(
+                optimized_count / (optimized_count + failed_count) * 100,
+                1,
+            ) if optimized_count + failed_count else 0,
+        },
+        "library": {
+            "archives": archive_count,
+            "optimized_archives": optimized_count,
+            "pages": page_count,
+            "source_bytes": int(totals.get("source_bytes") or 0),
+            "current_bytes": int(totals.get("current_bytes") or 0),
+            "jxl_coverage_percent": round(converted_pages / page_count * 100, 1) if page_count else 0,
+            "net_bytes": int(totals.get("net_bytes") or 0),
+        },
+        "formats": [
+            {
+                **row,
+                "average_percent_saved": round(row.get("average_percent_saved") or 0, 1),
+                "source_bytes": int(row.get("source_bytes") or 0),
+                "net_bytes": int(row.get("net_bytes") or 0),
+            }
+            for row in format_rows
+        ],
+        "outcomes": [
+            {"label": "Lossless JXL", "count": lossless_pages},
+            {"label": "Smart lossy", "count": lossy_pages},
+            {"label": "Original retained", "count": retained_pages},
+            {"label": "Already JXL or skipped", "count": skipped_pages},
+            {
+                "label": "Failed",
+                "count": sum(
+                    int(row.get("count") or 0)
+                    for row in issue_counts
+                    if row.get("kind") != "archive_grew"
+                ),
+            },
+        ],
+        "savings_distribution": savings_distribution,
+        "savings_summary": {
+            "median": round(median(saving_values), 1) if saving_values else 0,
+            "average": round(sum(saving_values) / len(saving_values), 1) if saving_values else 0,
+            "middle_50": middle_range,
+        },
+        "processing": {
+            "median_seconds": round(median(duration_values), 1) if duration_values else 0,
+            "p90_seconds": round(
+                duration_values[round((len(duration_values) - 1) * 0.9)],
+                1,
+            ) if duration_values else 0,
+            "distribution": duration_distribution,
+            "policies": policy_efficiency,
+        },
+        "attention": sorted(
+            attention_groups.values(),
+            key=lambda item: (-int(item["count"]), str(item["label"])),
+        ),
+        "effort": {
+            "completed_runs": int(effort.get("completed_runs") or 0),
+            "archives_attempted": int(effort.get("archives_attempted") or 0),
+            "pages_examined": int(effort.get("pages_examined") or 0),
+            "encoder_hours": round((effort.get("encoder_seconds") or 0) / 3600, 1),
+        },
+        "run_trend": run_trend,
     }
 
 
@@ -445,11 +726,110 @@ def remedies_for_issue(issue):
     kind = issue.get("kind") or "archive_failed"
     if kind == "archive_grew":
         return ["lossless", "dismiss"]
+    if kind == "crc_mismatch":
+        return ["rebuild", "replace", "delete", "dismiss"]
     if issue.get("entry_path"):
         return ["compatibility", "preserve", "replace", "delete"]
     if kind in {"unsafe_archive_path", "filename_collision"}:
         return ["dismiss"]
     return ["compatibility", "preserve", "retry", "dismiss"]
+
+
+ISSUE_GROUPS = {
+    "crc": {
+        "label": "CRC-32 failures",
+        "triage": "Inspect repairability",
+        "recommended": "Inspect the failing entry, then rebuild, replace or explicitly delete it",
+        "kinds": {"crc_mismatch"},
+    },
+    "images": {
+        "label": "Image processing failures",
+        "triage": "Needs your decision",
+        "recommended": "Preserve, replace or explicitly delete the affected image",
+        "kinds": {
+            "page_encode_failed",
+            "page_conversion_error",
+            "image_corrupt",
+            "unsupported_image",
+        },
+    },
+    "unreadable": {
+        "label": "Unreadable archives",
+        "triage": "Needs your decision",
+        "recommended": "Inspect the source archive before retrying",
+        "kinds": {"archive_corrupt"},
+    },
+    "verification": {
+        "label": "Candidate verification failures",
+        "triage": "Retryable",
+        "recommended": "Retry with compatibility or lossless-only verification",
+        "kinds": {"verification_failed"},
+    },
+    "paths": {
+        "label": "Unsafe archive paths",
+        "triage": "Needs your decision",
+        "recommended": "Correct the source archive outside CBZXL",
+        "kinds": {"unsafe_archive_path"},
+    },
+    "collisions": {
+        "label": "Filename collisions",
+        "triage": "Needs your decision",
+        "recommended": "Correct duplicate paths without automatic renaming",
+        "kinds": {"filename_collision"},
+    },
+    "permissions": {
+        "label": "Write or permission failures",
+        "triage": "System problem",
+        "recommended": "Restore library access, then retry the affected archives",
+        "kinds": {"permission_denied"},
+    },
+    "missing": {
+        "label": "Missing source archives",
+        "triage": "System problem",
+        "recommended": "Restore or rescan the missing source path",
+        "kinds": {"file_missing"},
+    },
+    "dependency": {
+        "label": "Missing conversion dependency",
+        "triage": "System problem",
+        "recommended": "Restore the encoder or image utility before retrying",
+        "kinds": {"encoder_unavailable"},
+    },
+    "conversion": {
+        "label": "Archive conversion failures",
+        "triage": "Retryable",
+        "recommended": "Retry normally or in compatibility mode",
+        "kinds": {"archive_failed"},
+    },
+}
+
+
+def issue_group(issue):
+    kind = issue.get("kind") or "archive_failed"
+    for group_id, group in ISSUE_GROUPS.items():
+        if kind in group["kinds"]:
+            return {"id": group_id, **{key: value for key, value in group.items() if key != "kinds"}}
+    return {
+        "id": "other",
+        "label": "Other conversion failures",
+        "triage": "Inspect",
+        "recommended": "Inspect the diagnostic detail before choosing a remedy",
+    }
+
+
+def issue_group_where(group_id):
+    if not group_id:
+        return "", []
+    group = ISSUE_GROUPS.get(group_id)
+    if group:
+        kinds = sorted(group["kinds"])
+        placeholders = ",".join("?" for _ in kinds)
+        return f" AND ai.kind IN ({placeholders})", kinds
+    if group_id == "other":
+        known = sorted({kind for group in ISSUE_GROUPS.values() for kind in group["kinds"]})
+        placeholders = ",".join("?" for _ in known)
+        return f" AND ai.kind NOT IN ({placeholders}, 'archive_grew')", known
+    raise HTTPException(404, "Failure type not found")
 
 
 def queue_issue_job(conn, issue, action, overrides=None):
@@ -512,11 +892,15 @@ def queue_issue_job(conn, issue, action, overrides=None):
 
 
 @app.get("/api/issues")
-def list_issues(limit: int = Query(100, ge=1, le=500)):
+def list_issues(
+    limit: int = Query(100, ge=1, le=500),
+    group: Optional[str] = None,
+):
+    group_clause, group_params = issue_group_where(group)
     with connect() as conn:
         rows = rows_dict(
             conn.execute(
-                """
+                f"""
                 SELECT
                     ai.*,
                     a.path,
@@ -530,21 +914,57 @@ def list_issues(limit: int = Query(100, ge=1, le=500)):
                 FROM archive_issues ai
                 JOIN archives a ON a.id=ai.archive_id
                 WHERE ai.status IN ('open', 'queued')
+                  AND ai.kind!='archive_grew'
+                  {group_clause}
                 ORDER BY
                     CASE ai.status WHEN 'open' THEN 0 ELSE 1 END,
                     ai.updated_at DESC
                 LIMIT ?
                 """,
-                (limit,),
+                (*group_params, limit),
             ).fetchall()
         )
         total = conn.execute(
-            "SELECT COUNT(*) FROM archive_issues WHERE status IN ('open', 'queued')"
+            """
+            SELECT COUNT(*) FROM archive_issues
+            WHERE status IN ('open', 'queued') AND kind!='archive_grew'
+            """
         ).fetchone()[0]
+        kind_counts = rows_dict(
+            conn.execute(
+                """
+                SELECT kind, stage, COUNT(*) AS count
+                FROM archive_issues
+                WHERE status IN ('open', 'queued') AND kind!='archive_grew'
+                GROUP BY kind, stage
+                """
+            ).fetchall()
+        )
     for row in rows:
         row["remedies"] = remedies_for_issue(row)
         row["preview_url"] = f"/api/issues/{row['id']}/preview" if row.get("entry_path") else None
-    return {"rows": rows, "total": total}
+        row["group"] = issue_group(row)
+        row["diagnostics_url"] = (
+            f"/api/issues/{row['id']}/diagnostics"
+            if row.get("kind") == "crc_mismatch"
+            else None
+        )
+    groups = {}
+    for count_row in kind_counts:
+        descriptor = issue_group(count_row)
+        current = groups.setdefault(
+            descriptor["id"],
+            {
+                **descriptor,
+                "count": 0,
+            },
+        )
+        current["count"] += int(count_row.get("count") or 0)
+    ordered_groups = sorted(
+        groups.values(),
+        key=lambda item: (-int(item["count"]), str(item["label"])),
+    )
+    return {"rows": rows, "groups": ordered_groups, "total": total}
 
 
 @app.post("/api/issues/{issue_id}/action", status_code=201)
@@ -602,6 +1022,21 @@ def act_on_issue(issue_id: int, payload: IssueActionPayload):
                     "repair_entry": issue["entry_path"],
                 }
             )
+        elif payload.action == "rebuild":
+            if issue.get("kind") != "crc_mismatch" or not issue.get("entry_path"):
+                raise HTTPException(409, "Only an inspected CRC failure can be rebuilt")
+            diagnostics = crc_issue_diagnostics(issue)
+            if not diagnostics.get("repairable"):
+                raise HTTPException(
+                    409,
+                    "The damaged entry could not be recovered and decoded safely",
+                )
+            overrides.update(
+                {
+                    "repair_action": "rebuild",
+                    "repair_entry": issue["entry_path"],
+                }
+            )
         job_id = queue_issue_job(conn, issue, payload.action, overrides)
     return {"status": "queued", "job_id": job_id}
 
@@ -626,6 +1061,83 @@ def cleanup_files(*paths):
             Path(path).unlink(missing_ok=True)
 
 
+def crc_issue_diagnostics(issue):
+    archive_path, entry_path = safe_issue_paths(issue)
+    if not archive_path.is_file():
+        raise HTTPException(404, "Archive is no longer present")
+    try:
+        with zipfile.ZipFile(archive_path, "r") as archive:
+            info = archive.getinfo(entry_path)
+            recovered = recover_zip_entry_bytes(
+                archive_path,
+                info,
+                max_bytes=100 * 1024 * 1024,
+            )
+    except KeyError as exc:
+        raise HTTPException(404, "The failing entry is no longer in the archive") from exc
+    except (zipfile.BadZipFile, OSError, VerificationError) as exc:
+        return {
+            "entry_path": entry_path,
+            "expected_crc32": None,
+            "calculated_crc32": None,
+            "recovered_bytes": 0,
+            "image_readable": False,
+            "repairable": False,
+            "detail": str(exc),
+        }
+
+    handle, recovered_path = tempfile.mkstemp(
+        prefix="cbzxl-crc-diagnostic-",
+        suffix=PurePosixPath(entry_path).suffix or ".image",
+    )
+    os.close(handle)
+    Path(recovered_path).write_bytes(recovered)
+    try:
+        check = subprocess.run(
+            ["identify", "-format", "%m %w %h", recovered_path],
+            capture_output=True,
+            text=True,
+            timeout=45,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        check = None
+        check_detail = str(exc)
+    else:
+        check_detail = check.stderr.strip()
+    finally:
+        Path(recovered_path).unlink(missing_ok=True)
+
+    image_readable = bool(check and check.returncode == 0)
+    calculated = crc32_hex(recovered)
+    expected = f"{info.CRC:08X}"
+    return {
+        "entry_path": entry_path,
+        "expected_crc32": expected,
+        "calculated_crc32": calculated,
+        "recovered_bytes": len(recovered),
+        "image_readable": image_readable,
+        "image": check.stdout.strip() if image_readable else None,
+        "repairable": image_readable and calculated != expected,
+        "detail": (
+            "Recovered bytes decode correctly; the archive can be rebuilt"
+            if image_readable and calculated != expected
+            else check_detail or "Recovered bytes do not decode as an image"
+        ),
+    }
+
+
+@app.get("/api/issues/{issue_id}/diagnostics")
+def issue_diagnostics(issue_id: int):
+    with connect() as conn:
+        issue = issue_row(conn, issue_id)
+    if not issue:
+        raise HTTPException(404, "Issue not found")
+    if issue.get("kind") != "crc_mismatch":
+        raise HTTPException(409, "CRC diagnostics are not available for this failure")
+    return crc_issue_diagnostics(issue)
+
+
 @app.get("/api/issues/{issue_id}/preview")
 def preview_issue_image(issue_id: int):
     with connect() as conn:
@@ -645,8 +1157,19 @@ def preview_issue_image(issue_id: int):
             suffix = PurePosixPath(entry_path).suffix or ".image"
             handle, extracted_path = tempfile.mkstemp(prefix="cbzxl-preview-", suffix=suffix)
             os.close(handle)
-            with archive.open(info) as source, open(extracted_path, "wb") as target:
-                shutil.copyfileobj(source, target, length=1024 * 1024)
+            try:
+                with archive.open(info) as source, open(extracted_path, "wb") as target:
+                    shutil.copyfileobj(source, target, length=1024 * 1024)
+            except zipfile.BadZipFile:
+                if issue.get("kind") != "crc_mismatch":
+                    raise
+                Path(extracted_path).write_bytes(
+                    recover_zip_entry_bytes(
+                        archive_path,
+                        info,
+                        max_bytes=64 * 1024 * 1024,
+                    )
+                )
 
         browser_suffixes = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif"}
         suffix = Path(extracted_path).suffix.lower()
@@ -885,7 +1408,53 @@ def create_profile(payload: ProfilePayload):
             )
     except sqlite3.IntegrityError as exc:
         raise HTTPException(409, "A profile with that name already exists") from exc
-    return {"id": profile_id}
+    with connect() as conn:
+        saved = row_dict(conn.execute("SELECT * FROM conversion_profiles WHERE id=?", (profile_id,)).fetchone())
+    return hydrate_profile(saved)
+
+
+@app.put("/api/profiles/{profile_id}")
+def update_profile(profile_id: str, payload: ProfilePayload):
+    now = utc_now()
+    try:
+        with transaction(immediate=True) as conn:
+            existing = row_dict(
+                conn.execute(
+                    "SELECT * FROM conversion_profiles WHERE id=?",
+                    (profile_id,),
+                ).fetchone()
+            )
+            if not existing:
+                raise HTTPException(404, "Conversion policy not found")
+            if existing.get("is_default") and not payload.is_default:
+                raise HTTPException(
+                    409,
+                    "Choose another policy as the default before removing this default",
+                )
+            if payload.is_default:
+                conn.execute(
+                    "UPDATE conversion_profiles SET is_default=0 WHERE id!=?",
+                    (profile_id,),
+                )
+            conn.execute(
+                """
+                UPDATE conversion_profiles
+                SET name=?, is_default=?, options_json=?, updated_at=?
+                WHERE id=?
+                """,
+                (
+                    payload.name,
+                    int(payload.is_default),
+                    json.dumps(payload.options.model_dump(), sort_keys=True),
+                    now,
+                    profile_id,
+                ),
+            )
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(409, "A profile with that name already exists") from exc
+    with connect() as conn:
+        saved = row_dict(conn.execute("SELECT * FROM conversion_profiles WHERE id=?", (profile_id,)).fetchone())
+    return hydrate_profile(saved)
 
 
 @app.get("/api/database/export")
@@ -940,7 +1509,7 @@ def homepage_widget():
             attention_count = conn.execute(
                 """
                 SELECT COUNT(*) FROM archive_issues
-                WHERE status IN ('open', 'queued')
+                WHERE status IN ('open', 'queued') AND kind!='archive_grew'
                 """
             ).fetchone()[0]
             active = row_dict(

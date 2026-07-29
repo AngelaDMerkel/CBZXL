@@ -34,6 +34,14 @@ function formatGb(value?: number | null) {
   return formatBytes(Number(value || 0) * 1024 ** 3);
 }
 
+function compactNumber(value?: number | null) {
+  const number = Number(value || 0);
+  return new Intl.NumberFormat(undefined, {
+    notation: number >= 100_000 ? "compact" : "standard",
+    maximumFractionDigits: 2,
+  }).format(number);
+}
+
 function dateTime(value?: string | null) {
   if (!value) return "Not yet";
   return new Date(value).toLocaleString(undefined, {
@@ -69,10 +77,11 @@ function Toast({ value }: { value: ToastValue }) {
   return value ? <div className={`toast ${value.kind}`} role="status">{value.message}</div> : null;
 }
 
-function LiveConversion({ initial, refresh, notify }: {
+function LiveConversion({ initial, refresh, notify, onDismiss }: {
   initial: Json;
   refresh: () => void;
   notify: (message: string, kind?: "success" | "error") => void;
+  onDismiss?: (job: Json) => void;
 }) {
   const [detail, setDetail] = useState<Json>({ job: initial, events: [] });
   useEffect(() => {
@@ -83,6 +92,20 @@ function LiveConversion({ initial, refresh, notify }: {
   }, [initial.id]);
   const job = detail.job || initial;
   const percent = Number(job.smooth_percent ?? job.percent ?? 0);
+  const terminal = !["queued", "running", "stopping"].includes(job.status);
+  const failed = ["failed", "interrupted"].includes(job.status);
+  const terminalTitle = failed
+    ? "Conversion stopped unexpectedly"
+    : job.status === "partial"
+      ? "Conversion completed with exceptions"
+      : job.status === "cancelled"
+        ? "Conversion stopped"
+        : "Conversion complete";
+  const statusText = terminal
+    ? label(job.status)
+    : job.status === "queued"
+      ? "Waiting for worker"
+      : label(job.current_stage || "Converting");
   const stop = async () => {
     try {
       await api(`/api/jobs/${job.id}/cancel`, { method: "POST" });
@@ -92,16 +115,29 @@ function LiveConversion({ initial, refresh, notify }: {
       notify((error as Error).message, "error");
     }
   };
-  return <section className="run-card">
+  const retry = async () => {
+    try {
+      await api(`/api/jobs/${job.id}/retry`, { method: "POST" });
+      notify("Conversion retry queued");
+      refresh();
+    } catch (error) {
+      notify((error as Error).message, "error");
+    }
+  };
+  return <section className={`run-card ${terminal ? "terminal" : ""} ${failed ? "failed" : ""}`}>
     <div className="run-top">
       <div className="run-copy">
-        <span className="status-pill"><i />{job.status === "queued" ? "Waiting for worker" : label(job.current_stage || "Converting")}</span>
-        <h2>{job.current_archive ? archiveName(job.current_archive) : "Discovering your library"}</h2>
-        <code>{job.current_archive || "Preparing the conversion queue…"}</code>
+        <span className={`status-pill ${terminal ? "terminal" : ""}`}><i />{statusText}</span>
+        <h2>{terminal ? terminalTitle : job.current_archive ? archiveName(job.current_archive) : "Discovering your library"}</h2>
+        <code>{terminal ? job.error_message || `${job.completed || 0} of ${job.archives_found || 0} archives completed` : job.current_archive || "Preparing the conversion queue…"}</code>
       </div>
-      <button className="button secondary" onClick={stop} disabled={job.status === "stopping"}>
-        {job.status === "stopping" ? "Stopping…" : "Stop"}
-      </button>
+      <div className="run-actions">
+        {terminal && failed && <button className="button primary" onClick={retry}>Retry remaining</button>}
+        {terminal ? <button className="button secondary" onClick={() => onDismiss?.(job)}>Dismiss</button> :
+          <button className="button secondary" onClick={stop} disabled={job.status === "stopping"}>
+            {job.status === "stopping" ? "Stopping…" : "Stop"}
+          </button>}
+      </div>
     </div>
     <div className="progress-track" aria-label={`${percent.toFixed(1)} percent complete`}><span style={{ width: `${percent}%` }} /></div>
     <div className="run-facts">
@@ -113,32 +149,65 @@ function LiveConversion({ initial, refresh, notify }: {
   </section>;
 }
 
+function policyStrategy(options: Json = {}) {
+  if (options.no_convert) return "recheck";
+  if (options.smart_distance) return "smart";
+  if (options.distance !== null && options.distance !== undefined) return "lossy";
+  return "lossless";
+}
+
+function policySummary(profile: Json) {
+  const options = profile.options || {};
+  const strategy = policyStrategy(options);
+  const effort = Number(options.effort ?? 7);
+  const threads = Number(options.threads ?? 4);
+  if (strategy === "recheck") return `Recheck only · ${threads} threads`;
+  if (strategy === "smart") {
+    return `Lossless first · d${Number(options.distance ?? 0.5)} fallback above ${Number(options.smart_mb ?? 10)} MB or ${Number(options.smart_mp ?? 5)} MP · effort ${effort}`;
+  }
+  if (strategy === "lossy") return `Lossy d${Number(options.distance)} · effort ${effort} · ${threads} threads`;
+  return `Lossless · effort ${effort} · ${threads} threads`;
+}
+
 function ManualConversion({ bootstrap, onQueued, notify }: {
   bootstrap: Json;
   onQueued: () => void;
   notify: (message: string, kind?: "success" | "error") => void;
 }) {
-  const profile = bootstrap.profiles?.find((row: Json) => row.is_default) || bootstrap.profiles?.[0] || {};
-  const defaults = profile.options || {};
+  const profiles = bootstrap.profiles || [];
+  const defaultProfile = profiles.find((row: Json) => row.is_default) || profiles[0] || {};
   const [open, setOpen] = useState(false);
   const [scope, setScope] = useState<"library" | "failed">("library");
-  const [policy, setPolicy] = useState<"lossless" | "smart" | "recheck">("lossless");
+  const [profileId, setProfileId] = useState(defaultProfile.id || "");
+  const profile = profiles.find((row: Json) => row.id === profileId) || defaultProfile;
+  const defaults = profile.options || {};
   const [effort, setEffort] = useState(Number(defaults.effort ?? 7));
   const [threads, setThreads] = useState(Number(defaults.threads ?? 4));
   const [backup, setBackup] = useState(Boolean(defaults.backup));
   const [busy, setBusy] = useState(false);
 
+  useEffect(() => {
+    if (!profiles.some((row: Json) => row.id === profileId) && defaultProfile.id) {
+      setProfileId(defaultProfile.id);
+    }
+  }, [defaultProfile.id, profileId, profiles]);
+
+  const chooseProfile = (nextProfile: Json) => {
+    const options = nextProfile.options || {};
+    setProfileId(nextProfile.id);
+    setEffort(Number(options.effort ?? 7));
+    setThreads(Number(options.threads ?? 4));
+    setBackup(Boolean(options.backup));
+  };
+
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     setBusy(true);
     const options: Json = {
+      ...defaults,
       effort,
       threads,
       backup,
-      no_convert: policy === "recheck",
-      recheck_all: policy === "recheck",
-      smart_distance: policy === "smart",
-      distance: policy === "smart" ? 0.5 : null,
     };
     try {
       await api("/api/jobs", {
@@ -169,9 +238,12 @@ function ManualConversion({ bootstrap, onQueued, notify }: {
             <button type="button" className={scope === "failed" ? "selected" : ""} onClick={() => setScope("failed")}>△ Failed</button>
           </div>
           <div className="choice-nav" role="group" aria-label="Conversion policy">
-            <button type="button" className={policy === "lossless" ? "selected" : ""} onClick={() => setPolicy("lossless")}>✓ Balanced lossless</button>
-            <button type="button" className={policy === "smart" ? "selected" : ""} onClick={() => setPolicy("smart")}>✦ Smart lossy fallback</button>
-            <button type="button" className={policy === "recheck" ? "selected" : ""} onClick={() => setPolicy("recheck")}>⌕ Recheck without conversion</button>
+            {profiles.map((row: Json) => <button
+              type="button"
+              key={row.id}
+              className={profile.id === row.id ? "selected" : ""}
+              onClick={() => chooseProfile(row)}
+            >{policyStrategy(row.options) === "smart" ? "✦" : policyStrategy(row.options) === "recheck" ? "⌕" : "✓"} {row.name}</button>)}
           </div>
         </div>
         <div className="manual-fields">
@@ -187,6 +259,193 @@ function ManualConversion({ bootstrap, onQueued, notify }: {
   </section>;
 }
 
+function DistributionChart({ rows, tone = "blue", label }: {
+  rows: Json[];
+  tone?: "blue" | "violet";
+  label: string;
+}) {
+  const maximum = Math.max(1, ...rows.map((row) => Number(row.count || 0)));
+  return <div className="distribution-chart" role="img" aria-label={label}>
+    {rows.map((row: Json) => <div className="distribution-column" key={row.label}>
+      <span className={`distribution-bar ${tone}`} style={{ height: `${Math.max(2, Number(row.count || 0) / maximum * 100)}%` }} />
+      <span>{row.label}</span>
+    </div>)}
+  </div>;
+}
+
+function PerformanceChart({ rows, range }: { rows: Json[]; range: "90" | "365" | "all" }) {
+  const cutoff = range === "all" ? null : Date.now() - Number(range) * 24 * 60 * 60 * 1000;
+  const filtered = rows.filter((row: Json) => {
+    const timestamp = Date.parse(row.date || "");
+    return cutoff === null || (Number.isFinite(timestamp) && timestamp >= cutoff);
+  });
+  const data = filtered.length ? filtered : rows.slice(-1);
+  if (!data.length) return <div className="chart-empty">Completed runs will build the lifetime trend.</div>;
+
+  const width = 760;
+  const height = 280;
+  const margin = { top: 22, right: 78, bottom: 38, left: 52 };
+  const plotWidth = width - margin.left - margin.right;
+  const plotHeight = height - margin.top - margin.bottom;
+  const netValues = data.map((row: Json) => Number(row.cumulative_net_gb || 0));
+  const averageValues = data.map((row: Json) => Number(row.average_percent_saved || 0));
+  const netMinimum = Math.min(0, ...netValues);
+  const netMaximum = Math.max(1, ...netValues);
+  const averageMinimum = Math.floor(Math.min(...averageValues) / 5) * 5;
+  const averageMaximum = Math.max(5, Math.ceil(Math.max(...averageValues) / 5) * 5);
+  const x = (index: number) => margin.left + index / Math.max(1, data.length - 1) * plotWidth;
+  const netY = (value: number) => margin.top + (netMaximum - value) / Math.max(1, netMaximum - netMinimum) * plotHeight;
+  const averageY = (value: number) => margin.top + (averageMaximum - value) / Math.max(1, averageMaximum - averageMinimum) * plotHeight;
+  const netPoints = data.map((row: Json, index: number) => `${x(index)},${netY(Number(row.cumulative_net_gb || 0))}`).join(" ");
+  const averagePoints = data.map((row: Json, index: number) => `${x(index)},${averageY(Number(row.average_percent_saved || 0))}`).join(" ");
+  const area = `${margin.left},${margin.top + plotHeight} ${netPoints} ${margin.left + plotWidth},${margin.top + plotHeight}`;
+  const gridValues = Array.from({ length: 4 }, (_, index) => netMinimum + (netMaximum - netMinimum) * index / 3);
+  const tickIndexes = [...new Set([0, Math.floor((data.length - 1) / 2), data.length - 1])];
+  const last = data[data.length - 1];
+
+  return <svg className="performance-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Net savings and average percentage saved over completed conversion runs">
+    <title>Conversion performance over time</title>
+    {gridValues.map((value) => <g key={value}>
+      <line x1={margin.left} y1={netY(value)} x2={margin.left + plotWidth} y2={netY(value)} />
+      <text x={margin.left - 9} y={netY(value) + 4} textAnchor="end">{Math.round(value)} GB</text>
+    </g>)}
+    <line x1={margin.left} y1={margin.top + plotHeight} x2={margin.left + plotWidth} y2={margin.top + plotHeight} />
+    <polygon className="net-area" points={area} />
+    <polyline className="net-line" points={netPoints} />
+    <polyline className="average-line" points={averagePoints} />
+    {data.map((row: Json, index: number) => <g key={row.id || `${row.date}-${index}`}>
+      <circle className="net-point" cx={x(index)} cy={netY(Number(row.cumulative_net_gb || 0))} r={index === data.length - 1 ? 4 : 3} />
+      <circle className="average-point" cx={x(index)} cy={averageY(Number(row.average_percent_saved || 0))} r={index === data.length - 1 ? 4 : 3} />
+      {["partial", "failed", "interrupted"].includes(row.status) && <rect className="exception-point" x={x(index) - 3} y={margin.top + plotHeight + 10} width="6" height="6" transform={`rotate(45 ${x(index)} ${margin.top + plotHeight + 13})`} />}
+    </g>)}
+    {tickIndexes.map((index) => <text
+      key={index}
+      x={x(index)}
+      y={height - 10}
+      textAnchor={index === 0 ? "start" : index === data.length - 1 ? "end" : "middle"}
+    >{new Date(data[index].date).toLocaleDateString(undefined, { month: "short", year: "numeric" })}</text>)}
+    <text className="chart-value" x={margin.left + plotWidth + 10} y={netY(Number(last.cumulative_net_gb || 0)) + 4}>{Number(last.cumulative_net_gb || 0).toFixed(1)} GB</text>
+    <text className="chart-value" x={margin.left + plotWidth + 10} y={averageY(Number(last.average_percent_saved || 0)) + 4}>{Number(last.average_percent_saved || 0).toFixed(1)}%</text>
+  </svg>;
+}
+
+function DetailedStatistics({ data }: { data: Json }) {
+  const [range, setRange] = useState<"90" | "365" | "all">("all");
+  const health = data.health || {};
+  const library = data.library || {};
+  const outcomes = data.outcomes || [];
+  const outcomeTotal = Math.max(1, outcomes.reduce((sum: number, row: Json) => sum + Number(row.count || 0), 0));
+  const outcomeClasses = ["one", "two", "three", "four", "five"];
+  const summary = data.savings_summary || {};
+  const processing = data.processing || {};
+  return <div className="detailed-statistics">
+    <section className="health-strip" aria-label="Library conversion health">
+      <div><span>Library coverage</span><strong>{Number(health.library_coverage_percent || 0).toFixed(1)}%</strong><small>{Number(library.optimized_archives || 0).toLocaleString()} of {Number(library.archives || 0).toLocaleString()} archives</small></div>
+      <div><span>Average reduction</span><strong>{Number(health.average_percent_saved || 0).toFixed(1)}%</strong><small>Across optimized archives</small></div>
+      <div><span>Originals retained</span><strong>{compactNumber(health.retained_pages)} pages</strong><small>Larger candidates rejected</small></div>
+      <div><span>Success rate</span><strong>{Number(health.success_percent || 0).toFixed(1)}%</strong><small>Completed archive attempts</small></div>
+    </section>
+
+    <section className="report-section">
+      <header className="report-heading">
+        <div><h2>Performance over time</h2><p>Cumulative net savings and average percentage saved across completed runs.</p></div>
+        <div className="range-controls" role="group" aria-label="Performance range">
+          {(["90", "365", "all"] as const).map((value) => <button className={range === value ? "active" : ""} key={value} onClick={() => setRange(value)}>{value === "90" ? "90 days" : value === "365" ? "1 year" : "All time"}</button>)}
+        </div>
+      </header>
+      <PerformanceChart rows={data.run_trend || []} range={range} />
+      <footer className="chart-legend">
+        <span><i className="net" />Cumulative net savings</span>
+        <span><i className="average" />Average percentage saved</span>
+        <span><i className="exception" />Run with exceptions</span>
+      </footer>
+    </section>
+
+    <section className="report-section">
+      <header className="report-heading"><div><h2>Library composition</h2><p>The current shape of the indexed library.</p></div></header>
+      <div className="library-strip">
+        <div><span>Archives</span><strong>{Number(library.archives || 0).toLocaleString()}</strong></div>
+        <div><span>Pages</span><strong>{compactNumber(library.pages)}</strong></div>
+        <div><span>Source size</span><strong>{formatBytes(library.source_bytes)}</strong></div>
+        <div><span>Current size</span><strong>{formatBytes(library.current_bytes)}</strong></div>
+        <div><span>JXL coverage</span><strong>{Number(library.jxl_coverage_percent || 0).toFixed(1)}%</strong></div>
+      </div>
+    </section>
+
+    <section className="report-section">
+      <header className="report-heading"><div><h2>Compression effectiveness</h2><p>Where savings come from and how pages were handled.</p></div></header>
+      <div className="report-grid">
+        <article className="report-panel">
+          <header><h3>By source format</h3><p>Bar length shows average percentage saved.</p></header>
+          <div className="effectiveness-list">
+            {(data.formats || []).map((row: Json) => <div className="effectiveness-row" key={row.label}>
+              <strong>{row.label}</strong>
+              <span className="effectiveness-track"><i style={{ width: `${Math.min(100, Math.max(0, Number(row.average_percent_saved || 0) * 3))}%` }} /></span>
+              <span><b>{Number(row.average_percent_saved || 0).toFixed(1)}%</b><small>{formatBytes(row.net_bytes)}</small></span>
+            </div>)}
+          </div>
+        </article>
+        <article className="report-panel">
+          <header><h3>Conversion outcomes</h3><p>Outcome of every recorded source page.</p></header>
+          <div className="outcome-bar" role="img" aria-label="Conversion outcome distribution">
+            {outcomes.map((row: Json, index: number) => <i className={outcomeClasses[index]} key={row.label} style={{ width: `${Number(row.count || 0) / outcomeTotal * 100}%` }} />)}
+          </div>
+          <div className="outcome-list">
+            {outcomes.map((row: Json, index: number) => <div key={row.label}><i className={outcomeClasses[index]} /><span>{row.label}</span><strong>{(Number(row.count || 0) / outcomeTotal * 100).toFixed(1)}%</strong></div>)}
+          </div>
+        </article>
+      </div>
+      <article className="report-panel distribution-panel">
+        <header><h3>Savings distribution</h3><p>Optimized archives grouped by percentage reduction.</p></header>
+        <DistributionChart rows={data.savings_distribution || []} label="Archive savings distribution" />
+        <div className="distribution-summary">
+          <span>Median <strong>{Number(summary.median || 0).toFixed(1)}%</strong></span>
+          <span>Average <strong>{Number(summary.average || 0).toFixed(1)}%</strong></span>
+          <span>Middle 50% <strong>{Number(summary.middle_50?.[0] || 0).toFixed(1)}–{Number(summary.middle_50?.[1] || 0).toFixed(1)}%</strong></span>
+        </div>
+      </article>
+    </section>
+
+    <section className="report-section">
+      <header className="report-heading">
+        <div><h2>Processing performance</h2><p>Typical archive duration and policy efficiency.</p></div>
+        <div className="heading-metrics">
+          <span>Median archive <strong>{duration(processing.median_seconds)}</strong></span>
+          <span>90th percentile <strong>{duration(processing.p90_seconds)}</strong></span>
+        </div>
+      </header>
+      <div className="report-grid">
+        <article className="report-panel">
+          <header><h3>Processing-time distribution</h3><p>Completed archives grouped by elapsed time.</p></header>
+          <DistributionChart rows={processing.distribution || []} tone="violet" label="Archive processing-time distribution" />
+        </article>
+        <article className="report-panel">
+          <header><h3>Efficiency by conversion policy</h3><p>Lifetime results for policies that completed runs.</p></header>
+          <div className="policy-report-wrap"><table className="policy-report">
+            <thead><tr><th>Policy</th><th>Median</th><th>Avg saved</th><th>Success</th></tr></thead>
+            <tbody>{(processing.policies || []).map((row: Json) => <tr key={row.name}><td>{row.name}</td><td>{duration(row.median_seconds)}</td><td>{Number(row.average_percent_saved || 0).toFixed(1)}%</td><td>{Number(row.success_percent || 0).toFixed(1)}%</td></tr>)}</tbody>
+          </table></div>
+        </article>
+      </div>
+    </section>
+
+    <section className="report-section">
+      <header className="report-heading"><div><h2>Attention breakdown</h2><p>Unresolved items grouped by the decision or repair they require.</p></div></header>
+      <div className="attention-breakdown">{(data.attention || []).map((row: Json) => <div key={row.id}><span>{row.label}</span><i><b style={{ width: `${Number(row.count || 0) / Math.max(1, ...(data.attention || []).map((item: Json) => Number(item.count || 0))) * 100}%` }} /></i><strong>{Number(row.count || 0).toLocaleString()}</strong></div>)}</div>
+    </section>
+
+    <section className="report-section">
+      <header className="report-heading"><div><h2>Lifetime processing effort</h2><p>Completed work, including retries and archives retained unchanged.</p></div></header>
+      <div className="effort-strip">
+        <div><span>Completed runs</span><strong>{Number(data.effort?.completed_runs || 0).toLocaleString()}</strong></div>
+        <div><span>Archives attempted</span><strong>{Number(data.effort?.archives_attempted || 0).toLocaleString()}</strong></div>
+        <div><span>Pages examined</span><strong>{compactNumber(data.effort?.pages_examined)}</strong></div>
+        <div><span>Encoder time</span><strong>{Number(data.effort?.encoder_hours || 0).toLocaleString()} hours</strong></div>
+      </div>
+    </section>
+  </div>;
+}
+
 function Overview({ dashboard, bootstrap, refresh, notify }: {
   dashboard: Json;
   bootstrap: Json;
@@ -194,20 +453,74 @@ function Overview({ dashboard, bootstrap, refresh, notify }: {
   notify: (message: string, kind?: "success" | "error") => void;
 }) {
   const active = dashboard.active_jobs?.[0];
+  const [dismissedRun, setDismissedRun] = useState(() => {
+    try { return window.localStorage.getItem("cbzxl-dismissed-run"); } catch { return null; }
+  });
+  const recentTerminal = (dashboard.recent_jobs || []).find((job: Json) =>
+    ["manual", "retry"].includes(job.source) &&
+    ["succeeded", "partial", "failed", "cancelled", "interrupted"].includes(job.status)
+  );
+  const visibleRun = active || (recentTerminal?.id !== dismissedRun ? recentTerminal : null);
+  const dismissRun = (job: Json) => {
+    setDismissedRun(job.id);
+    try { window.localStorage.setItem("cbzxl-dismissed-run", job.id); } catch { /* storage unavailable */ }
+  };
   const totals = dashboard.totals || {};
+  const [detailsOpen, setDetailsOpen] = useState(() => {
+    try { return window.localStorage.getItem("cbzxl-detailed-statistics") === "open"; } catch { return false; }
+  });
+  const [statistics, setStatistics] = useState<Json | null>(null);
+  const [statisticsError, setStatisticsError] = useState("");
+  const [statisticsLoading, setStatisticsLoading] = useState(false);
+  useEffect(() => {
+    if (!detailsOpen || statistics || statisticsLoading || statisticsError) return;
+    setStatisticsLoading(true);
+    api("/api/statistics")
+      .then((payload) => {
+        setStatistics(payload);
+        setStatisticsError("");
+      })
+      .catch((error) => setStatisticsError(error.message))
+      .finally(() => setStatisticsLoading(false));
+  }, [detailsOpen, statistics, statisticsError, statisticsLoading]);
+  const toggleDetails = () => {
+    const next = !detailsOpen;
+    setDetailsOpen(next);
+    try { window.localStorage.setItem("cbzxl-detailed-statistics", next ? "open" : "closed"); } catch { /* storage unavailable */ }
+  };
   return <div className="page overview">
-    {active ? <LiveConversion initial={active} refresh={refresh} notify={notify} /> :
+    {visibleRun ? <LiveConversion key={visibleRun.id} initial={visibleRun} refresh={refresh} notify={notify} onDismiss={dismissRun} /> :
       <ManualConversion bootstrap={bootstrap} onQueued={refresh} notify={notify} />}
     <section className="stats-grid" aria-label="Lifetime optimization statistics">
-      <div><span>Gross reduction</span><strong>{formatGb(totals.saved_gb)}</strong></div>
+      <div><span>Net savings</span><strong>{formatGb(totals.net_gb)}</strong></div>
       <div><span>Pages optimized</span><strong>{Number(totals.page_count || 0).toLocaleString()}</strong></div>
       <div><span>Archives optimized</span><strong>{Number(totals.optimized_count || 0).toLocaleString()}</strong></div>
       <div><span>Need attention</span><strong>{Number(dashboard.review?.total || 0).toLocaleString()}</strong></div>
     </section>
+    <button className="detailed-statistics-toggle" type="button" aria-expanded={detailsOpen} onClick={toggleDetails}>
+      <span>{detailsOpen ? "Hide Detailed Statistics" : "Detailed Statistics"}</span><b>{detailsOpen ? "−" : "+"}</b>
+    </button>
+    {detailsOpen && <div className="statistics-disclosure">
+      {statisticsLoading && <div className="statistics-loading">Building lifetime statistics…</div>}
+      {statisticsError && <div className="statistics-error">{statisticsError}<button className="button secondary" onClick={() => setStatisticsError("")}>Retry</button></div>}
+      {statistics && <DetailedStatistics data={statistics} />}
+    </div>}
   </div>;
 }
 
 function issueContext(issue: Json) {
+  if (issue.kind === "crc_mismatch") {
+    if (issue.diagnostics?.repairable) return {
+      title: "This archive can be rebuilt safely",
+      text: "The image payload decodes correctly. CBZXL can rebuild the container and recalculate every CRC without changing archive or image names.",
+      recommended: "Rebuild archive",
+    };
+    return {
+      title: "This CRC failure needs a decision",
+      text: "The damaged entry cannot yet be proven intact. Replace it, explicitly delete it, or leave the archive unchanged.",
+      recommended: "Inspect recovery status",
+    };
+  }
   if (issue.kind === "archive_grew") return {
     title: "No conversion candidate was beneficial",
     text: "Larger candidates were discarded. The original archive remains unchanged.",
@@ -248,6 +561,7 @@ const remedyLabels: Record<string, string> = {
   delete: "Delete image",
   lossless: "Lossless retry",
   retry: "Default retry",
+  rebuild: "Rebuild archive",
   dismiss: "Accept unchanged",
 };
 
@@ -255,12 +569,46 @@ function Attention({ refreshDashboard, notify }: {
   refreshDashboard: () => void;
   notify: (message: string, kind?: "success" | "error") => void;
 }) {
-  const [data, setData] = useState<Json>({ rows: [], total: 0 });
+  const [data, setData] = useState<Json>({ rows: [], groups: [], total: 0 });
+  const [groupRows, setGroupRows] = useState<Record<string, Json[]>>({});
+  const [groupLoading, setGroupLoading] = useState<string | null>(null);
+  const [openGroup, setOpenGroup] = useState<string | null>(null);
   const [open, setOpen] = useState<number | null>(null);
   const [busy, setBusy] = useState<number | null>(null);
+  const [diagnostics, setDiagnostics] = useState<Record<number, Json>>({});
+  const [diagnosticsLoading, setDiagnosticsLoading] = useState<number | null>(null);
   const fileInputs = useRef<Record<number, HTMLInputElement | null>>({});
-  const load = useCallback(() => api("/api/issues").then(setData).catch((error) => notify(error.message, "error")), [notify]);
+  const load = useCallback(() => api("/api/issues?limit=1").then(setData).catch((error) => notify(error.message, "error")), [notify]);
   useEffect(() => { load(); }, [load]);
+
+  const loadGroup = useCallback(async (groupId: string) => {
+    setGroupLoading(groupId);
+    try {
+      const payload = await api(`/api/issues?group=${encodeURIComponent(groupId)}&limit=100`);
+      setGroupRows((current) => ({ ...current, [groupId]: payload.rows || [] }));
+    } catch (error) {
+      notify((error as Error).message, "error");
+    } finally {
+      setGroupLoading(null);
+    }
+  }, [notify]);
+
+  const toggleGroup = async (groupId: string) => {
+    if (openGroup === groupId) {
+      setOpenGroup(null);
+      setOpen(null);
+      return;
+    }
+    setOpenGroup(groupId);
+    setOpen(null);
+    if (!groupRows[groupId]) await loadGroup(groupId);
+  };
+
+  const refreshOpenGroup = async () => {
+    await load();
+    if (openGroup) await loadGroup(openGroup);
+    refreshDashboard();
+  };
 
   const act = async (issue: Json, action: string) => {
     if (action === "delete" && !window.confirm(`Delete ${issue.entry_path} from ${archiveName(issue.path)}? The archive name will not change.`)) return;
@@ -269,8 +617,7 @@ function Attention({ refreshDashboard, notify }: {
       await api(`/api/issues/${issue.id}/action`, { method: "POST", body: JSON.stringify({ action }) });
       notify(action === "dismiss" ? "Dismissed until the next full rescan" : "Repair queued");
       if (action === "dismiss") setOpen(null);
-      await load();
-      refreshDashboard();
+      await refreshOpenGroup();
     } catch (error) {
       notify((error as Error).message, "error");
     } finally {
@@ -288,8 +635,7 @@ function Attention({ refreshDashboard, notify }: {
         body: file,
       });
       notify("Replacement validated and queued");
-      await load();
-      refreshDashboard();
+      await refreshOpenGroup();
     } catch (error) {
       notify((error as Error).message, "error");
     } finally {
@@ -297,37 +643,83 @@ function Attention({ refreshDashboard, notify }: {
     }
   };
 
-  if (!data.rows?.length) return <div className="empty-state"><span>✓</span><h2>Nothing needs attention.</h2><p>Failures and exceptions will appear here with actions tailored to their cause.</p></div>;
-  return <div className="issue-list">
-    {data.rows.map((issue: Json) => {
-      const context = issueContext(issue);
-      const expanded = open === issue.id;
-      return <article className={`issue ${expanded ? "expanded" : ""}`} key={issue.id}>
-        <div className="issue-summary">
-          <div><strong>{archiveName(issue.path)}</strong><span className={issue.kind === "archive_grew" ? "" : "error-copy"}>{issue.message}</span></div>
-          <time>{dateTime(issue.updated_at)}</time>
-          <div className="issue-actions">
-            <button className="button primary" disabled={busy === issue.id || issue.status === "queued"} onClick={() => act(issue, "retry")}>{issue.status === "queued" ? "Queued" : "Retry"}</button>
-            <button className="button secondary" aria-expanded={expanded} onClick={() => setOpen(expanded ? null : issue.id)}>{expanded ? "Close" : "Inspect"}</button>
-            <button className="button ghost" disabled={busy === issue.id} onClick={() => act(issue, "dismiss")}>Dismiss</button>
+  const toggleInspect = async (issue: Json) => {
+    if (open === issue.id) {
+      setOpen(null);
+      return;
+    }
+    setOpen(issue.id);
+    if (issue.diagnostics_url && !diagnostics[issue.id]) {
+      setDiagnosticsLoading(issue.id);
+      try {
+        const result = await api(issue.diagnostics_url);
+        setDiagnostics((current) => ({ ...current, [issue.id]: result }));
+      } catch (error) {
+        notify((error as Error).message, "error");
+      } finally {
+        setDiagnosticsLoading(null);
+      }
+    }
+  };
+
+  if (!data.groups?.length) return <div className="empty-state"><span>✓</span><h2>Nothing needs attention.</h2><p>Failures and exceptions will appear here with actions tailored to their cause.</p></div>;
+  return <div className="failure-type-list">
+    {data.groups.map((group: Json) => {
+      const expandedGroup = openGroup === group.id;
+      const rows = groupRows[group.id] || [];
+      return <article className={`failure-type ${expandedGroup ? "expanded" : ""}`} key={group.id}>
+        <div className="failure-type-summary">
+          <div>
+            <strong>{group.label}</strong>
+            <span><b>{group.triage}</b>{group.recommended}</span>
           </div>
+          <span className="failure-count">{Number(group.count || 0).toLocaleString()}</span>
+          <button className="button ghost" aria-expanded={expandedGroup} onClick={() => toggleGroup(group.id)}>{expandedGroup ? "Close" : "Review"}</button>
         </div>
-        {expanded && <div className={`issue-detail ${issue.entry_path ? "" : "without-preview"}`}>
-          {issue.entry_path && <IssuePreview issue={issue} />}
-          <div className="diagnosis">
-            <div><h3>{context.title}</h3><p>{context.text}</p></div>
-            <div className="diagnosis-facts">
-              <div><span>Failure stage</span><strong>{label(issue.stage)}</strong></div>
-              <div><span>Recommended</span><strong>{context.recommended}</strong></div>
-            </div>
-            {issue.detail && <details><summary>Technical detail</summary><code>{issue.detail}</code></details>}
-            <input className="visually-hidden" type="file" accept="image/*" ref={(node) => { fileInputs.current[issue.id] = node; }} onChange={(event) => replace(issue, event.target.files?.[0])} />
-            <div className="remedy-grid">
-              {(issue.remedies || []).map((remedy: string) => remedy === "replace" ?
-                <button className="button secondary block" key={remedy} disabled={busy === issue.id} onClick={() => fileInputs.current[issue.id]?.click()}>{remedyLabels[remedy]}</button> :
-                <button className={`button block ${remedy === "compatibility" || remedy === "lossless" ? "primary" : remedy === "delete" ? "danger" : "secondary"}`} key={remedy} disabled={busy === issue.id} onClick={() => act(issue, remedy)}>{remedyLabels[remedy] || label(remedy)}</button>)}
-            </div>
-          </div>
+        {expandedGroup && <div className="failure-type-detail">
+          {groupLoading === group.id && <div className="group-loading">Loading affected archives…</div>}
+          {rows.map((issue: Json) => {
+            const diagnostic = diagnostics[issue.id];
+            const hydratedIssue = diagnostic ? { ...issue, diagnostics: diagnostic } : issue;
+            const context = issueContext(hydratedIssue);
+            const expanded = open === issue.id;
+            const remedies = (issue.remedies || []).filter((remedy: string) => remedy !== "rebuild" || diagnostic?.repairable);
+            return <div className={`issue ${expanded ? "expanded" : ""}`} key={issue.id}>
+              <div className="issue-summary">
+                <div><strong>{archiveName(issue.path)}</strong><span className="error-copy">{issue.message}</span>{issue.entry_path && <code>{issue.entry_path}</code>}</div>
+                <time>{dateTime(issue.updated_at)}</time>
+                <div className="issue-actions">
+                  <button className="button primary" disabled={busy === issue.id || issue.status === "queued"} onClick={() => act(issue, "retry")}>{issue.status === "queued" ? "Queued" : "Retry"}</button>
+                  <button className="button secondary" aria-expanded={expanded} onClick={() => toggleInspect(issue)}>{expanded ? "Close" : "Inspect"}</button>
+                  <button className="button ghost" disabled={busy === issue.id} onClick={() => act(issue, "dismiss")}>Dismiss</button>
+                </div>
+              </div>
+              {expanded && <div className={`issue-detail ${issue.entry_path ? "" : "without-preview"}`}>
+                {issue.entry_path && <IssuePreview issue={issue} />}
+                <div className="diagnosis">
+                  <div><h3>{context.title}</h3><p>{context.text}</p></div>
+                  <div className="diagnosis-facts">
+                    <div><span>Failure stage</span><strong>{label(issue.stage)}</strong></div>
+                    <div><span>Recommended</span><strong>{context.recommended}</strong></div>
+                    {diagnostic && <>
+                      <div><span>Stored CRC-32</span><strong><code>{diagnostic.expected_crc32 || "Unavailable"}</code></strong></div>
+                      <div><span>Calculated CRC-32</span><strong><code>{diagnostic.calculated_crc32 || "Unavailable"}</code></strong></div>
+                      <div><span>Recovery status</span><strong>{diagnostic.image_readable ? "Recovered image decodes correctly" : "Recovered image is unreadable"}</strong></div>
+                    </>}
+                  </div>
+                  {diagnosticsLoading === issue.id && <div className="diagnostic-loading">Checking the failing ZIP entry…</div>}
+                  {(diagnostic?.detail || issue.detail) && <details><summary>Technical detail</summary><code>{diagnostic?.detail || issue.detail}</code></details>}
+                  <input className="visually-hidden" type="file" accept="image/*" ref={(node) => { fileInputs.current[issue.id] = node; }} onChange={(event) => replace(issue, event.target.files?.[0])} />
+                  <div className="remedy-grid">
+                    {remedies.map((remedy: string) => remedy === "replace" ?
+                      <button className="button secondary block" key={remedy} disabled={busy === issue.id} onClick={() => fileInputs.current[issue.id]?.click()}>{remedyLabels[remedy]}</button> :
+                      <button className={`button block ${["compatibility", "lossless", "rebuild"].includes(remedy) ? "primary" : remedy === "delete" ? "danger" : "secondary"}`} key={remedy} disabled={busy === issue.id} onClick={() => act(issue, remedy)}>{remedyLabels[remedy] || label(remedy)}</button>)}
+                  </div>
+                </div>
+              </div>}
+            </div>;
+          })}
+          {rows.length >= 100 && <div className="group-limit">Showing the 100 most recently updated archives in this failure type.</div>}
         </div>}
       </article>;
     })}
@@ -377,10 +769,106 @@ function Settings({ bootstrap, reload, notify }: {
 }) {
   const [schedules, setSchedules] = useState<Json[]>([]);
   const [newOpen, setNewOpen] = useState(false);
-  const [form, setForm] = useState({ name: "Library maintenance", cadence: "daily", hour: 4, minute: 0 });
-  const load = useCallback(() => api("/api/schedules").then((value) => setSchedules(value.rows)).catch((error) => notify(error.message, "error")), [notify]);
+  const profiles = bootstrap.profiles || [];
+  const defaultProfile = profiles.find((row: Json) => row.is_default) || profiles[0] || {};
+  const [form, setForm] = useState({
+    name: "Library maintenance",
+    cadence: "daily",
+    hour: 4,
+    minute: 0,
+    profile_id: defaultProfile.id || "",
+  });
+  const [policyOpen, setPolicyOpen] = useState(false);
+  const [policyBusy, setPolicyBusy] = useState(false);
+  const [policyForm, setPolicyForm] = useState<Json>({});
+  const [scheduleProfiles, setScheduleProfiles] = useState<Record<string, string>>({});
+  const load = useCallback(() => api("/api/schedules").then((value) => {
+    setSchedules(value.rows);
+    setScheduleProfiles(Object.fromEntries(value.rows.map((row: Json) => [row.id, row.profile_id])));
+  }).catch((error) => notify(error.message, "error")), [notify]);
   useEffect(() => { load(); }, [load]);
-  const profile = bootstrap.profiles?.find((row: Json) => row.is_default) || bootstrap.profiles?.[0];
+  useEffect(() => {
+    if (!profiles.some((row: Json) => row.id === form.profile_id) && defaultProfile.id) {
+      setForm((current) => ({ ...current, profile_id: defaultProfile.id }));
+    }
+  }, [defaultProfile.id, form.profile_id, profiles]);
+
+  const schedulePayload = (row: Json, overrides: Json = {}) => ({
+    name: row.name,
+    enabled: Boolean(row.enabled),
+    cadence: row.cadence,
+    interval_value: row.interval_value,
+    interval_unit: row.interval_unit,
+    weekday: row.weekday,
+    day_of_month: row.day_of_month,
+    hour: Number(row.hour || 0),
+    minute: Number(row.minute || 0),
+    library_id: row.library_id,
+    profile_id: row.profile_id,
+    ...overrides,
+  });
+
+  const openPolicy = (profile?: Json) => {
+    const options = profile?.options || defaultProfile.options || {};
+    setPolicyForm({
+      id: profile?.id || null,
+      name: profile?.name || "",
+      strategy: policyStrategy(options),
+      effort: Number(options.effort ?? 7),
+      threads: Number(options.threads ?? 4),
+      distance: Number(options.distance ?? 0.5),
+      smart_mb: Number(options.smart_mb ?? 10),
+      smart_mp: Number(options.smart_mp ?? 5),
+      backup: Boolean(options.backup),
+      is_default: Boolean(profile?.is_default),
+      base_options: options,
+    });
+    setPolicyOpen(true);
+  };
+
+  const savePolicy = async (event: FormEvent) => {
+    event.preventDefault();
+    setPolicyBusy(true);
+    const strategy = policyForm.strategy;
+    const options: Json = {
+      ...(policyForm.base_options || {}),
+      effort: Number(policyForm.effort),
+      threads: Number(policyForm.threads),
+      backup: Boolean(policyForm.backup),
+      smart_distance: strategy === "smart",
+      distance: strategy === "smart" || strategy === "lossy" ? Number(policyForm.distance) : null,
+      smart_mb: Number(policyForm.smart_mb),
+      smart_mp: Number(policyForm.smart_mp),
+      no_convert: strategy === "recheck",
+      recheck_all: strategy === "recheck",
+      failed_only: false,
+      compatibility_mode: false,
+      continue_on_page_error: false,
+      only_path: null,
+      repair_action: null,
+      repair_entry: null,
+      repair_source: null,
+    };
+    try {
+      await api(policyForm.id ? `/api/profiles/${policyForm.id}` : "/api/profiles", {
+        method: policyForm.id ? "PUT" : "POST",
+        body: JSON.stringify({
+          name: policyForm.name,
+          is_default: Boolean(policyForm.is_default),
+          options,
+        }),
+      });
+      notify(policyForm.id ? "Conversion policy updated" : "Conversion policy created");
+      setPolicyOpen(false);
+      await reload();
+      await load();
+    } catch (error) {
+      notify((error as Error).message, "error");
+    } finally {
+      setPolicyBusy(false);
+    }
+  };
+
   const save = async (event: FormEvent) => {
     event.preventDefault();
     try {
@@ -392,7 +880,7 @@ function Settings({ bootstrap, reload, notify }: {
           weekday: form.cadence === "weekly" ? 0 : null,
           day_of_month: form.cadence === "monthly" ? 1 : null,
           library_id: bootstrap.libraries?.[0]?.id,
-          profile_id: profile?.id,
+          profile_id: form.profile_id || defaultProfile.id,
         }),
       });
       notify("Schedule created");
@@ -403,8 +891,23 @@ function Settings({ bootstrap, reload, notify }: {
   };
   const toggle = async (row: Json) => {
     try {
-      await api(`/api/schedules/${row.id}`, { method: "PUT", body: JSON.stringify({ ...row, enabled: !row.enabled }) });
+      await api(`/api/schedules/${row.id}`, {
+        method: "PUT",
+        body: JSON.stringify(schedulePayload(row, { enabled: !row.enabled })),
+      });
       notify(row.enabled ? "Schedule paused" : "Schedule enabled");
+      load();
+      reload();
+    } catch (error) { notify((error as Error).message, "error"); }
+  };
+  const saveSchedulePolicy = async (row: Json) => {
+    const profileId = scheduleProfiles[row.id] || row.profile_id;
+    try {
+      await api(`/api/schedules/${row.id}`, {
+        method: "PUT",
+        body: JSON.stringify(schedulePayload(row, { profile_id: profileId })),
+      });
+      notify("Schedule policy updated");
       load();
       reload();
     } catch (error) { notify((error as Error).message, "error"); }
@@ -421,18 +924,75 @@ function Settings({ bootstrap, reload, notify }: {
   return <div className="settings-page">
     <section className="settings-grid">
       <div><span>Library</span><strong><code>{bootstrap.libraries?.[0]?.root_path || "/data"}</code></strong></div>
-      <div><span>Conversion policy</span><strong>{profile?.name || "Balanced lossless"}</strong></div>
-      <div><span>Schedule</span><strong>{schedules.find((row) => row.enabled)?.description || "Not scheduled"}</strong></div>
+      <div><span>Default policy</span><strong>{defaultProfile.name || "Balanced lossless"}</strong></div>
+      <div><span>Active schedule</span><strong>{schedules.find((row) => row.enabled)?.description || "Not scheduled"}</strong></div>
     </section>
+
+    <section className="policy-section">
+      <header>
+        <div><h2>Conversion policies</h2><p>Save encoder choices once, then assign them to manual or scheduled runs.</p></div>
+        <button className="button primary" type="button" onClick={() => openPolicy()}>New policy</button>
+      </header>
+      <div className="policy-list">
+        {profiles.map((profile: Json) => {
+          const usedBy = schedules.filter((row) => row.profile_id === profile.id);
+          return <article key={profile.id}>
+            <div>
+              <div className="policy-name"><strong>{profile.name}</strong>{profile.is_default && <span className="status-label">Default</span>}</div>
+              <span>{policySummary(profile)} · {usedBy.length ? `used by ${usedBy.map((row) => row.name).join(", ")}` : "unused"}</span>
+            </div>
+            <button className="button secondary" type="button" onClick={() => openPolicy(profile)}>Edit</button>
+          </article>;
+        })}
+      </div>
+      {policyOpen && <form className="policy-editor" onSubmit={savePolicy}>
+        <header>
+          <div><h3>{policyForm.id ? "Edit conversion policy" : "New conversion policy"}</h3><p>Archive and image names remain unchanged under every policy.</p></div>
+          <button className="button ghost" type="button" onClick={() => setPolicyOpen(false)}>Close</button>
+        </header>
+        <div className="policy-fields">
+          <label><span>Policy name</span><input type="text" value={policyForm.name || ""} onChange={(event) => setPolicyForm({ ...policyForm, name: event.target.value })} required /></label>
+          <label><span>Conversion strategy</span><select value={policyForm.strategy || "lossless"} onChange={(event) => setPolicyForm({ ...policyForm, strategy: event.target.value })}>
+            <option value="lossless">Lossless</option>
+            <option value="smart">Lossless first, smart lossy fallback</option>
+            <option value="lossy">Fixed lossy distance</option>
+            <option value="recheck">Recheck without conversion</option>
+          </select></label>
+          <label><span>Encoder effort · {policyForm.effort ?? 7}</span><input type="range" min="0" max="11" value={policyForm.effort ?? 7} onChange={(event) => setPolicyForm({ ...policyForm, effort: Number(event.target.value) })} /></label>
+          <label><span>CPU budget</span><select value={policyForm.threads ?? 4} onChange={(event) => setPolicyForm({ ...policyForm, threads: Number(event.target.value) })}>{[1, 2, 4, 6, 8, 12, 16, 24, 32].map((value) => <option key={value} value={value}>{value} threads</option>)}</select></label>
+        </div>
+        {["smart", "lossy"].includes(policyForm.strategy) && <div className={`policy-lossy-fields ${policyForm.strategy === "lossy" ? "direct" : ""}`}>
+          <label><span>Lossy distance · {Number(policyForm.distance ?? 0.5).toFixed(1)}</span><input type="range" min="0.1" max="1" step="0.1" value={policyForm.distance ?? 0.5} onChange={(event) => setPolicyForm({ ...policyForm, distance: Number(event.target.value) })} /></label>
+          {policyForm.strategy === "smart" && <>
+            <label><span>Minimum source size</span><input type="number" min="0.1" max="1000" step="0.1" value={policyForm.smart_mb ?? 10} onChange={(event) => setPolicyForm({ ...policyForm, smart_mb: Number(event.target.value) })} /><small>MB</small></label>
+            <label><span>Minimum resolution</span><input type="number" min="0.1" max="1000" step="0.1" value={policyForm.smart_mp ?? 5} onChange={(event) => setPolicyForm({ ...policyForm, smart_mp: Number(event.target.value) })} /><small>MP</small></label>
+          </>}
+        </div>}
+        <div className="policy-switches">
+          <label className="switch"><input type="checkbox" checked={Boolean(policyForm.backup)} onChange={(event) => setPolicyForm({ ...policyForm, backup: event.target.checked })} /><i /><span>Back up originals</span></label>
+          <label className="switch"><input type="checkbox" checked={Boolean(policyForm.is_default)} onChange={(event) => setPolicyForm({ ...policyForm, is_default: event.target.checked })} /><i /><span>Use as the default policy</span></label>
+        </div>
+        <footer>
+          <button className="button ghost" type="button" onClick={() => setPolicyOpen(false)}>Cancel</button>
+          <button className="button primary" type="submit" disabled={policyBusy}>{policyBusy ? "Saving…" : "Save policy"}</button>
+        </footer>
+      </form>}
+    </section>
+
     <section className="schedule-section">
       <header><div><h2>Schedules</h2><p>Recurring conversions use the same verified pipeline.</p></div><button className="button primary" onClick={() => setNewOpen(!newOpen)}>{newOpen ? "Close" : "New schedule"}</button></header>
       {newOpen && <form className="schedule-form" onSubmit={save}>
         <label><span>Name</span><input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} required /></label>
         <label><span>Cadence</span><select value={form.cadence} onChange={(event) => setForm({ ...form, cadence: event.target.value })}><option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option></select></label>
         <label><span>Hour</span><select value={form.hour} onChange={(event) => setForm({ ...form, hour: Number(event.target.value) })}>{Array.from({ length: 24 }, (_, hour) => <option key={hour} value={hour}>{new Date(2000, 0, 1, hour).toLocaleTimeString([], { hour: "numeric" })}</option>)}</select></label>
+        <label><span>Conversion policy</span><select value={form.profile_id} onChange={(event) => setForm({ ...form, profile_id: event.target.value })}>{profiles.map((profile: Json) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}</select></label>
         <button className="button primary" type="submit">Save schedule</button>
       </form>}
-      <div className="schedule-list">{schedules.map((row) => <article key={row.id} className={!row.enabled ? "disabled" : ""}><div><strong>{row.name}</strong><span>{row.description}</span></div><span>{row.enabled ? `Next ${dateTime(row.next_run_at)}` : "Paused"}</span><div><button className="button secondary" onClick={() => toggle(row)}>{row.enabled ? "Pause" : "Enable"}</button><button className="button ghost danger" onClick={() => remove(row)}>Delete</button></div></article>)}</div>
+      <div className="schedule-list">{schedules.map((row) => <article key={row.id} className={!row.enabled ? "disabled" : ""}>
+        <div><strong>{row.name}</strong><span>{row.description} · {row.enabled ? `next ${dateTime(row.next_run_at)}` : "paused"}</span></div>
+        <label className="schedule-policy"><span>Conversion policy</span><select value={scheduleProfiles[row.id] || row.profile_id} onChange={(event) => setScheduleProfiles({ ...scheduleProfiles, [row.id]: event.target.value })}>{profiles.map((profile: Json) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}</select></label>
+        <div><button className="button secondary" onClick={() => saveSchedulePolicy(row)} disabled={(scheduleProfiles[row.id] || row.profile_id) === row.profile_id}>Save</button><button className="button secondary" onClick={() => toggle(row)}>{row.enabled ? "Pause" : "Enable"}</button><button className="button ghost danger" onClick={() => remove(row)}>Delete</button></div>
+      </article>)}</div>
     </section>
   </div>;
 }

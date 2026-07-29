@@ -1,5 +1,5 @@
 x-cbzxl-common: &cbzxl-common
-  image: angeladmerkel/cbzxl-web:3.3.1
+  image: angeladmerkel/cbzxl-web:latest
   platform: linux/amd64
   volumes:
     - /mnt/Array/Media/Manga:/data

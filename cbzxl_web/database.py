@@ -136,6 +136,10 @@ CREATE TABLE IF NOT EXISTS archives (
     image_count INTEGER,
     jpg_count INTEGER,
     png_count INTEGER,
+    converted_pages INTEGER NOT NULL DEFAULT 0,
+    lossless_pages INTEGER NOT NULL DEFAULT 0,
+    lossy_pages INTEGER NOT NULL DEFAULT 0,
+    retained_pages INTEGER NOT NULL DEFAULT 0,
     script_version TEXT,
     jxl_version TEXT,
     error_message TEXT,
@@ -165,6 +169,10 @@ CREATE TABLE IF NOT EXISTS archive_results (
     image_count INTEGER,
     jpg_count INTEGER,
     png_count INTEGER,
+    converted_pages INTEGER NOT NULL DEFAULT 0,
+    lossless_pages INTEGER NOT NULL DEFAULT 0,
+    lossy_pages INTEGER NOT NULL DEFAULT 0,
+    retained_pages INTEGER NOT NULL DEFAULT 0,
     conversion_mode TEXT,
     megapixels_info TEXT,
     error_message TEXT,
@@ -248,6 +256,35 @@ DEFAULT_OPTIONS = {
     "repair_source": None,
 }
 
+BUILTIN_PROFILES = (
+    {
+        "id": "profile-balanced",
+        "name": "Balanced lossless",
+        "is_default": 1,
+        "options": DEFAULT_OPTIONS,
+    },
+    {
+        "id": "profile-smart",
+        "name": "Smart lossy fallback",
+        "is_default": 0,
+        "options": {
+            **DEFAULT_OPTIONS,
+            "smart_distance": True,
+            "distance": 0.5,
+        },
+    },
+    {
+        "id": "profile-recheck",
+        "name": "Recheck without conversion",
+        "is_default": 0,
+        "options": {
+            **DEFAULT_OPTIONS,
+            "no_convert": True,
+            "recheck_all": True,
+        },
+    },
+)
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -330,6 +367,14 @@ def initialize() -> None:
             "archives": {"content_fingerprint": "TEXT"},
         }
         migrations["archives"]["dismissed_until_rescan"] = "INTEGER NOT NULL DEFAULT 0"
+        page_outcome_columns = {
+            "converted_pages": "INTEGER NOT NULL DEFAULT 0",
+            "lossless_pages": "INTEGER NOT NULL DEFAULT 0",
+            "lossy_pages": "INTEGER NOT NULL DEFAULT 0",
+            "retained_pages": "INTEGER NOT NULL DEFAULT 0",
+        }
+        migrations["archives"].update(page_outcome_columns)
+        migrations["archive_results"] = page_outcome_columns
         for table, additions in migrations.items():
             existing_columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
             for column, definition in additions.items():
@@ -343,9 +388,12 @@ def initialize() -> None:
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (4, ?)",
             (utc_now(),),
         )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (5, ?)",
+            (utc_now(),),
+        )
         now = utc_now()
         library_id = "library-default"
-        profile_id = "profile-balanced"
         conn.execute(
             """
             INSERT OR IGNORE INTO libraries(id, name, root_path, enabled, created_at, updated_at)
@@ -353,13 +401,23 @@ def initialize() -> None:
             """,
             (library_id, LIBRARY_PATH, now, now),
         )
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO conversion_profiles(id, name, is_default, options_json, created_at, updated_at)
-            VALUES (?, 'Balanced lossless', 1, ?, ?, ?)
-            """,
-            (profile_id, json.dumps(DEFAULT_OPTIONS, sort_keys=True), now, now),
-        )
+        for profile in BUILTIN_PROFILES:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO conversion_profiles(
+                    id, name, is_default, options_json, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    profile["id"],
+                    profile["name"],
+                    profile["is_default"],
+                    json.dumps(profile["options"], sort_keys=True),
+                    now,
+                    now,
+                ),
+            )
         conn.execute(
             """
             INSERT OR IGNORE INTO archive_issues(

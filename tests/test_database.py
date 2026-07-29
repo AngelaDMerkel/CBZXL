@@ -21,14 +21,27 @@ class DatabaseTests(unittest.TestCase):
             version = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
             library = database.default_library(conn)
             profile = database.default_profile(conn)
-        self.assertEqual(version, 4)
+            profile_names = {
+                row[0]
+                for row in conn.execute("SELECT name FROM conversion_profiles")
+            }
+        self.assertEqual(version, 5)
         self.assertEqual(library["root_path"], database.LIBRARY_PATH)
         self.assertEqual(profile["name"], "Balanced lossless")
+        self.assertEqual(
+            profile_names,
+            {
+                "Balanced lossless",
+                "Smart lossy fallback",
+                "Recheck without conversion",
+            },
+        )
         with database.connect() as conn:
             issue_columns = {row[1] for row in conn.execute("PRAGMA table_info(archive_issues)")}
             archive_columns = {row[1] for row in conn.execute("PRAGMA table_info(archives)")}
         self.assertIn("entry_path", issue_columns)
         self.assertIn("dismissed_until_rescan", archive_columns)
+        self.assertIn("converted_pages", archive_columns)
 
     def test_new_database_does_not_modify_legacy_v2_file(self):
         root = Path(self.temp.name)

@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 from .database import (
@@ -20,7 +21,7 @@ from .database import (
     transaction,
     utc_now,
 )
-from .protocol import parse_event
+from .protocol import PROTOCOL_PREFIX, parse_event
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -108,6 +109,20 @@ def stream_reader(stream, output):
             output.put(line)
     finally:
         output.put(None)
+
+
+def failure_output(lines):
+    """Return the useful tail of raw engine output without structured event noise."""
+    cleaned = [clean_line(line) for line in lines if line and not line.strip().startswith(PROTOCOL_PREFIX)]
+    cleaned = [line for line in cleaned if line]
+    if not cleaned:
+        return ""
+    traceback_index = next(
+        (index for index in range(len(cleaned) - 1, -1, -1) if cleaned[index].startswith("Traceback ")),
+        None,
+    )
+    selected = cleaned[traceback_index:] if traceback_index is not None else cleaned[-20:]
+    return "\n".join(selected)[-8000:]
 
 
 def persist_output(job_id, raw):
@@ -248,6 +263,7 @@ def run_job(job):
     stalled = False
     stream_open = True
     last_activity = time.monotonic()
+    raw_output_tail = deque(maxlen=100)
 
     while process.poll() is None or stream_open or not output.empty():
         try:
@@ -256,6 +272,7 @@ def run_job(job):
                 stream_open = False
             else:
                 last_activity = time.monotonic()
+                raw_output_tail.append(line)
                 persist_output(job["id"], line)
         except queue.Empty:
             pass
@@ -288,9 +305,24 @@ def run_job(job):
             add_event(conn, job["id"], "warning", "cancelled", "Scan cancelled")
         elif current.get("status") in {"running", "stopping"}:
             status = "failed" if return_code else "succeeded"
-            message = f"Worker exited with status {return_code}" if return_code else "Scan completed"
+            detail = failure_output(raw_output_tail) if return_code else ""
+            final_detail = detail.splitlines()[-1] if detail else ""
+            message = (
+                f"Conversion engine exited with status {return_code}: {final_detail}"
+                if return_code and final_detail
+                else f"Conversion engine exited with status {return_code}"
+                if return_code
+                else "Scan completed"
+            )
             conn.execute("UPDATE jobs SET status=?, finished_at=?, current_archive=NULL, error_message=? WHERE id=?", (status, utc_now(), message if return_code else None, job["id"]))
-            add_event(conn, job["id"], "error" if return_code else "success", status, message)
+            add_event(
+                conn,
+                job["id"],
+                "error" if return_code else "success",
+                "engine_exit" if return_code else status,
+                message,
+                data={"return_code": return_code, "output": detail} if return_code else None,
+            )
     STRUCTURED_JOBS.discard(job["id"])
 
 
