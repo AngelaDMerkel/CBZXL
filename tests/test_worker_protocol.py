@@ -77,6 +77,16 @@ class WorkerProtocolTests(unittest.TestCase):
         self.assertEqual(command.count("--no-flatten"), 1)
         self.assertNotIn("--delete-empty-archives", command)
 
+    def test_worker_rechecks_every_archive_for_entire_library_scope(self):
+        command = command_for_job(
+            {
+                "id": self.job_id,
+                "options_json": '{"recheck_all": true}',
+            },
+            {"root_path": "/library"},
+        )
+        self.assertIn("--recheck-all", command)
+
     def test_worker_passes_contextual_repair_options(self):
         command = command_for_job(
             {

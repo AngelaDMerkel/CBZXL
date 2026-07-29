@@ -12,7 +12,7 @@ import stat
 import sys
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from rich.console import Console
@@ -46,7 +46,7 @@ from cbzxl_web.protocol import EventEmitter
 # Default Constants (can be overwritten by args)
 DEFAULT_JXL_EFFORT = 10
 DEFAULT_THREADS = 10
-SCRIPT_VERSION = "4.0.0"
+SCRIPT_VERSION = "4.1.1"
 
 # Constants for use only in the Docker Container.
 CONFIG_DIR = os.getenv("CONFIG_DIR", "/config")
@@ -279,6 +279,70 @@ def start_run(conn, args, total_files):
     conn.commit()
 
 
+def record_library_snapshot(conn, job_id):
+    if conn is None or not job_id:
+        return
+    job = conn.execute(
+        "SELECT library_id, COALESCE(finished_at, ?) AS recorded_at FROM jobs WHERE id=?",
+        (utc_now(), job_id),
+    ).fetchone()
+    if not job:
+        return
+    totals = conn.execute(
+        """
+        SELECT
+            COUNT(*) AS archive_count,
+            SUM(CASE WHEN status='processed' THEN 1 ELSE 0 END) AS optimized_count,
+            SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed_count,
+            COALESCE(SUM(CASE WHEN status='processed' THEN original_size ELSE 0 END), 0) AS baseline_bytes,
+            COALESCE(SUM(CASE WHEN status='processed' THEN COALESCE(final_size, original_size) ELSE 0 END), 0) AS current_bytes,
+            COALESCE(SUM(CASE WHEN status='processed' THEN bytes_saved ELSE 0 END), 0) AS net_bytes,
+            COALESCE(SUM(CASE WHEN status='processed' THEN image_count ELSE 0 END), 0) AS page_count,
+            COALESCE(SUM(CASE WHEN status='processed' THEN converted_pages ELSE 0 END), 0) AS converted_pages,
+            COALESCE(AVG(CASE
+                WHEN status='processed' AND original_size > 0 THEN percent_saved END
+            ), 0) AS average_percent_saved
+        FROM archives
+        WHERE library_id=?
+        """,
+        (job["library_id"],),
+    ).fetchone()
+    conn.execute(
+        """
+        INSERT INTO library_stat_snapshots(
+            job_id, library_id, recorded_at, archive_count, optimized_count,
+            failed_count, baseline_bytes, current_bytes, net_bytes, page_count,
+            converted_pages, average_percent_saved
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(job_id) DO UPDATE SET
+            recorded_at=excluded.recorded_at,
+            archive_count=excluded.archive_count,
+            optimized_count=excluded.optimized_count,
+            failed_count=excluded.failed_count,
+            baseline_bytes=excluded.baseline_bytes,
+            current_bytes=excluded.current_bytes,
+            net_bytes=excluded.net_bytes,
+            page_count=excluded.page_count,
+            converted_pages=excluded.converted_pages,
+            average_percent_saved=excluded.average_percent_saved
+        """,
+        (
+            job_id,
+            job["library_id"],
+            job["recorded_at"],
+            totals["archive_count"] or 0,
+            totals["optimized_count"] or 0,
+            totals["failed_count"] or 0,
+            totals["baseline_bytes"] or 0,
+            totals["current_bytes"] or 0,
+            totals["net_bytes"] or 0,
+            totals["page_count"] or 0,
+            totals["converted_pages"] or 0,
+            totals["average_percent_saved"] or 0,
+        ),
+    )
+
+
 def finish_run(conn, status, processed, skipped, failed, flattened, deleted, saved_bytes, increased_bytes, net_bytes):
     normalized_status = "partial" if status == "finished_with_errors" else "succeeded" if status == "finished" else status
     event_type = "job_completed" if normalized_status in {"succeeded", "partial"} else "job_cancelled" if normalized_status == "cancelled" else "job_failed"
@@ -323,6 +387,7 @@ def finish_run(conn, status, processed, skipped, failed, flattened, deleted, sav
         net_bytes,
         RUN_ID,
     ))
+    record_library_snapshot(conn, RUN_ID)
     conn.commit()
 
 
@@ -394,6 +459,7 @@ def record_archive_result(
     retained_pages=0,
     error_message=None,
     archive_mtime_value=None,
+    generation=1,
 ):
     if DRY_RUN or conn is None or not RUN_ID:
         return
@@ -403,8 +469,8 @@ def record_archive_result(
         (job_id, archive_id, path, original_size, final_size, bytes_saved, percent_saved, status, dominant_type,
          jxl_effort, processing_duration_seconds, image_count, jpg_count, png_count,
          converted_pages, lossless_pages, lossy_pages, retained_pages, conversion_mode,
-         megapixels_info, error_message, converted_at, archive_mtime)
-        VALUES (?, (SELECT id FROM archives WHERE library_id=? AND path=?), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         megapixels_info, error_message, converted_at, archive_mtime, generation)
+        VALUES (?, (SELECT id FROM archives WHERE library_id=? AND path=?), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(job_id, path) DO UPDATE SET archive_id=excluded.archive_id, original_size=excluded.original_size,
           final_size=excluded.final_size, bytes_saved=excluded.bytes_saved, percent_saved=excluded.percent_saved,
           status=excluded.status, dominant_type=excluded.dominant_type, jxl_effort=excluded.jxl_effort,
@@ -414,7 +480,8 @@ def record_archive_result(
           lossy_pages=excluded.lossy_pages, retained_pages=excluded.retained_pages,
           conversion_mode=excluded.conversion_mode,
           megapixels_info=excluded.megapixels_info, error_message=excluded.error_message,
-          converted_at=excluded.converted_at, archive_mtime=excluded.archive_mtime
+          converted_at=excluded.converted_at, archive_mtime=excluded.archive_mtime,
+          generation=excluded.generation
     """, (
         RUN_ID,
         LIBRARY_ID,
@@ -440,6 +507,7 @@ def record_archive_result(
         error_message,
         utc_now(),
         archive_mtime_value,
+        generation,
     ))
 
 
@@ -460,6 +528,7 @@ def mark_processed(
     megapixels_info,
     content_fingerprint=None,
     *,
+    input_fingerprint=None,
     converted_pages=0,
     lossless_pages=0,
     lossy_pages=0,
@@ -470,17 +539,92 @@ def mark_processed(
         log(f"Would mark as processed: {path_str} (Duration: {duration:.2f}s, Images: {img_count})")
         return
 
-    percent_saved = (saved_bytes / original_size) * 100 if original_size > 0 else 0
     converted_at_iso = utc_now()
     archive_mtime_value = archive_mtime(cbz_path_obj)
     try:
+        existing = conn.execute(
+            """
+            SELECT original_size, final_size, content_fingerprint, dominant_type,
+                   image_count, jpg_count, png_count, converted_pages,
+                   lossless_pages, lossy_pages, retained_pages, conversion_mode,
+                   megapixels_info, generation
+            FROM archives
+            WHERE library_id=? AND path=?
+            """,
+            (LIBRARY_ID, path_str),
+        ).fetchone()
+        same_generation = False
+        generation = 1
+        baseline_size = original_size
+        state_dominant_type = dominant_type
+        state_image_count = img_count
+        state_jpg_count = num_jpg
+        state_png_count = num_png
+        state_converted_pages = converted_pages
+        state_lossless_pages = lossless_pages
+        state_lossy_pages = lossy_pages
+        state_retained_pages = retained_pages
+        state_conversion_mode = conversion_mode
+        state_megapixels_info = megapixels_info
+        if existing and existing["original_size"] is not None:
+            stored_fingerprint = existing["content_fingerprint"]
+            same_generation = (
+                input_fingerprint is None
+                or stored_fingerprint is None
+                or stored_fingerprint == input_fingerprint
+            )
+            generation = int(existing["generation"] or 1)
+            if same_generation:
+                baseline_size = int(existing["original_size"])
+                state_dominant_type = existing["dominant_type"] or dominant_type
+                state_image_count = img_count or int(existing["image_count"] or 0)
+                state_jpg_count = num_jpg or int(existing["jpg_count"] or 0)
+                state_png_count = num_png or int(existing["png_count"] or 0)
+                previous_converted = int(existing["converted_pages"] or 0)
+                previous_lossless = int(existing["lossless_pages"] or 0)
+                previous_lossy = int(existing["lossy_pages"] or 0)
+                previous_retained = int(existing["retained_pages"] or 0)
+                if converted_pages or lossless_pages or lossy_pages:
+                    state_converted_pages = min(
+                        state_image_count,
+                        previous_converted + converted_pages,
+                    )
+                    state_lossless_pages = min(
+                        state_converted_pages,
+                        previous_lossless + lossless_pages,
+                    )
+                    state_lossy_pages = min(
+                        state_converted_pages,
+                        previous_lossy + lossy_pages,
+                    )
+                    state_retained_pages = max(
+                        0,
+                        min(
+                            state_image_count - state_converted_pages,
+                            previous_retained + retained_pages,
+                        ),
+                    )
+                else:
+                    state_converted_pages = previous_converted
+                    state_lossless_pages = previous_lossless
+                    state_lossy_pages = previous_lossy
+                    state_retained_pages = previous_retained
+                    state_conversion_mode = existing["conversion_mode"] or conversion_mode
+                    state_megapixels_info = existing["megapixels_info"] or megapixels_info
+            elif stored_fingerprint and input_fingerprint != stored_fingerprint:
+                generation += 1
+
+        cumulative_saved_bytes = baseline_size - final_size
+        cumulative_percent_saved = (
+            cumulative_saved_bytes / baseline_size * 100 if baseline_size > 0 else 0
+        )
         conn.execute("""
             INSERT INTO archives
             (library_id, path, original_size, final_size, bytes_saved, percent_saved, converted_at, archive_mtime, content_fingerprint, status, dominant_type, jxl_effort,
              processing_duration_seconds, image_count, jpg_count, png_count,
              converted_pages, lossless_pages, lossy_pages, retained_pages,
-             script_version, jxl_version, conversion_mode, megapixels_info, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'processed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             script_version, jxl_version, conversion_mode, megapixels_info, generation, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'processed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(library_id, path) DO UPDATE SET original_size=excluded.original_size, final_size=excluded.final_size,
               bytes_saved=excluded.bytes_saved, percent_saved=excluded.percent_saved, converted_at=excluded.converted_at,
               archive_mtime=excluded.archive_mtime, content_fingerprint=excluded.content_fingerprint,
@@ -489,11 +633,12 @@ def mark_processed(
               image_count=excluded.image_count, jpg_count=excluded.jpg_count, png_count=excluded.png_count,
               converted_pages=excluded.converted_pages, lossless_pages=excluded.lossless_pages,
               lossy_pages=excluded.lossy_pages, retained_pages=excluded.retained_pages,
+              generation=excluded.generation,
               script_version=excluded.script_version, jxl_version=excluded.jxl_version, error_message=NULL,
               conversion_mode=excluded.conversion_mode, megapixels_info=excluded.megapixels_info, updated_at=excluded.updated_at
-        """, (LIBRARY_ID, path_str, original_size, final_size, saved_bytes, percent_saved, converted_at_iso, archive_mtime_value, content_fingerprint, dominant_type, jxl_effort_level,
-              duration, img_count, num_jpg, num_png, converted_pages, lossless_pages, lossy_pages,
-              retained_pages, SCRIPT_VERSION, JXL_VERSION, conversion_mode, megapixels_info,
+        """, (LIBRARY_ID, path_str, baseline_size, final_size, cumulative_saved_bytes, cumulative_percent_saved, converted_at_iso, archive_mtime_value, content_fingerprint, state_dominant_type, jxl_effort_level,
+              duration, state_image_count, state_jpg_count, state_png_count, state_converted_pages, state_lossless_pages, state_lossy_pages,
+              state_retained_pages, SCRIPT_VERSION, JXL_VERSION, state_conversion_mode, state_megapixels_info, generation,
               converted_at_iso, converted_at_iso))
         archive_id = conn.execute(
             "SELECT id FROM archives WHERE library_id=? AND path=?",
@@ -520,6 +665,7 @@ def mark_processed(
             lossy_pages,
             retained_pages,
             archive_mtime_value=archive_mtime_value,
+            generation=generation,
         )
         conn.commit()
     except sqlite3.DatabaseError as e:
@@ -544,20 +690,39 @@ def mark_failed(
         return
     archive_mtime_value = archive_mtime(cbz_path_obj)
     try:
+        current_size = get_size(cbz_path_obj)
+        existing = conn.execute(
+            """
+            SELECT status, final_size
+            FROM archives
+            WHERE library_id=? AND path=?
+            """,
+            (LIBRARY_ID, path_str),
+        ).fetchone()
+        preserved_current_state = bool(
+            existing
+            and existing["status"] == "processed"
+            and existing["final_size"] is not None
+            and int(existing["final_size"]) == current_size
+        )
+        archive_status = "processed" if preserved_current_state else "failed"
         conn.execute("""
             INSERT INTO archives
             (library_id, path, status, converted_at, archive_mtime, script_version, jxl_version,
              processing_duration_seconds, error_message, created_at, updated_at)
-            VALUES (?, ?, 'failed', ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(library_id, path) DO UPDATE SET status='failed', converted_at=excluded.converted_at,
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(library_id, path) DO UPDATE SET
+              status=excluded.status,
+              converted_at=excluded.converted_at,
               archive_mtime=excluded.archive_mtime, script_version=excluded.script_version, jxl_version=excluded.jxl_version,
               processing_duration_seconds=excluded.processing_duration_seconds, error_message=excluded.error_message,
               updated_at=excluded.updated_at
-        """, (LIBRARY_ID, path_str, utc_now(), archive_mtime_value, SCRIPT_VERSION, JXL_VERSION, duration, error_msg, utc_now(), utc_now()))
-        archive_id = conn.execute(
-            "SELECT id FROM archives WHERE library_id=? AND path=?",
+        """, (LIBRARY_ID, path_str, archive_status, utc_now(), archive_mtime_value, SCRIPT_VERSION, JXL_VERSION, duration, error_msg, utc_now(), utc_now()))
+        archive = conn.execute(
+            "SELECT id, generation FROM archives WHERE library_id=? AND path=?",
             (LIBRARY_ID, path_str),
-        ).fetchone()[0]
+        ).fetchone()
+        archive_id = archive["id"]
         upsert_archive_issue(
             conn,
             archive_id=archive_id,
@@ -585,6 +750,7 @@ def mark_failed(
             "N/A",
             error_message=error_msg,
             archive_mtime_value=archive_mtime_value,
+            generation=int(archive["generation"] or 1),
         )
         conn.commit()
     except sqlite3.DatabaseError as e:
@@ -1002,6 +1168,19 @@ def convert_images(temp_dir_path, cli_args, workspace=None, archive_path=None):
         elif ext in known_other_image_exts:
             other_image_paths.append(p)
             other_count += 1
+
+    preserved_entry = (
+        PurePosixPath(str(getattr(cli_args, "repair_entry", "") or "")).as_posix()
+        if getattr(cli_args, "repair_action", None) == "preserve"
+        else None
+    )
+    preserved_count = 0
+    if preserved_entry:
+        for path in list(convertible_paths):
+            if path.relative_to(temp_dir_path).as_posix() == preserved_entry:
+                convertible_paths.remove(path)
+                preserved_count = 1
+                break
     
     other_type = format_summary(other_image_paths) if other_image_paths else "Other"
     image_count = jpg_count + png_count + tiff_count + bmp_count + jxl_count + other_count
@@ -1026,7 +1205,7 @@ def convert_images(temp_dir_path, cli_args, workspace=None, archive_path=None):
         0,
         0,
         0,
-        0,
+        preserved_count,
     )
 
     if not convertible_paths:
@@ -1048,7 +1227,7 @@ def convert_images(temp_dir_path, cli_args, workspace=None, archive_path=None):
                 0,
                 0,
                 0,
-                0,
+                preserved_count,
             )
         else:
             return ConversionStatus.NO_IMAGES_RECOGNIZED, *base_return
@@ -1161,7 +1340,7 @@ def convert_images(temp_dir_path, cli_args, workspace=None, archive_path=None):
     lossy_pages = sum(
         1 for page in resumed_records if "Lossy" in str(page.get("mode") or "")
     ) + sum(1 for result in results if result[5] and "Lossy" in result[2])
-    retained_pages = sum(1 for result in results if not result[5])
+    retained_pages = preserved_count + sum(1 for result in results if not result[5])
     megapixels_list = [r[1] for r in results if r[1] > 0]
     modes_set = {r[2] for r in results if r[5] and r[2] != "N/A"}
     distances_set = {r[3] for r in results if r[5] and r[2] != "N/A"}
@@ -1251,7 +1430,10 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args, fingerprint=None):
         resumed, resumed_pages = workspace.prepare(
             MAX_ARCHIVE_UNCOMPRESSED_BYTES,
             CANCEL_TOKEN,
-            recover_crc_entry=repair_entry if repair_action == "rebuild" else None,
+            recover_crc_entry=repair_entry
+            if repair_action in {"rebuild", "preserve"}
+            else None,
+            recover_size_mismatch=repair_action in {"rebuild", "preserve"},
         )
         temp_dir_obj = workspace.files
         if resumed:
@@ -1264,7 +1446,7 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args, fingerprint=None):
                 total_pages=resumed_pages,
             )
         repair_applied = False
-        if repair_action in {"replace", "delete", "rebuild"}:
+        if repair_action in {"replace", "delete", "rebuild", "preserve"}:
             expected_repair = {"action": repair_action, "entry": repair_entry}
             if workspace.manifest.get("repair") != expected_repair:
                 workspace.set_stage("repairing")
@@ -1273,7 +1455,7 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args, fingerprint=None):
                 elif repair_action == "delete":
                     workspace.delete_entry(repair_entry)
                 else:
-                    workspace.mark_repair("rebuild", repair_entry)
+                    workspace.mark_repair(repair_action, repair_entry)
             repair_applied = True
             emit(
                 "repair_applied",
@@ -1354,6 +1536,7 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args, fingerprint=None):
             mark_processed(
                 conn_main, cbz_path_obj, rel_path_str, original_cbz_size, original_cbz_size, 0,
                 dominant_type, JXL_EFFORT, duration_value, img_count, num_jpg, num_png, conv_mode, mp_info, fingerprint,
+                input_fingerprint=fingerprint,
                 converted_pages=converted_pages,
                 lossless_pages=lossless_pages,
                 lossy_pages=lossy_pages,
@@ -1406,6 +1589,7 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args, fingerprint=None):
                         conn_main, cbz_path_obj, rel_path_str, original_cbz_size, original_cbz_size, 0,
                         dominant_type, JXL_EFFORT, duration_value, img_count, num_jpg, num_png,
                         "Original retained", mp_info, fingerprint,
+                        input_fingerprint=fingerprint,
                         converted_pages=0,
                         lossless_pages=0,
                         lossy_pages=0,
@@ -1445,6 +1629,7 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args, fingerprint=None):
         mark_processed(
             conn_main, cbz_path_obj, rel_path_str, original_cbz_size, final_size, actual_saved_bytes,
             dominant_type, JXL_EFFORT, duration_value, img_count, num_jpg, num_png, conv_mode, mp_info, final_fingerprint,
+            input_fingerprint=fingerprint,
             converted_pages=converted_pages,
             lossless_pages=lossless_pages,
             lossy_pages=lossy_pages,
@@ -1494,7 +1679,11 @@ def attempt_archive(cbz_path, resolved_input_dir, processed_paths, conn, fail_co
             fingerprint = archive_fingerprint(cbz_path)
         except (OSError, zipfile.BadZipFile):
             fingerprint = None
-        if processed_row and archive_is_current(cbz_path, processed_row, fingerprint):
+        if (
+            processed_row
+            and archive_is_current(cbz_path, processed_row, fingerprint)
+            and not RECHECK_ALL
+        ):
             emit(
                 "archive_completed",
                 message=f"Skipped unchanged archive {rel_path_for_db}",
@@ -1540,7 +1729,7 @@ def main():
     action_group.add_argument("--only-path", help=argparse.SUPPRESS)
     action_group.add_argument("--compatibility-mode", action="store_true", help=argparse.SUPPRESS)
     action_group.add_argument("--continue-on-page-error", action="store_true", help=argparse.SUPPRESS)
-    action_group.add_argument("--repair-action", choices=("replace", "delete", "rebuild"), help=argparse.SUPPRESS)
+    action_group.add_argument("--repair-action", choices=("replace", "delete", "rebuild", "preserve"), help=argparse.SUPPRESS)
     action_group.add_argument("--repair-entry", help=argparse.SUPPRESS)
     action_group.add_argument("--repair-source", help=argparse.SUPPRESS)
 
@@ -1601,7 +1790,7 @@ def main():
     fail_conn = None
     
     processed_paths = {}
-    if conn and not RECHECK_ALL:
+    if conn:
         try:
             cursor = conn.execute(
                 "SELECT path, converted_at, archive_mtime, content_fingerprint FROM archives WHERE library_id=? AND status='processed'",
@@ -1621,7 +1810,13 @@ def main():
         failed_paths = {
             row[0]
             for row in conn.execute(
-                "SELECT path FROM archives WHERE library_id=? AND status='failed'",
+                """
+                SELECT DISTINCT a.path
+                FROM archives a
+                LEFT JOIN archive_issues ai
+                  ON ai.archive_id=a.id AND ai.status IN ('open', 'queued')
+                WHERE a.library_id=? AND (a.status='failed' OR ai.id IS NOT NULL)
+                """,
                 (LIBRARY_ID,),
             )
         }
@@ -1652,7 +1847,7 @@ def main():
         log(f"   Mode: SMART LOSSLESS-FIRST (lossy fallback d={args.distance if args.distance is not None else 0.5})")
         log(f"     Lossy thresholds: >{args.smart_mb:.1f} MB or >{args.smart_mp:.1f} MP")
     if BACKUP_ENABLED: log("   Backup: ENABLED")
-    if RECHECK_ALL: log("   Mode: RECHECK ALL ARCHIVES (Overwriting DB entries)")
+    if RECHECK_ALL: log("   Mode: RECHECK ALL ARCHIVES (Preserving lifetime baselines)")
     if DELETE_EMPTY_ARCHIVES: log("   Action: DELETE EMPTY ARCHIVES ENABLED")
 
     total_bytes_saved_overall, total_bytes_increased_overall = 0, 0

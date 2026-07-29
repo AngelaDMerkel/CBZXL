@@ -215,7 +215,7 @@ def run_job(job):
         return
 
     options = json.loads(job["options_json"])
-    if not options.get("only_path") and not options.get("failed_only"):
+    if options.get("recheck_all") and not options.get("only_path") and not options.get("failed_only"):
         with transaction(immediate=True) as conn:
             now = utc_now()
             dismissed = conn.execute(

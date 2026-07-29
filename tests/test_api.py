@@ -129,6 +129,82 @@ class ApiTests(unittest.TestCase):
         listed = self.client.get("/api/schedules").json()["rows"]
         self.assertEqual(listed[0]["profile_name"], "Recheck without conversion")
 
+    def test_conversion_policy_is_physically_deleted_and_dependents_are_reassigned(self):
+        bootstrap = self.client.get("/api/bootstrap").json()
+        library_id = bootstrap["libraries"][0]["id"]
+        default_profile = next(profile for profile in bootstrap["profiles"] if profile["is_default"])
+        created = self.client.post(
+            "/api/profiles",
+            json={
+                "name": "Temporary policy",
+                "is_default": False,
+                "options": {
+                    **database.DEFAULT_OPTIONS,
+                    "failed_only": True,
+                },
+            },
+        ).json()
+        schedule = self.client.post(
+            "/api/schedules",
+            json={
+                "name": "Temporary policy schedule",
+                "enabled": True,
+                "cadence": "daily",
+                "hour": 4,
+                "minute": 0,
+                "library_id": library_id,
+                "profile_id": created["id"],
+            },
+        ).json()
+        job = self.client.post(
+            "/api/jobs",
+            json={"profile_id": created["id"], "scope": "unprocessed"},
+        ).json()
+
+        deleted = self.client.delete(f"/api/profiles/{created['id']}")
+
+        self.assertEqual(deleted.status_code, 204)
+        with database.connect() as conn:
+            self.assertIsNone(
+                conn.execute(
+                    "SELECT id FROM conversion_profiles WHERE id=?",
+                    (created["id"],),
+                ).fetchone()
+            )
+            reassigned = conn.execute(
+                "SELECT profile_id FROM schedules WHERE id=?",
+                (schedule["id"],),
+            ).fetchone()
+            historical_job = conn.execute(
+                "SELECT profile_id FROM jobs WHERE id=?",
+                (job["id"],),
+            ).fetchone()
+        self.assertEqual(reassigned["profile_id"], default_profile["id"])
+        self.assertIsNone(historical_job["profile_id"])
+
+    def test_deleted_builtin_policy_is_not_recreated(self):
+        bootstrap = self.client.get("/api/bootstrap").json()
+        deleted_profile = next(
+            profile
+            for profile in bootstrap["profiles"]
+            if profile["is_default"]
+        )
+        self.assertEqual(
+            self.client.delete(f"/api/profiles/{deleted_profile['id']}").status_code,
+            204,
+        )
+
+        refreshed = self.client.get("/api/bootstrap").json()
+
+        self.assertNotIn(
+            deleted_profile["id"],
+            {profile["id"] for profile in refreshed["profiles"]},
+        )
+        self.assertEqual(
+            sum(1 for profile in refreshed["profiles"] if profile["is_default"]),
+            1,
+        )
+
     def test_job_progress_includes_rate_metadata(self):
         job = self.client.post("/api/jobs", json={}).json()
         hydrated = self.client.get(f"/api/jobs/{job['id']}").json()["job"]
@@ -173,6 +249,75 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(options["no_flatten"])
         self.assertFalse(options["delete_empty"])
 
+    def test_failed_retry_exposes_and_permanently_deletes_archive(self):
+        issue_id = self.create_issue(kind="archive_corrupt", entry_path=None)
+        archive_path = Path(self.temp.name) / "Series" / "Book.cbz"
+        archive_path.parent.mkdir(parents=True)
+        archive_path.write_bytes(b"not a zip")
+        with database.transaction() as conn:
+            library = database.default_library(conn)
+            conn.execute(
+                "UPDATE libraries SET root_path=? WHERE id=?",
+                (self.temp.name, library["id"]),
+            )
+            retry_job_id = database.create_job(
+                conn,
+                source="retry",
+                library_id=library["id"],
+                profile_id=None,
+                options=database.DEFAULT_OPTIONS,
+            )
+            conn.execute(
+                "UPDATE archive_issues SET job_id=?, status='open' WHERE id=?",
+                (retry_job_id, issue_id),
+            )
+
+        issue = self.client.get("/api/issues").json()["rows"][0]
+        self.assertTrue(issue["retry_failed"])
+
+        response = self.client.post(
+            f"/api/issues/{issue_id}/action",
+            json={"action": "delete_archive"},
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()["status"], "deleted")
+        self.assertFalse(archive_path.exists())
+        with database.connect() as conn:
+            self.assertIsNone(
+                conn.execute(
+                    "SELECT id FROM archives WHERE path='Series/Book.cbz'"
+                ).fetchone()
+            )
+            self.assertIsNone(
+                conn.execute(
+                    "SELECT id FROM archive_issues WHERE id=?",
+                    (issue_id,),
+                ).fetchone()
+            )
+
+    def test_archive_cannot_be_deleted_before_a_retry_fails(self):
+        issue_id = self.create_issue(kind="archive_corrupt", entry_path=None)
+        archive_path = Path(self.temp.name) / "Series" / "Book.cbz"
+        archive_path.parent.mkdir(parents=True)
+        archive_path.write_bytes(b"not a zip")
+        with database.transaction() as conn:
+            library = database.default_library(conn)
+            conn.execute(
+                "UPDATE libraries SET root_path=? WHERE id=?",
+                (self.temp.name, library["id"]),
+            )
+
+        issue = self.client.get("/api/issues").json()["rows"][0]
+        self.assertFalse(issue["retry_failed"])
+        response = self.client.post(
+            f"/api/issues/{issue_id}/action",
+            json={"action": "delete_archive"},
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertTrue(archive_path.exists())
+
     def test_dismiss_hides_issue_until_full_rescan(self):
         issue_id = self.create_issue()
         response = self.client.post(
@@ -194,6 +339,21 @@ class ApiTests(unittest.TestCase):
         with database.connect() as conn:
             options = json.loads(conn.execute("SELECT options_json FROM jobs WHERE id=?", (job["id"],)).fetchone()[0])
         self.assertTrue(options["failed_only"])
+        self.assertFalse(options["recheck_all"])
+
+    def test_unprocessed_is_the_default_manual_scope(self):
+        job = self.client.post("/api/jobs", json={}).json()
+        with database.connect() as conn:
+            options = json.loads(conn.execute("SELECT options_json FROM jobs WHERE id=?", (job["id"],)).fetchone()[0])
+        self.assertFalse(options["failed_only"])
+        self.assertFalse(options["recheck_all"])
+
+    def test_entire_library_scope_rechecks_processed_archives(self):
+        job = self.client.post("/api/jobs", json={"scope": "library"}).json()
+        with database.connect() as conn:
+            options = json.loads(conn.execute("SELECT options_json FROM jobs WHERE id=?", (job["id"],)).fetchone()[0])
+        self.assertFalse(options["failed_only"])
+        self.assertTrue(options["recheck_all"])
 
     def test_detailed_statistics_reports_page_outcomes_and_lifetime_trend(self):
         bootstrap = self.client.get("/api/bootstrap").json()
@@ -241,6 +401,17 @@ class ApiTests(unittest.TestCase):
                 """,
                 (job_id, archive_id),
             )
+            conn.execute(
+                """
+                INSERT INTO library_stat_snapshots(
+                    job_id, library_id, recorded_at, archive_count,
+                    optimized_count, failed_count, baseline_bytes,
+                    current_bytes, net_bytes, page_count, converted_pages,
+                    average_percent_saved
+                ) VALUES (?, ?, ?, 2, 1, 1, 1500, 1200, ?, 10, 8, 25)
+                """,
+                (job_id, library_id, now, 1024 ** 3),
+            )
 
         response = self.client.get("/api/statistics")
 
@@ -252,21 +423,24 @@ class ApiTests(unittest.TestCase):
         outcomes = {row["label"]: row["count"] for row in payload["outcomes"]}
         self.assertEqual(outcomes["Lossless JXL"], 6)
         self.assertEqual(outcomes["Smart lossy"], 2)
-        self.assertEqual(payload["run_trend"][0]["cumulative_net_gb"], 0.0)
+        self.assertEqual(payload["run_trend"][0]["cumulative_net_gb"], 1.0)
+        self.assertEqual(payload["run_trend"][0]["average_percent_saved"], 25)
+        self.assertTrue(payload["run_trend"][0]["library_snapshot"])
         self.assertEqual(payload["processing"]["median_seconds"], 40)
         self.assertEqual(payload["effort"]["archives_attempted"], 1)
 
-    def test_crc_diagnostics_offer_safe_rebuild_for_a_decodable_entry(self):
+    def test_crc_diagnostics_offer_recovery_for_a_decodable_jxl_with_bad_size(self):
         library_root = Path(self.temp.name) / "library"
         archive_path = library_root / "Series" / "Book.cbz"
         archive_path.parent.mkdir(parents=True)
-        payload = b"recoverable-png-payload"
+        payload = b"\xff\x0a" + (b"recoverable-jxl-payload" * 8)
         with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as target:
-            target.writestr("pages/003.png", payload)
+            target.writestr("pages/009.jxl", payload)
         archive_bytes = bytearray(archive_path.read_bytes())
         central_offset = archive_bytes.index(b"PK\x01\x02")
         original_crc = struct.unpack_from("<L", archive_bytes, central_offset + 16)[0]
         struct.pack_into("<L", archive_bytes, central_offset + 16, original_crc ^ 0xFFFFFFFF)
+        struct.pack_into("<L", archive_bytes, central_offset + 24, len(payload) + 19)
         archive_path.write_bytes(archive_bytes)
 
         with database.transaction() as conn:
@@ -275,10 +449,14 @@ class ApiTests(unittest.TestCase):
                 "UPDATE libraries SET root_path=? WHERE id=?",
                 (str(library_root), library["id"]),
             )
-        issue_id = self.create_issue(kind="crc_mismatch", entry_path="pages/003.png")
+        issue_id = self.create_issue(kind="crc_mismatch", entry_path="pages/009.jxl")
 
-        identify_result = mock.Mock(returncode=0, stdout="PNG 1200 1800", stderr="")
-        with mock.patch.object(web_app.subprocess, "run", return_value=identify_result):
+        decode_result = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(
+            web_app.subprocess,
+            "run",
+            return_value=decode_result,
+        ) as decode:
             diagnostics = self.client.get(f"/api/issues/{issue_id}/diagnostics")
             rebuilt = self.client.post(
                 f"/api/issues/{issue_id}/action",
@@ -287,9 +465,22 @@ class ApiTests(unittest.TestCase):
 
         self.assertEqual(diagnostics.status_code, 200)
         self.assertTrue(diagnostics.json()["repairable"])
+        self.assertTrue(diagnostics.json()["size_mismatch"])
+        self.assertEqual(diagnostics.json()["declared_bytes"], len(payload) + 19)
+        self.assertEqual(diagnostics.json()["recovered_bytes"], len(payload))
         self.assertNotEqual(
             diagnostics.json()["expected_crc32"],
             diagnostics.json()["calculated_crc32"],
+        )
+        self.assertEqual(
+            decode.call_args.args[0],
+            [
+                "djxl",
+                mock.ANY,
+                "--disable_output",
+                "--num_threads=1",
+                "--quiet",
+            ],
         )
         self.assertEqual(rebuilt.status_code, 201)
         with database.connect() as conn:
@@ -300,7 +491,32 @@ class ApiTests(unittest.TestCase):
                 ).fetchone()[0]
             )
         self.assertEqual(options["repair_action"], "rebuild")
-        self.assertEqual(options["repair_entry"], "pages/003.png")
+        self.assertEqual(options["repair_entry"], "pages/009.jxl")
+
+    def test_crc_issue_can_preserve_the_page_and_convert_the_rest(self):
+        issue_id = self.create_issue(
+            kind="crc_mismatch",
+            entry_path="pages/003.jpg",
+        )
+
+        listed = self.client.get("/api/issues").json()["rows"][0]
+        response = self.client.post(
+            f"/api/issues/{issue_id}/action",
+            json={"action": "preserve"},
+        )
+
+        self.assertIn("preserve", listed["remedies"])
+        self.assertEqual(response.status_code, 201)
+        with database.connect() as conn:
+            options = json.loads(
+                conn.execute(
+                    "SELECT options_json FROM jobs WHERE id=?",
+                    (response.json()["job_id"],),
+                ).fetchone()[0]
+            )
+        self.assertEqual(options["repair_action"], "preserve")
+        self.assertEqual(options["repair_entry"], "pages/003.jpg")
+        self.assertTrue(options["continue_on_page_error"])
 
     def test_homepage_widget_reports_exact_net_savings_and_idle_state(self):
         with database.transaction() as conn:

@@ -1,9 +1,12 @@
 import os
+import shutil
 import struct
+import subprocess
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 from cbzxl_web.engine import (
     CancellationToken,
@@ -132,6 +135,41 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(names, ["Chapter 1/001.png"])
         self.assertEqual((extracted / "Chapter 1/001.png").read_bytes(), payload)
 
+    def test_crc_recovery_can_ignore_incorrect_declared_size_within_limit(self):
+        damaged = self.root / "bad-size.cbz"
+        payload = b"recoverable-jxl-payload" * 16
+        with zipfile.ZipFile(damaged, "w", zipfile.ZIP_DEFLATED) as target:
+            target.writestr("009.jxl", payload)
+
+        archive_bytes = bytearray(damaged.read_bytes())
+        central_offset = archive_bytes.index(b"PK\x01\x02")
+        struct.pack_into("<L", archive_bytes, central_offset + 24, len(payload) + 37)
+        damaged.write_bytes(archive_bytes)
+
+        with zipfile.ZipFile(damaged, "r") as source:
+            info = source.getinfo("009.jxl")
+            with self.assertRaisesRegex(VerificationError, "wrong size"):
+                recover_zip_entry_bytes(damaged, info, max_bytes=1024 * 1024)
+            recovered = recover_zip_entry_bytes(
+                damaged,
+                info,
+                max_bytes=1024 * 1024,
+                allow_size_mismatch=True,
+            )
+
+        self.assertEqual(recovered, payload)
+        extracted = self.root / "recovered-size"
+        names = safe_extract_archive(
+            damaged,
+            extracted,
+            1024 * 1024,
+            CancellationToken(),
+            recover_crc_entry="009.jxl",
+            recover_size_mismatch=True,
+        )
+        self.assertEqual(names, ["009.jxl"])
+        self.assertEqual((extracted / "009.jxl").read_bytes(), payload)
+
     def test_archive_verification_checks_entry_set_and_signatures(self):
         workspace = self.root / "files"
         workspace.mkdir()
@@ -145,6 +183,68 @@ class EngineTests(unittest.TestCase):
             target.write(metadata, "ComicInfo.xml")
         result = verify_archive(candidate, workspace, [page, metadata], CancellationToken(), deep_samples=0)
         self.assertEqual(result, {"entries": 2, "jxl_entries": 1, "decoded_samples": 0})
+
+    def test_archive_verification_decodes_without_forcing_an_export_format(self):
+        workspace = self.root / "decode-files"
+        workspace.mkdir()
+        page = workspace / "001.jxl"
+        page.write_bytes(JXL_SIGNATURE)
+        candidate = self.root / "decode-candidate.cbz"
+        with zipfile.ZipFile(candidate, "w", zipfile.ZIP_STORED) as target:
+            target.write(page, "001.jxl")
+
+        with mock.patch("cbzxl_web.engine.run_cancellable") as run:
+            run.return_value = mock.Mock(returncode=0, stderr="")
+            result = verify_archive(
+                candidate,
+                workspace,
+                [page],
+                CancellationToken(),
+                deep_samples=1,
+            )
+
+        self.assertEqual(result["decoded_samples"], 1)
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                "djxl",
+                str(page),
+                "--disable_output",
+                "--num_threads=1",
+                "--quiet",
+            ],
+        )
+        self.assertTrue(run.call_args.kwargs["discard_stdout"])
+
+    @unittest.skipUnless(
+        shutil.which("cjxl") and shutil.which("djxl"),
+        "libjxl command-line tools are required",
+    )
+    def test_archive_verification_accepts_grayscale_jxl(self):
+        workspace = self.root / "grayscale-files"
+        workspace.mkdir()
+        source = workspace / "001.pgm"
+        source.write_bytes(b"P5\n16 16\n255\n" + bytes(range(256)))
+        page = workspace / "001.jxl"
+        subprocess.run(
+            ["cjxl", "-d", "0", "--quiet", str(source), str(page)],
+            check=True,
+            capture_output=True,
+        )
+        source.unlink()
+        candidate = self.root / "grayscale-candidate.cbz"
+        with zipfile.ZipFile(candidate, "w", zipfile.ZIP_STORED) as target:
+            target.write(page, "001.jxl")
+
+        result = verify_archive(
+            candidate,
+            workspace,
+            [page],
+            CancellationToken(),
+            deep_samples=1,
+        )
+
+        self.assertEqual(result["decoded_samples"], 1)
 
     def test_filename_invariant_allows_only_extension_change(self):
         verify_filename_invariants(

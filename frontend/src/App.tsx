@@ -156,6 +156,12 @@ function policyStrategy(options: Json = {}) {
   return "lossless";
 }
 
+function policyScope(options: Json = {}) {
+  if (options.failed_only) return "failed";
+  if (options.recheck_all) return "library";
+  return "unprocessed";
+}
+
 function policySummary(profile: Json) {
   const options = profile.options || {};
   const strategy = policyStrategy(options);
@@ -177,7 +183,7 @@ function ManualConversion({ bootstrap, onQueued, notify }: {
   const profiles = bootstrap.profiles || [];
   const defaultProfile = profiles.find((row: Json) => row.is_default) || profiles[0] || {};
   const [open, setOpen] = useState(false);
-  const [scope, setScope] = useState<"library" | "failed">("library");
+  const [scope, setScope] = useState<"library" | "unprocessed" | "failed">("unprocessed");
   const [profileId, setProfileId] = useState(defaultProfile.id || "");
   const profile = profiles.find((row: Json) => row.id === profileId) || defaultProfile;
   const defaults = profile.options || {};
@@ -235,6 +241,7 @@ function ManualConversion({ bootstrap, onQueued, notify }: {
         <div className="choice-stack">
           <div className="choice-nav" role="group" aria-label="Conversion scope">
             <button type="button" className={scope === "library" ? "selected" : ""} onClick={() => setScope("library")}>▤ Entire Library</button>
+            <button type="button" className={scope === "unprocessed" ? "selected" : ""} onClick={() => setScope("unprocessed")}>Unprocessed</button>
             <button type="button" className={scope === "failed" ? "selected" : ""} onClick={() => setScope("failed")}>△ Failed</button>
           </div>
           <div className="choice-nav" role="group" aria-label="Conversion policy">
@@ -273,13 +280,59 @@ function DistributionChart({ rows, tone = "blue", label }: {
   </div>;
 }
 
-function PerformanceChart({ rows, range }: { rows: Json[]; range: "90" | "365" | "all" }) {
+type PerformancePoint = Json & {
+  timestamp: number;
+  average_percent_saved: number;
+  run_count: number;
+};
+
+function performanceData(rows: Json[], range: "90" | "365" | "all"): PerformancePoint[] {
+  const ordered = rows
+    .map((row: Json) => ({ ...row, timestamp: Date.parse(row.date || "") }) as Json & { timestamp: number })
+    .filter((row) => Number.isFinite(row.timestamp))
+    .sort((left, right) => left.timestamp - right.timestamp);
+  const cumulative: PerformancePoint[] = ordered.map((row) => ({
+    ...row,
+    average_percent_saved: Number(row.average_percent_saved || 0),
+    run_count: 1,
+  }) as PerformancePoint);
   const cutoff = range === "all" ? null : Date.now() - Number(range) * 24 * 60 * 60 * 1000;
-  const filtered = rows.filter((row: Json) => {
-    const timestamp = Date.parse(row.date || "");
-    return cutoff === null || (Number.isFinite(timestamp) && timestamp >= cutoff);
+  const filtered = cumulative.filter((row: Json) => cutoff === null || row.timestamp >= cutoff);
+  const visible = filtered.length ? filtered : cumulative.slice(-1);
+  const pointLimit = range === "90" ? 13 : 12;
+  if (visible.length <= pointLimit) return visible;
+
+  const firstTimestamp = visible[0].timestamp;
+  const lastTimestamp = visible[visible.length - 1].timestamp;
+  const span = Math.max(1, lastTimestamp - firstTimestamp);
+  const buckets = new Map<number, Json[]>();
+  visible.forEach((row: Json) => {
+    const bucket = Math.min(pointLimit - 1, Math.floor((row.timestamp - firstTimestamp) / span * pointLimit));
+    buckets.set(bucket, [...(buckets.get(bucket) || []), row]);
   });
-  const data = filtered.length ? filtered : rows.slice(-1);
+  return [...buckets.entries()]
+    .sort(([left], [right]) => left - right)
+    .map(([, bucketRows]) => {
+      const last = bucketRows[bucketRows.length - 1];
+      return {
+        ...last,
+        run_count: bucketRows.length,
+      } as PerformancePoint;
+    });
+}
+
+function niceChartStep(value: number) {
+  if (!Number.isFinite(value) || value <= 0) return 1;
+  const magnitude = 10 ** Math.floor(Math.log10(value));
+  const normalized = value / magnitude;
+  const factor = [1, 2, 5, 10].reduce((closest, candidate) =>
+    Math.abs(candidate - normalized) < Math.abs(closest - normalized) ? candidate : closest
+  );
+  return factor * magnitude;
+}
+
+function PerformanceChart({ rows, range }: { rows: Json[]; range: "90" | "365" | "all" }) {
+  const data = performanceData(rows, range);
   if (!data.length) return <div className="chart-empty">Completed runs will build the lifetime trend.</div>;
 
   const width = 760;
@@ -289,44 +342,65 @@ function PerformanceChart({ rows, range }: { rows: Json[]; range: "90" | "365" |
   const plotHeight = height - margin.top - margin.bottom;
   const netValues = data.map((row: Json) => Number(row.cumulative_net_gb || 0));
   const averageValues = data.map((row: Json) => Number(row.average_percent_saved || 0));
-  const netMinimum = Math.min(0, ...netValues);
-  const netMaximum = Math.max(1, ...netValues);
+  const netFloor = Math.min(0, ...netValues);
+  const netCeiling = Math.max(1, ...netValues);
+  const netStep = niceChartStep((netCeiling - netFloor) / 4);
+  const netMinimum = Math.floor(netFloor / netStep) * netStep;
+  const netMaximum = Math.ceil(netCeiling / netStep) * netStep;
   const averageMinimum = Math.floor(Math.min(...averageValues) / 5) * 5;
   const averageMaximum = Math.max(5, Math.ceil(Math.max(...averageValues) / 5) * 5);
-  const x = (index: number) => margin.left + index / Math.max(1, data.length - 1) * plotWidth;
+  const firstTimestamp = Number(data[0].timestamp);
+  const lastTimestamp = Number(data[data.length - 1].timestamp);
+  const timestampSpan = Math.max(1, lastTimestamp - firstTimestamp);
+  const x = (row: Json, index: number) => data.length === 1
+    ? margin.left + plotWidth
+    : margin.left + (Number(row.timestamp) - firstTimestamp) / timestampSpan * plotWidth;
   const netY = (value: number) => margin.top + (netMaximum - value) / Math.max(1, netMaximum - netMinimum) * plotHeight;
   const averageY = (value: number) => margin.top + (averageMaximum - value) / Math.max(1, averageMaximum - averageMinimum) * plotHeight;
-  const netPoints = data.map((row: Json, index: number) => `${x(index)},${netY(Number(row.cumulative_net_gb || 0))}`).join(" ");
-  const averagePoints = data.map((row: Json, index: number) => `${x(index)},${averageY(Number(row.average_percent_saved || 0))}`).join(" ");
-  const area = `${margin.left},${margin.top + plotHeight} ${netPoints} ${margin.left + plotWidth},${margin.top + plotHeight}`;
-  const gridValues = Array.from({ length: 4 }, (_, index) => netMinimum + (netMaximum - netMinimum) * index / 3);
+  const netPoints = data.map((row: Json, index: number) => `${x(row, index)},${netY(Number(row.cumulative_net_gb || 0))}`).join(" ");
+  const averagePoints = data.map((row: Json, index: number) => `${x(row, index)},${averageY(Number(row.average_percent_saved || 0))}`).join(" ");
+  const gridValues = Array.from(
+    { length: Math.round((netMaximum - netMinimum) / netStep) + 1 },
+    (_, index) => netMinimum + netStep * index,
+  );
   const tickIndexes = [...new Set([0, Math.floor((data.length - 1) / 2), data.length - 1])];
+  const dateFormat = range === "90"
+    ? { day: "numeric", month: "short" } as const
+    : { month: "short", year: "numeric" } as const;
+  const formatDate = (row: Json) => new Date(row.timestamp).toLocaleDateString(undefined, dateFormat);
+  const first = data[0];
   const last = data[data.length - 1];
+  const displayedRuns = data.reduce((total: number, row: Json) => total + Number(row.run_count || 1), 0);
 
-  return <svg className="performance-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Net savings and average percentage saved over completed conversion runs">
-    <title>Conversion performance over time</title>
-    {gridValues.map((value) => <g key={value}>
-      <line x1={margin.left} y1={netY(value)} x2={margin.left + plotWidth} y2={netY(value)} />
-      <text x={margin.left - 9} y={netY(value) + 4} textAnchor="end">{Math.round(value)} GB</text>
-    </g>)}
-    <line x1={margin.left} y1={margin.top + plotHeight} x2={margin.left + plotWidth} y2={margin.top + plotHeight} />
-    <polygon className="net-area" points={area} />
-    <polyline className="net-line" points={netPoints} />
-    <polyline className="average-line" points={averagePoints} />
-    {data.map((row: Json, index: number) => <g key={row.id || `${row.date}-${index}`}>
-      <circle className="net-point" cx={x(index)} cy={netY(Number(row.cumulative_net_gb || 0))} r={index === data.length - 1 ? 4 : 3} />
-      <circle className="average-point" cx={x(index)} cy={averageY(Number(row.average_percent_saved || 0))} r={index === data.length - 1 ? 4 : 3} />
-      {["partial", "failed", "interrupted"].includes(row.status) && <rect className="exception-point" x={x(index) - 3} y={margin.top + plotHeight + 10} width="6" height="6" transform={`rotate(45 ${x(index)} ${margin.top + plotHeight + 13})`} />}
-    </g>)}
-    {tickIndexes.map((index) => <text
-      key={index}
-      x={x(index)}
-      y={height - 10}
-      textAnchor={index === 0 ? "start" : index === data.length - 1 ? "end" : "middle"}
-    >{new Date(data[index].date).toLocaleDateString(undefined, { month: "short", year: "numeric" })}</text>)}
-    <text className="chart-value" x={margin.left + plotWidth + 10} y={netY(Number(last.cumulative_net_gb || 0)) + 4}>{Number(last.cumulative_net_gb || 0).toFixed(1)} GB</text>
-    <text className="chart-value" x={margin.left + plotWidth + 10} y={averageY(Number(last.average_percent_saved || 0)) + 4}>{Number(last.average_percent_saved || 0).toFixed(1)}%</text>
-  </svg>;
+  return <figure className="performance-figure">
+    <svg className="performance-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Net savings and average percentage saved over completed conversion runs">
+      <title>Conversion performance over time</title>
+      {gridValues.map((value) => <g key={value}>
+        <line x1={margin.left} y1={netY(value)} x2={margin.left + plotWidth} y2={netY(value)} />
+        <text x={margin.left - 9} y={netY(value) + 4} textAnchor="end">{Math.round(value)} GB</text>
+      </g>)}
+      <line x1={margin.left} y1={margin.top + plotHeight} x2={margin.left + plotWidth} y2={margin.top + plotHeight} />
+      <polyline className="net-line" points={netPoints} />
+      <polyline className="average-line" points={averagePoints} />
+      {data.map((row: Json, index: number) => <g key={row.id || `${row.date}-${index}`}>
+        <circle className="net-point" cx={x(row, index)} cy={netY(Number(row.cumulative_net_gb || 0))} r={index === data.length - 1 ? 4 : 3} />
+        <circle className="average-point" cx={x(row, index)} cy={averageY(Number(row.average_percent_saved || 0))} r={index === data.length - 1 ? 4 : 3} />
+      </g>)}
+      {tickIndexes.map((index) => <text
+        key={index}
+        x={x(data[index], index)}
+        y={height - 10}
+        textAnchor={index === 0 ? "start" : index === data.length - 1 ? "end" : "middle"}
+      >{formatDate(data[index])}</text>)}
+      <text className="chart-value" x={margin.left + plotWidth + 10} y={netY(Number(last.cumulative_net_gb || 0)) + 4}>{Number(last.cumulative_net_gb || 0).toFixed(1)} GB</text>
+      <text className="chart-value" x={margin.left + plotWidth + 10} y={averageY(Number(last.average_percent_saved || 0)) + 4}>{Number(last.average_percent_saved || 0).toFixed(1)}%</text>
+    </svg>
+    <figcaption className="chart-legend">
+      <span><i className="net" />Cumulative net savings</span>
+      <span><i className="average" />Average percentage saved</span>
+      <small>{formatDate(first)}–{formatDate(last)} · {displayedRuns.toLocaleString()} runs · {Number(last.cumulative_net_gb || 0).toFixed(1)} GB saved · {Number(last.average_percent_saved || 0).toFixed(1)}% average</small>
+    </figcaption>
+  </figure>;
 }
 
 function DetailedStatistics({ data }: { data: Json }) {
@@ -354,11 +428,6 @@ function DetailedStatistics({ data }: { data: Json }) {
         </div>
       </header>
       <PerformanceChart rows={data.run_trend || []} range={range} />
-      <footer className="chart-legend">
-        <span><i className="net" />Cumulative net savings</span>
-        <span><i className="average" />Average percentage saved</span>
-        <span><i className="exception" />Run with exceptions</span>
-      </footer>
     </section>
 
     <section className="report-section">
@@ -511,9 +580,9 @@ function Overview({ dashboard, bootstrap, refresh, notify }: {
 function issueContext(issue: Json) {
   if (issue.kind === "crc_mismatch") {
     if (issue.diagnostics?.repairable) return {
-      title: "This archive can be rebuilt safely",
-      text: "The image payload decodes correctly. CBZXL can rebuild the container and recalculate every CRC without changing archive or image names.",
-      recommended: "Rebuild archive",
+      title: "This archive can be recovered safely",
+      text: "The recovered image fully decodes. CBZXL can repair its ZIP metadata, convert it when eligible, and continue through the rest of the archive without changing names.",
+      recommended: "Recover & convert",
     };
     return {
       title: "This CRC failure needs a decision",
@@ -561,7 +630,7 @@ const remedyLabels: Record<string, string> = {
   delete: "Delete image",
   lossless: "Lossless retry",
   retry: "Default retry",
-  rebuild: "Rebuild archive",
+  rebuild: "Recover & convert",
   dismiss: "Accept unchanged",
 };
 
@@ -612,11 +681,12 @@ function Attention({ refreshDashboard, notify }: {
 
   const act = async (issue: Json, action: string) => {
     if (action === "delete" && !window.confirm(`Delete ${issue.entry_path} from ${archiveName(issue.path)}? The archive name will not change.`)) return;
+    if (action === "delete_archive" && !window.confirm(`Permanently delete ${archiveName(issue.path)} from the library? This cannot be undone.`)) return;
     setBusy(issue.id);
     try {
       await api(`/api/issues/${issue.id}/action`, { method: "POST", body: JSON.stringify({ action }) });
-      notify(action === "dismiss" ? "Dismissed until the next full rescan" : "Repair queued");
-      if (action === "dismiss") setOpen(null);
+      notify(action === "dismiss" ? "Dismissed until the next full rescan" : action === "delete_archive" ? "Archive deleted" : "Repair queued");
+      if (action === "dismiss" || action === "delete_archive") setOpen(null);
       await refreshOpenGroup();
     } catch (error) {
       notify((error as Error).message, "error");
@@ -691,6 +761,7 @@ function Attention({ refreshDashboard, notify }: {
                 <div className="issue-actions">
                   <button className="button primary" disabled={busy === issue.id || issue.status === "queued"} onClick={() => act(issue, "retry")}>{issue.status === "queued" ? "Queued" : "Retry"}</button>
                   <button className="button secondary" aria-expanded={expanded} onClick={() => toggleInspect(issue)}>{expanded ? "Close" : "Inspect"}</button>
+                  {issue.retry_failed && <button className="button ghost danger" disabled={busy === issue.id || issue.status === "queued"} onClick={() => act(issue, "delete_archive")}>Delete archive</button>}
                   <button className="button ghost" disabled={busy === issue.id} onClick={() => act(issue, "dismiss")}>Dismiss</button>
                 </div>
               </div>
@@ -820,6 +891,7 @@ function Settings({ bootstrap, reload, notify }: {
       smart_mb: Number(options.smart_mb ?? 10),
       smart_mp: Number(options.smart_mp ?? 5),
       backup: Boolean(options.backup),
+      scope: policyScope(options),
       is_default: Boolean(profile?.is_default),
       base_options: options,
     });
@@ -840,8 +912,8 @@ function Settings({ bootstrap, reload, notify }: {
       smart_mb: Number(policyForm.smart_mb),
       smart_mp: Number(policyForm.smart_mp),
       no_convert: strategy === "recheck",
-      recheck_all: strategy === "recheck",
-      failed_only: false,
+      recheck_all: policyForm.scope === "library",
+      failed_only: policyForm.scope === "failed",
       compatibility_mode: false,
       continue_on_page_error: false,
       only_path: null,
@@ -866,6 +938,22 @@ function Settings({ bootstrap, reload, notify }: {
       notify((error as Error).message, "error");
     } finally {
       setPolicyBusy(false);
+    }
+  };
+  const removePolicy = async (profile: Json) => {
+    const usedBy = schedules.filter((row) => row.profile_id === profile.id);
+    const scheduleNote = usedBy.length
+      ? " Schedules using it will switch to the remaining default policy."
+      : "";
+    if (!window.confirm(`Delete ${profile.name}?${scheduleNote} Its job history will remain.`)) return;
+    try {
+      await api(`/api/profiles/${profile.id}`, { method: "DELETE" });
+      notify("Conversion policy deleted");
+      setPolicyOpen(false);
+      await reload();
+      await load();
+    } catch (error) {
+      notify((error as Error).message, "error");
     }
   };
 
@@ -941,7 +1029,10 @@ function Settings({ bootstrap, reload, notify }: {
               <div className="policy-name"><strong>{profile.name}</strong>{profile.is_default && <span className="status-label">Default</span>}</div>
               <span>{policySummary(profile)} · {usedBy.length ? `used by ${usedBy.map((row) => row.name).join(", ")}` : "unused"}</span>
             </div>
-            <button className="button secondary" type="button" onClick={() => openPolicy(profile)}>Edit</button>
+            <div className="policy-actions">
+              <button className="button secondary" type="button" onClick={() => openPolicy(profile)}>Edit</button>
+              <button className="button ghost danger" type="button" onClick={() => removePolicy(profile)}>Delete</button>
+            </div>
           </article>;
         })}
       </div>
@@ -957,6 +1048,11 @@ function Settings({ bootstrap, reload, notify }: {
             <option value="smart">Lossless first, smart lossy fallback</option>
             <option value="lossy">Fixed lossy distance</option>
             <option value="recheck">Recheck without conversion</option>
+          </select></label>
+          <label><span>Scope</span><select value={policyForm.scope || "unprocessed"} onChange={(event) => setPolicyForm({ ...policyForm, scope: event.target.value })}>
+            <option value="unprocessed">Unprocessed</option>
+            <option value="library">Entire Library</option>
+            <option value="failed">Failed</option>
           </select></label>
           <label><span>Encoder effort · {policyForm.effort ?? 7}</span><input type="range" min="0" max="11" value={policyForm.effort ?? 7} onChange={(event) => setPolicyForm({ ...policyForm, effort: Number(event.target.value) })} /></label>
           <label><span>CPU budget</span><select value={policyForm.threads ?? 4} onChange={(event) => setPolicyForm({ ...policyForm, threads: Number(event.target.value) })}>{[1, 2, 4, 6, 8, 12, 16, 24, 32].map((value) => <option key={value} value={value}>{value} threads</option>)}</select></label>

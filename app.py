@@ -44,7 +44,7 @@ ROOT = Path(__file__).parent
 FRONTEND_DIST = ROOT / "frontend" / "dist"
 LEGACY_STATIC = ROOT / "static"
 
-VERSION = "4.0.0"
+VERSION = "4.1.1"
 LOGGER = logging.getLogger("cbzxl.web")
 DATABASE_STARTUP_ERROR: str | None = None
 
@@ -69,7 +69,7 @@ class ScanOptions(BaseModel):
     compatibility_mode: bool = False
     continue_on_page_error: bool = False
     only_path: Optional[str] = None
-    repair_action: Optional[Literal["replace", "delete", "rebuild"]] = None
+    repair_action: Optional[Literal["replace", "delete", "rebuild", "preserve"]] = None
     repair_entry: Optional[str] = None
     repair_source: Optional[str] = None
 
@@ -83,7 +83,7 @@ class ScanOptions(BaseModel):
 class JobCreate(BaseModel):
     library_id: Optional[str] = None
     profile_id: Optional[str] = None
-    scope: Literal["library", "failed"] = "library"
+    scope: Literal["library", "unprocessed", "failed"] = "unprocessed"
     options: Optional[ScanOptions] = None
 
 
@@ -117,7 +117,16 @@ class ReviewPayload(BaseModel):
 
 
 class IssueActionPayload(BaseModel):
-    action: Literal["retry", "dismiss", "compatibility", "preserve", "delete", "lossless", "rebuild"]
+    action: Literal[
+        "retry",
+        "dismiss",
+        "compatibility",
+        "preserve",
+        "delete",
+        "delete_archive",
+        "lossless",
+        "rebuild",
+    ]
 
 
 class ProfilePayload(BaseModel):
@@ -407,9 +416,12 @@ def detailed_statistics():
                     j.net_bytes_saved,
                     j.status,
                     COUNT(ar.id) AS result_count,
-                    AVG(CASE WHEN ar.status='processed' THEN ar.percent_saved END) AS average_percent_saved
+                    AVG(CASE WHEN ar.status='processed' THEN ar.percent_saved END) AS attempt_average_percent_saved,
+                    s.net_bytes AS snapshot_net_bytes,
+                    s.average_percent_saved AS snapshot_average_percent_saved
                 FROM jobs j
                 LEFT JOIN archive_results ar ON ar.job_id=j.id
+                LEFT JOIN library_stat_snapshots s ON s.job_id=j.id
                 WHERE j.status NOT IN ('queued', 'running', 'stopping')
                 GROUP BY j.id
                 ORDER BY COALESCE(j.finished_at, j.queued_at), j.id
@@ -515,17 +527,38 @@ def detailed_statistics():
     policy_efficiency.sort(key=lambda item: (-item["attempted"], item["name"]))
 
     cumulative_bytes = 0
+    weighted_percent_saved = 0.0
+    weighted_result_count = 0
     run_trend = []
     for row in run_rows:
         cumulative_bytes += int(row.get("net_bytes_saved") or 0)
+        result_count = int(row.get("result_count") or 0)
+        attempt_average = float(row.get("attempt_average_percent_saved") or 0)
+        if result_count:
+            weighted_percent_saved += attempt_average * result_count
+            weighted_result_count += result_count
+        snapshot_net = row.get("snapshot_net_bytes")
+        snapshot_average = row.get("snapshot_average_percent_saved")
         run_trend.append(
             {
                 "id": row["id"],
                 "date": row["date"],
-                "cumulative_net_gb": gb(cumulative_bytes),
-                "average_percent_saved": round(row.get("average_percent_saved") or 0, 1),
+                "cumulative_net_gb": gb(
+                    snapshot_net if snapshot_net is not None else cumulative_bytes
+                ),
+                "average_percent_saved": round(
+                    snapshot_average
+                    if snapshot_average is not None
+                    else (
+                        weighted_percent_saved / weighted_result_count
+                        if weighted_result_count
+                        else 0
+                    ),
+                    1,
+                ),
                 "status": row["status"],
-                "result_count": int(row.get("result_count") or 0),
+                "result_count": result_count,
+                "library_snapshot": snapshot_net is not None,
             }
         )
 
@@ -652,6 +685,7 @@ def enqueue_job(payload: JobCreate):
             raise HTTPException(400, "Conversion profile not found")
         overrides = payload.options.model_dump() if payload.options else {}
         overrides["failed_only"] = payload.scope == "failed"
+        overrides["recheck_all"] = payload.scope == "library"
         job_id = create_job(
             conn,
             source="manual",
@@ -697,11 +731,12 @@ def retry_job(job_id: str):
 
 
 def issue_row(conn, issue_id: int):
-    return row_dict(
+    issue = row_dict(
         conn.execute(
             """
             SELECT
                 ai.*,
+                CASE WHEN issue_job.source='retry' THEN 1 ELSE 0 END AS retry_failed,
                 a.library_id,
                 a.path,
                 a.status AS archive_status,
@@ -715,11 +750,15 @@ def issue_row(conn, issue_id: int):
             FROM archive_issues ai
             JOIN archives a ON a.id=ai.archive_id
             JOIN libraries l ON l.id=a.library_id
+            LEFT JOIN jobs issue_job ON issue_job.id=ai.job_id
             WHERE ai.id=?
             """,
             (issue_id,),
         ).fetchone()
     )
+    if issue:
+        issue["retry_failed"] = bool(issue["retry_failed"])
+    return issue
 
 
 def remedies_for_issue(issue):
@@ -727,7 +766,7 @@ def remedies_for_issue(issue):
     if kind == "archive_grew":
         return ["lossless", "dismiss"]
     if kind == "crc_mismatch":
-        return ["rebuild", "replace", "delete", "dismiss"]
+        return ["rebuild", "preserve", "replace", "delete", "dismiss"]
     if issue.get("entry_path"):
         return ["compatibility", "preserve", "replace", "delete"]
     if kind in {"unsafe_archive_path", "filename_collision"}:
@@ -739,7 +778,7 @@ ISSUE_GROUPS = {
     "crc": {
         "label": "CRC-32 failures",
         "triage": "Inspect repairability",
-        "recommended": "Inspect the failing entry, then rebuild, replace or explicitly delete it",
+        "recommended": "Inspect the failing entry, then recover, preserve, replace or explicitly delete it",
         "kinds": {"crc_mismatch"},
     },
     "images": {
@@ -903,6 +942,7 @@ def list_issues(
                 f"""
                 SELECT
                     ai.*,
+                    CASE WHEN issue_job.source='retry' THEN 1 ELSE 0 END AS retry_failed,
                     a.path,
                     a.status AS archive_status,
                     a.original_size,
@@ -913,6 +953,7 @@ def list_issues(
                     a.image_count
                 FROM archive_issues ai
                 JOIN archives a ON a.id=ai.archive_id
+                LEFT JOIN jobs issue_job ON issue_job.id=ai.job_id
                 WHERE ai.status IN ('open', 'queued')
                   AND ai.kind!='archive_grew'
                   {group_clause}
@@ -941,6 +982,7 @@ def list_issues(
             ).fetchall()
         )
     for row in rows:
+        row["retry_failed"] = bool(row["retry_failed"])
         row["remedies"] = remedies_for_issue(row)
         row["preview_url"] = f"/api/issues/{row['id']}/preview" if row.get("entry_path") else None
         row["group"] = issue_group(row)
@@ -1018,16 +1060,36 @@ def act_on_issue(issue_id: int, payload: IssueActionPayload):
             )
             return {"status": "dismissed"}
 
+        if payload.action == "delete_archive":
+            if issue["status"] != "open":
+                raise HTTPException(409, "Wait for the retry to finish before deleting this archive")
+            if not issue.get("retry_failed"):
+                raise HTTPException(
+                    409,
+                    "Archive deletion is available only after a retry fails",
+                )
+            archive_path = safe_archive_path(issue)
+            if archive_path.suffix.lower() != ".cbz":
+                raise HTTPException(409, "Only CBZ archives can be deleted here")
+            if not archive_path.is_file():
+                raise HTTPException(404, "Archive is no longer present")
+            try:
+                archive_path.unlink()
+            except OSError as exc:
+                raise HTTPException(409, f"Archive could not be deleted: {exc}") from exc
+            conn.execute("DELETE FROM archives WHERE id=?", (issue["archive_id"],))
+            return {"status": "deleted"}
+
         overrides = {}
         if payload.action == "compatibility":
             overrides["compatibility_mode"] = True
         elif payload.action == "preserve":
-            overrides.update(
-                {
-                    "continue_on_page_error": True,
-                    "repair_entry": issue.get("entry_path"),
-                }
-            )
+            overrides.update({
+                "continue_on_page_error": True,
+                "repair_entry": issue.get("entry_path"),
+            })
+            if issue.get("kind") == "crc_mismatch":
+                overrides["repair_action"] = "preserve"
         elif payload.action == "lossless":
             overrides.update({"smart_distance": False, "distance": None})
         elif payload.action == "delete":
@@ -1052,7 +1114,7 @@ def act_on_issue(issue_id: int, payload: IssueActionPayload):
     return {"status": "queued", "job_id": job_id}
 
 
-def safe_issue_paths(issue):
+def safe_archive_path(issue):
     root = Path(issue["root_path"]).resolve()
     archive_relative = PurePosixPath(issue["path"])
     if archive_relative.is_absolute() or ".." in archive_relative.parts:
@@ -1060,6 +1122,11 @@ def safe_issue_paths(issue):
     archive_path = (root / Path(*archive_relative.parts)).resolve()
     if os.path.commonpath([root, archive_path]) != str(root):
         raise HTTPException(400, "Archive path escapes the configured library")
+    return archive_path
+
+
+def safe_issue_paths(issue):
+    archive_path = safe_archive_path(issue)
     entry = PurePosixPath(issue.get("entry_path") or "")
     if not issue.get("entry_path") or entry.is_absolute() or ".." in entry.parts:
         raise HTTPException(404, "No image preview is available for this issue")
@@ -1083,6 +1150,7 @@ def crc_issue_diagnostics(issue):
                 archive_path,
                 info,
                 max_bytes=100 * 1024 * 1024,
+                allow_size_mismatch=True,
             )
     except KeyError as exc:
         raise HTTPException(404, "The failing entry is no longer in the archive") from exc
@@ -1091,7 +1159,9 @@ def crc_issue_diagnostics(issue):
             "entry_path": entry_path,
             "expected_crc32": None,
             "calculated_crc32": None,
+            "declared_bytes": None,
             "recovered_bytes": 0,
+            "size_mismatch": False,
             "image_readable": False,
             "repairable": False,
             "detail": str(exc),
@@ -1103,9 +1173,21 @@ def crc_issue_diagnostics(issue):
     )
     os.close(handle)
     Path(recovered_path).write_bytes(recovered)
+    suffix = PurePosixPath(entry_path).suffix.lower()
+    decode_command = (
+        [
+            "djxl",
+            recovered_path,
+            "--disable_output",
+            "--num_threads=1",
+            "--quiet",
+        ]
+        if suffix == ".jxl"
+        else ["magick", recovered_path, "null:"]
+    )
     try:
         check = subprocess.run(
-            ["identify", "-format", "%m %w %h", recovered_path],
+            decode_command,
             capture_output=True,
             text=True,
             timeout=45,
@@ -1122,19 +1204,32 @@ def crc_issue_diagnostics(issue):
     image_readable = bool(check and check.returncode == 0)
     calculated = crc32_hex(recovered)
     expected = f"{info.CRC:08X}"
+    size_mismatch = len(recovered) != info.file_size
+    metadata_mismatch = calculated != expected or size_mismatch
+    if image_readable and size_mismatch:
+        detail = (
+            "Recovered image fully decodes; incorrect ZIP size and CRC metadata "
+            "can be rebuilt"
+        )
+    elif image_readable and calculated != expected:
+        detail = (
+            "Recovered image fully decodes; incorrect ZIP CRC metadata can be rebuilt"
+        )
+    elif image_readable:
+        detail = "Recovered image fully decodes, but no metadata mismatch remains"
+    else:
+        detail = check_detail or "Recovered bytes do not fully decode as an image"
     return {
         "entry_path": entry_path,
         "expected_crc32": expected,
         "calculated_crc32": calculated,
+        "declared_bytes": info.file_size,
         "recovered_bytes": len(recovered),
+        "size_mismatch": size_mismatch,
         "image_readable": image_readable,
-        "image": check.stdout.strip() if image_readable else None,
-        "repairable": image_readable and calculated != expected,
-        "detail": (
-            "Recovered bytes decode correctly; the archive can be rebuilt"
-            if image_readable and calculated != expected
-            else check_detail or "Recovered bytes do not decode as an image"
-        ),
+        "image": suffix.lstrip(".").upper() if image_readable else None,
+        "repairable": image_readable and metadata_mismatch,
+        "detail": detail,
     }
 
 
@@ -1466,6 +1561,42 @@ def update_profile(profile_id: str, payload: ProfilePayload):
     with connect() as conn:
         saved = row_dict(conn.execute("SELECT * FROM conversion_profiles WHERE id=?", (profile_id,)).fetchone())
     return hydrate_profile(saved)
+
+
+@app.delete("/api/profiles/{profile_id}", status_code=204)
+def delete_profile(profile_id: str):
+    with transaction(immediate=True) as conn:
+        existing = row_dict(
+            conn.execute(
+                "SELECT * FROM conversion_profiles WHERE id=?",
+                (profile_id,),
+            ).fetchone()
+        )
+        if not existing:
+            raise HTTPException(404, "Conversion policy not found")
+        replacement = row_dict(
+            conn.execute(
+                """
+                SELECT * FROM conversion_profiles
+                WHERE id!=?
+                ORDER BY is_default DESC, created_at
+                LIMIT 1
+                """,
+                (profile_id,),
+            ).fetchone()
+        )
+        if not replacement:
+            raise HTTPException(409, "The only conversion policy cannot be deleted")
+        if existing.get("is_default") or not replacement.get("is_default"):
+            conn.execute(
+                "UPDATE conversion_profiles SET is_default=1, updated_at=? WHERE id=?",
+                (utc_now(), replacement["id"]),
+            )
+        conn.execute(
+            "UPDATE schedules SET profile_id=?, updated_at=? WHERE profile_id=?",
+            (replacement["id"], utc_now(), profile_id),
+        )
+        conn.execute("DELETE FROM conversion_profiles WHERE id=?", (profile_id,))
 
 
 @app.get("/api/database/export")

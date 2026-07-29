@@ -6,7 +6,7 @@ COPY frontend/ ./
 RUN pnpm run build
 
 FROM python:3.13-alpine
-LABEL name="cbzxl-web" version="4.0.0"
+LABEL name="cbzxl-web" version="4.1.1"
 
 RUN apk add --no-cache libjxl-tools tzdata imagemagick file
 

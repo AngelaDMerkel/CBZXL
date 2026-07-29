@@ -140,6 +140,7 @@ CREATE TABLE IF NOT EXISTS archives (
     lossless_pages INTEGER NOT NULL DEFAULT 0,
     lossy_pages INTEGER NOT NULL DEFAULT 0,
     retained_pages INTEGER NOT NULL DEFAULT 0,
+    generation INTEGER NOT NULL DEFAULT 1,
     script_version TEXT,
     jxl_version TEXT,
     error_message TEXT,
@@ -173,6 +174,7 @@ CREATE TABLE IF NOT EXISTS archive_results (
     lossless_pages INTEGER NOT NULL DEFAULT 0,
     lossy_pages INTEGER NOT NULL DEFAULT 0,
     retained_pages INTEGER NOT NULL DEFAULT 0,
+    generation INTEGER NOT NULL DEFAULT 1,
     conversion_mode TEXT,
     megapixels_info TEXT,
     error_message TEXT,
@@ -206,6 +208,21 @@ CREATE TABLE IF NOT EXISTS review_actions (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS library_stat_snapshots (
+    job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+    library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+    recorded_at TEXT NOT NULL,
+    archive_count INTEGER NOT NULL DEFAULT 0,
+    optimized_count INTEGER NOT NULL DEFAULT 0,
+    failed_count INTEGER NOT NULL DEFAULT 0,
+    baseline_bytes INTEGER NOT NULL DEFAULT 0,
+    current_bytes INTEGER NOT NULL DEFAULT 0,
+    net_bytes INTEGER NOT NULL DEFAULT 0,
+    page_count INTEGER NOT NULL DEFAULT 0,
+    converted_pages INTEGER NOT NULL DEFAULT 0,
+    average_percent_saved REAL NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS import_batches (
     id TEXT PRIMARY KEY,
     source_path TEXT NOT NULL,
@@ -231,6 +248,7 @@ CREATE INDEX IF NOT EXISTS idx_results_job ON archive_results(job_id);
 CREATE INDEX IF NOT EXISTS idx_archive_issues_status ON archive_issues(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_archive_issues_job ON archive_issues(job_id);
 CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(enabled, next_run_at);
+CREATE INDEX IF NOT EXISTS idx_library_snapshots_date ON library_stat_snapshots(library_id, recorded_at);
 """
 
 
@@ -374,7 +392,11 @@ def initialize() -> None:
             "retained_pages": "INTEGER NOT NULL DEFAULT 0",
         }
         migrations["archives"].update(page_outcome_columns)
-        migrations["archive_results"] = page_outcome_columns
+        migrations["archives"]["generation"] = "INTEGER NOT NULL DEFAULT 1"
+        migrations["archive_results"] = {
+            **page_outcome_columns,
+            "generation": "INTEGER NOT NULL DEFAULT 1",
+        }
         for table, additions in migrations.items():
             existing_columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
             for column, definition in additions.items():
@@ -392,6 +414,89 @@ def initialize() -> None:
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (5, ?)",
             (utc_now(),),
         )
+        if not conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=6"
+        ).fetchone():
+            # Older rechecks replaced an archive's original conversion baseline
+            # with the already-optimized input size. Reconstruct contiguous size
+            # chains from immutable attempts; a discontinuity starts a new source
+            # generation rather than comparing unrelated archive contents.
+            archives = conn.execute(
+                """
+                SELECT id, library_id, path, original_size, final_size
+                FROM archives
+                WHERE status='processed'
+                """
+            ).fetchall()
+            for archive in archives:
+                attempts = conn.execute(
+                    """
+                    SELECT ar.id, ar.original_size, ar.final_size
+                    FROM archive_results ar
+                    JOIN jobs j ON j.id=ar.job_id
+                    WHERE j.library_id=? AND ar.path=? AND ar.status='processed'
+                      AND ar.original_size IS NOT NULL AND ar.final_size IS NOT NULL
+                    ORDER BY COALESCE(ar.converted_at, j.finished_at, j.queued_at), ar.id
+                    """,
+                    (archive["library_id"], archive["path"]),
+                ).fetchall()
+                baseline_size = (
+                    int(archive["original_size"])
+                    if archive["original_size"] is not None
+                    else None
+                )
+                generation = 1
+                previous_final = None
+                recovered_baseline = None
+                for attempt in attempts:
+                    attempt_original = int(attempt["original_size"])
+                    attempt_final = int(attempt["final_size"])
+                    if previous_final is None or attempt_original != previous_final:
+                        if previous_final is not None:
+                            generation += 1
+                        recovered_baseline = attempt_original
+                    conn.execute(
+                        "UPDATE archive_results SET generation=? WHERE id=?",
+                        (generation, attempt["id"]),
+                    )
+                    previous_final = attempt_final
+                if (
+                    recovered_baseline is not None
+                    and archive["final_size"] is not None
+                    and previous_final == int(archive["final_size"])
+                ):
+                    baseline_size = recovered_baseline
+                if baseline_size is None:
+                    continue
+                current_size = (
+                    int(archive["final_size"])
+                    if archive["final_size"] is not None
+                    else baseline_size
+                )
+                bytes_saved = baseline_size - current_size
+                percent_saved = (
+                    bytes_saved / baseline_size * 100 if baseline_size else 0
+                )
+                conn.execute(
+                    """
+                    UPDATE archives
+                    SET original_size=?, final_size=?, bytes_saved=?, percent_saved=?,
+                        generation=?
+                    WHERE id=?
+                    """,
+                    (
+                        baseline_size,
+                        current_size,
+                        bytes_saved,
+                        percent_saved,
+                        generation,
+                        archive["id"],
+                    ),
+                )
+            conn.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (6, ?)",
+                (utc_now(),),
+            )
         now = utc_now()
         library_id = "library-default"
         conn.execute(
@@ -401,23 +506,24 @@ def initialize() -> None:
             """,
             (library_id, LIBRARY_PATH, now, now),
         )
-        for profile in BUILTIN_PROFILES:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO conversion_profiles(
-                    id, name, is_default, options_json, created_at, updated_at
+        if not conn.execute("SELECT 1 FROM conversion_profiles LIMIT 1").fetchone():
+            for profile in BUILTIN_PROFILES:
+                conn.execute(
+                    """
+                    INSERT INTO conversion_profiles(
+                        id, name, is_default, options_json, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        profile["id"],
+                        profile["name"],
+                        profile["is_default"],
+                        json.dumps(profile["options"], sort_keys=True),
+                        now,
+                        now,
+                    ),
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    profile["id"],
-                    profile["name"],
-                    profile["is_default"],
-                    json.dumps(profile["options"], sort_keys=True),
-                    now,
-                    now,
-                ),
-            )
         conn.execute(
             """
             INSERT OR IGNORE INTO archive_issues(

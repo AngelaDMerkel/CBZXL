@@ -25,7 +25,7 @@ class DatabaseTests(unittest.TestCase):
                 row[0]
                 for row in conn.execute("SELECT name FROM conversion_profiles")
             }
-        self.assertEqual(version, 5)
+        self.assertEqual(version, 6)
         self.assertEqual(library["root_path"], database.LIBRARY_PATH)
         self.assertEqual(profile["name"], "Balanced lossless")
         self.assertEqual(
@@ -39,9 +39,16 @@ class DatabaseTests(unittest.TestCase):
         with database.connect() as conn:
             issue_columns = {row[1] for row in conn.execute("PRAGMA table_info(archive_issues)")}
             archive_columns = {row[1] for row in conn.execute("PRAGMA table_info(archives)")}
+            result_columns = {row[1] for row in conn.execute("PRAGMA table_info(archive_results)")}
+            snapshot_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(library_stat_snapshots)")
+            }
         self.assertIn("entry_path", issue_columns)
         self.assertIn("dismissed_until_rescan", archive_columns)
         self.assertIn("converted_pages", archive_columns)
+        self.assertIn("generation", archive_columns)
+        self.assertIn("generation", result_columns)
+        self.assertIn("average_percent_saved", snapshot_columns)
 
     def test_new_database_does_not_modify_legacy_v2_file(self):
         root = Path(self.temp.name)
@@ -62,6 +69,54 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(columns, ["run_id", "path"])
         self.assertEqual(row, ("old-run", "Series/Book.cbz"))
         self.assertIn("job_id", current_columns)
+
+    def test_version_six_recovers_baseline_from_attempt_history(self):
+        now = database.utc_now()
+        with database.transaction() as conn:
+            library = database.default_library(conn)
+            profile = database.default_profile(conn)
+            conn.execute(
+                """
+                INSERT INTO archives(
+                    library_id, path, status, original_size, final_size,
+                    bytes_saved, percent_saved, created_at, updated_at
+                ) VALUES (?, 'Series/Book.cbz', 'processed', 700, 700, 0, 0, ?, ?)
+                """,
+                (library["id"], now, now),
+            )
+            archive_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            job_id = database.create_job(
+                conn,
+                source="manual",
+                library_id=library["id"],
+                profile_id=profile["id"],
+                options=database.DEFAULT_OPTIONS,
+            )
+            conn.execute(
+                "UPDATE jobs SET status='succeeded', finished_at=? WHERE id=?",
+                (now, job_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO archive_results(
+                    job_id, archive_id, path, original_size, final_size,
+                    bytes_saved, percent_saved, status, converted_at
+                ) VALUES (?, ?, 'Series/Book.cbz', 1000, 700, 300, 30, 'processed', ?)
+                """,
+                (job_id, archive_id, now),
+            )
+            conn.execute("DELETE FROM schema_migrations WHERE version=6")
+
+        database.initialize()
+
+        with database.connect() as conn:
+            archive = conn.execute(
+                """
+                SELECT original_size, final_size, bytes_saved, percent_saved
+                FROM archives WHERE path='Series/Book.cbz'
+                """
+            ).fetchone()
+        self.assertEqual(tuple(archive), (1000, 700, 300, 30))
 
     def test_human_schedule_calculation(self):
         after = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)

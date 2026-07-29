@@ -122,7 +122,13 @@ def options_fingerprint(options):
     return hashlib.blake2b(encoded, digest_size=16).hexdigest()
 
 
-def recover_zip_entry_bytes(source, info, *, max_bytes=None):
+def recover_zip_entry_bytes(
+    source,
+    info,
+    *,
+    max_bytes=None,
+    allow_size_mismatch=False,
+):
     """Recover one ZIP entry without trusting its stored CRC.
 
     This is deliberately limited to common CBZ compression methods. Callers
@@ -130,7 +136,7 @@ def recover_zip_entry_bytes(source, info, *, max_bytes=None):
     """
     if info.flag_bits & 0x1:
         raise VerificationError(f"Encrypted ZIP entries cannot be recovered: {info.filename}")
-    if max_bytes and info.file_size > max_bytes:
+    if max_bytes and info.file_size > max_bytes and not allow_size_mismatch:
         raise VerificationError(f"ZIP entry exceeds the recovery limit: {info.filename}")
     with open(source, "rb") as handle:
         handle.seek(info.header_offset)
@@ -148,16 +154,39 @@ def recover_zip_entry_bytes(source, info, *, max_bytes=None):
         if method == zipfile.ZIP_STORED:
             recovered = compressed
         elif method == zipfile.ZIP_DEFLATED:
-            recovered = zlib.decompress(compressed, -15)
+            decompressor = zlib.decompressobj(-15)
+            recovered = decompressor.decompress(
+                compressed,
+                max_bytes + 1 if max_bytes else 0,
+            )
+            if max_bytes and (
+                len(recovered) > max_bytes or decompressor.unconsumed_tail
+            ):
+                raise VerificationError(
+                    f"Recovered ZIP entry exceeds the recovery limit: {info.filename}"
+                )
+            recovered += (
+                decompressor.flush(max_bytes + 1 - len(recovered))
+                if max_bytes
+                else decompressor.flush()
+            )
         elif method == zipfile.ZIP_BZIP2:
-            recovered = bz2.decompress(compressed)
+            decompressor = bz2.BZ2Decompressor()
+            recovered = decompressor.decompress(
+                compressed,
+                max_length=max_bytes + 1 if max_bytes else -1,
+            )
+            if max_bytes and (len(recovered) > max_bytes or not decompressor.eof):
+                raise VerificationError(
+                    f"Recovered ZIP entry exceeds the recovery limit: {info.filename}"
+                )
         else:
             raise VerificationError(
                 f"ZIP compression method {method} is not recoverable: {info.filename}"
             )
-    except (OSError, EOFError, zlib.error) as exc:
+    except (OSError, EOFError, ValueError, zlib.error) as exc:
         raise VerificationError(f"ZIP entry could not be decompressed: {info.filename}") from exc
-    if len(recovered) != info.file_size:
+    if len(recovered) != info.file_size and not allow_size_mismatch:
         raise VerificationError(f"Recovered ZIP entry has the wrong size: {info.filename}")
     if max_bytes and len(recovered) > max_bytes:
         raise VerificationError(f"Recovered ZIP entry exceeds the recovery limit: {info.filename}")
@@ -175,6 +204,7 @@ def safe_extract_archive(
     token=None,
     *,
     recover_crc_entry=None,
+    recover_size_mismatch=False,
 ):
     destination = Path(destination).resolve()
     total_uncompressed = 0
@@ -199,7 +229,19 @@ def safe_extract_archive(
             if normalized_name in seen_paths:
                 raise ValueError(f"Duplicate archive path: {member.filename}")
             seen_paths.add(normalized_name)
-            total_uncompressed += member.file_size
+            recovered_payload = None
+            if recover_crc_entry and normalized_name == recover_crc_entry:
+                recovered_payload = recover_zip_entry_bytes(
+                    source,
+                    member,
+                    max_bytes=max_uncompressed_bytes,
+                    allow_size_mismatch=recover_size_mismatch,
+                )
+            total_uncompressed += (
+                len(recovered_payload)
+                if recovered_payload is not None
+                else member.file_size
+            )
             if total_uncompressed > max_uncompressed_bytes:
                 max_mb = max_uncompressed_bytes // (1024 * 1024)
                 raise ValueError(f"Archive expands past configured limit of {max_mb} MB")
@@ -210,14 +252,8 @@ def safe_extract_archive(
                 target.mkdir(parents=True, exist_ok=True)
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
-            if recover_crc_entry and normalized_name == recover_crc_entry:
-                target.write_bytes(
-                    recover_zip_entry_bytes(
-                        source,
-                        member,
-                        max_bytes=max_uncompressed_bytes,
-                    )
-                )
+            if recovered_payload is not None:
+                target.write_bytes(recovered_payload)
             else:
                 with archive.open(member) as source_stream, open(target, "wb") as target_stream:
                     shutil.copyfileobj(source_stream, target_stream, length=1024 * 1024)
@@ -294,7 +330,14 @@ class ResumeWorkspace:
             os.fsync(handle.fileno())
         os.replace(temporary, self.manifest_path)
 
-    def prepare(self, max_uncompressed_bytes, token, *, recover_crc_entry=None):
+    def prepare(
+        self,
+        max_uncompressed_bytes,
+        token,
+        *,
+        recover_crc_entry=None,
+        recover_size_mismatch=False,
+    ):
         resumed = False
         if self.manifest_path.is_file() and self.files.is_dir():
             try:
@@ -323,6 +366,7 @@ class ResumeWorkspace:
                 max_uncompressed_bytes,
                 token,
                 recover_crc_entry=recover_crc_entry,
+                recover_size_mismatch=recover_size_mismatch,
             )
             self.manifest = {
                 "version": 4,
@@ -440,7 +484,7 @@ def verify_archive(
         for index in positions:
             token.check()
             result = run_cancellable(
-                ["djxl", str(jxl_paths[index]), "-", "--output_format", "ppm", "--num_threads=1", "--quiet"],
+                ["djxl", str(jxl_paths[index]), "--disable_output", "--num_threads=1", "--quiet"],
                 token,
                 heartbeat=heartbeat,
                 discard_stdout=True,
