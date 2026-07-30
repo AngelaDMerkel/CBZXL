@@ -1312,7 +1312,7 @@ ISSUE_GROUPS = {
         "label": "Archive conversion failures",
         "triage": "Retryable",
         "recommended": "Retry normally or in compatibility mode",
-        "kinds": {"archive_failed"},
+        "kinds": {"archive_failed", "source_changed"},
     },
 }
 

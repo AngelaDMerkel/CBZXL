@@ -14,12 +14,27 @@ CONFIG_DIR = Path(os.getenv("CONFIG_DIR", "/config"))
 DB_PATH = Path(os.getenv("DB_PATH", str(CONFIG_DIR / "cbzxl-v3.sqlite3")))
 LIBRARY_PATH = os.getenv("LIBRARY_PATH", "/data")
 APP_TIMEZONE = os.getenv("TZ", "UTC")
+LATEST_SCHEMA_VERSION = 11
+DATABASE_MAINTENANCE_SECONDS = max(
+    86400,
+    int(os.getenv("DATABASE_MAINTENANCE_SECONDS", "604800")),
+)
+MIGRATION_BACKUP_KEEP = max(
+    1,
+    int(os.getenv("MIGRATION_BACKUP_KEEP", "3")),
+)
 
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
     applied_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS maintenance_state (
+    key TEXT PRIMARY KEY,
+    value TEXT,
+    updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS libraries (
@@ -214,6 +229,18 @@ CREATE TABLE IF NOT EXISTS archive_format_stats (
     PRIMARY KEY (archive_id, format)
 );
 
+CREATE TABLE IF NOT EXISTS archive_commit_intents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+    job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    path TEXT NOT NULL,
+    input_fingerprint TEXT NOT NULL,
+    candidate_fingerprint TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(library_id, path)
+);
+
 CREATE TABLE IF NOT EXISTS archive_issues (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     archive_id INTEGER NOT NULL UNIQUE REFERENCES archives(id) ON DELETE CASCADE,
@@ -280,6 +307,7 @@ CREATE INDEX IF NOT EXISTS idx_results_job ON archive_results(job_id);
 CREATE INDEX IF NOT EXISTS idx_page_decisions_job_path ON page_decisions(job_id, path);
 CREATE INDEX IF NOT EXISTS idx_page_decisions_archive ON page_decisions(archive_id);
 CREATE INDEX IF NOT EXISTS idx_archive_format_stats_format ON archive_format_stats(format);
+CREATE INDEX IF NOT EXISTS idx_commit_intents_library ON archive_commit_intents(library_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_archive_issues_status ON archive_issues(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_archive_issues_job ON archive_issues(job_id);
 CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(enabled, next_run_at);
@@ -407,6 +435,106 @@ def connect(path: Path | str | None = None) -> sqlite3.Connection:
     return conn
 
 
+def existing_schema_version(path: Path | str | None = None) -> int | None:
+    target = Path(path or DB_PATH)
+    if not target.is_file() or target.stat().st_size == 0:
+        return None
+    source = sqlite3.connect(f"file:{target}?mode=ro", uri=True, timeout=30)
+    try:
+        table = source.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type='table' AND name='schema_migrations'
+            """
+        ).fetchone()
+        if not table:
+            return 0
+        row = source.execute(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
+        ).fetchone()
+        return int(row[0] or 0)
+    finally:
+        source.close()
+
+
+def backup_before_migration(
+    path: Path | str | None = None,
+    *,
+    current_version: int,
+) -> Path:
+    """Create a verified rotating SQLite backup before changing the schema."""
+    target = Path(path or DB_PATH)
+    backup_dir = target.parent / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    destination = backup_dir / (
+        f"{target.stem}.pre-v{current_version}-{stamp}-{os.getpid()}.sqlite3"
+    )
+    partial = destination.with_suffix(destination.suffix + ".partial")
+    source = sqlite3.connect(str(target), timeout=30)
+    backup = sqlite3.connect(str(partial), timeout=30)
+    try:
+        source.backup(backup)
+        result = backup.execute("PRAGMA quick_check").fetchone()
+        if not result or result[0] != "ok":
+            raise sqlite3.DatabaseError(
+                "Pre-migration database backup failed integrity verification"
+            )
+        backup.commit()
+    except Exception:
+        partial.unlink(missing_ok=True)
+        raise
+    finally:
+        backup.close()
+        source.close()
+    os.replace(partial, destination)
+    backups = sorted(
+        backup_dir.glob(f"{target.stem}.pre-v*.sqlite3"),
+        key=lambda item: item.stat().st_mtime_ns,
+        reverse=True,
+    )
+    for stale in backups[MIGRATION_BACKUP_KEEP:]:
+        stale.unlink(missing_ok=True)
+    return destination
+
+
+def run_database_maintenance(*, force: bool = False) -> bool:
+    """Run an infrequent integrity check and passive WAL checkpoint."""
+    now = datetime.now(timezone.utc)
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT updated_at FROM maintenance_state WHERE key='quick_check'"
+        ).fetchone()
+        if row and not force:
+            try:
+                previous = datetime.fromisoformat(
+                    str(row["updated_at"]).replace("Z", "+00:00")
+                )
+            except ValueError:
+                previous = datetime.fromtimestamp(0, timezone.utc)
+            if (now - previous).total_seconds() < DATABASE_MAINTENANCE_SECONDS:
+                return False
+        result = conn.execute("PRAGMA quick_check").fetchone()
+        if not result or result[0] != "ok":
+            detail = result[0] if result else "no result"
+            raise sqlite3.DatabaseError(
+                f"SQLite quick_check failed: {detail}"
+            )
+        conn.execute(
+            """
+            INSERT INTO maintenance_state(key, value, updated_at)
+            VALUES ('quick_check', 'ok', ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value=excluded.value,
+                updated_at=excluded.updated_at
+            """,
+            (utc_now(),),
+        )
+    with connect() as conn:
+        conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+    return True
+
+
 @contextmanager
 def transaction(immediate: bool = False):
     conn = connect()
@@ -422,6 +550,12 @@ def transaction(immediate: bool = False):
 
 
 def initialize() -> None:
+    current_version = existing_schema_version()
+    if (
+        current_version is not None
+        and current_version < LATEST_SCHEMA_VERSION
+    ):
+        backup_before_migration(current_version=current_version)
     with connect() as conn:
         conn.executescript(SCHEMA)
         conn.execute(
@@ -655,6 +789,10 @@ def initialize() -> None:
             (now,),
         )
         conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (11, ?)",
+            (now,),
+        )
+        conn.execute(
             """
             INSERT OR IGNORE INTO archive_issues(
                 archive_id, job_id, kind, stage, entry_path, message, detail,
@@ -698,6 +836,7 @@ def initialize() -> None:
             """,
             (now,),
         )
+    run_database_maintenance()
 
 
 def upsert_archive_issue(

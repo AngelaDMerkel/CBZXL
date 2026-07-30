@@ -16,6 +16,7 @@ import sys
 import time
 import uuid
 from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from rich.console import Console
@@ -128,6 +129,18 @@ def capture_archive_identity(path):
     }
 
 
+def archive_guard_fingerprint(path):
+    """Fingerprint valid ZIP metadata, falling back to complete raw bytes."""
+    try:
+        return archive_fingerprint(path)
+    except zipfile.BadZipFile:
+        digest = hashlib.blake2b(digest_size=20)
+        with open(path, "rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+
 def require_unchanged_archive(path, expected_identity, expected_fingerprint):
     """Refuse to overwrite a source that changed after conversion began."""
     current_identity = capture_archive_identity(path)
@@ -137,8 +150,8 @@ def require_unchanged_archive(path, expected_identity, expected_fingerprint):
             "was discarded"
         )
     try:
-        current_fingerprint = archive_fingerprint(path)
-    except (OSError, zipfile.BadZipFile) as exc:
+        current_fingerprint = archive_guard_fingerprint(path)
+    except OSError as exc:
         raise ArchiveSourceChanged(
             "Source archive became unreadable during conversion; the verified "
             "candidate was discarded"
@@ -832,8 +845,10 @@ def record_archive_result(
     error_message=None,
     archive_mtime_value=None,
     generation=1,
+    job_id=None,
 ):
-    if DRY_RUN or conn is None or not RUN_ID:
+    effective_job_id = job_id or RUN_ID
+    if DRY_RUN or conn is None or not effective_job_id:
         return
     percent_saved = (saved_bytes / original_size) * 100 if original_size else 0
     conn.execute("""
@@ -855,7 +870,7 @@ def record_archive_result(
           converted_at=excluded.converted_at, archive_mtime=excluded.archive_mtime,
           generation=excluded.generation
     """, (
-        RUN_ID,
+        effective_job_id,
         LIBRARY_ID,
         path_str,
         path_str,
@@ -883,9 +898,17 @@ def record_archive_result(
     ))
 
 
-def persist_page_decisions(conn, path_str, workspace, *, commit=True):
+def persist_page_decisions(
+    conn,
+    path_str,
+    workspace,
+    *,
+    commit=True,
+    job_id=None,
+):
     """Persist the final per-page decision trail for one archive attempt."""
-    if DRY_RUN or conn is None or not RUN_ID or not workspace:
+    effective_job_id = job_id or RUN_ID
+    if DRY_RUN or conn is None or not effective_job_id or not workspace:
         return
     decisions = workspace.manifest.get("page_decisions", {})
     if not decisions:
@@ -919,7 +942,7 @@ def persist_page_decisions(conn, path_str, workspace, *, commit=True):
                 created_at=excluded.created_at
             """,
             (
-                RUN_ID,
+                effective_job_id,
                 archive_id,
                 path_str,
                 entry_path,
@@ -1071,6 +1094,7 @@ def mark_processed(
     lossy_pages=0,
     retained_pages=0,
     commit=True,
+    result_job_id=None,
 ):
     """Mark an archive as processed with enhanced metadata."""
     if DRY_RUN or conn is None:
@@ -1078,6 +1102,7 @@ def mark_processed(
         return
 
     converted_at_iso = utc_now()
+    effective_job_id = result_job_id or RUN_ID
     archive_mtime_value = archive_mtime(cbz_path_obj)
     try:
         existing = conn.execute(
@@ -1210,7 +1235,7 @@ def mark_processed(
             upsert_archive_issue(
                 conn,
                 archive_id=archive_id,
-                job_id=RUN_ID,
+                job_id=effective_job_id,
                 kind="archive_grew",
                 stage="size_check",
                 message=(
@@ -1246,6 +1271,7 @@ def mark_processed(
             retained_pages,
             archive_mtime_value=archive_mtime_value,
             generation=generation,
+            job_id=effective_job_id,
         )
         if commit:
             conn.commit()
@@ -1388,6 +1414,73 @@ def classify_archive_error(error, workspace=None):
     )
 
 
+def should_auto_retry_archive(error, cli_args, attempt):
+    """Allow one conservative retry only for plausibly transient failures."""
+    if attempt >= AUTO_RETRY_ATTEMPTS:
+        return False
+    if getattr(cli_args, "repair_action", None) in {
+        "delete",
+        "replace",
+        "rebuild",
+        "preserve",
+        "salvage",
+        "salvage_partial",
+        "restore_original",
+        "restore_reconvert",
+        "repack",
+    }:
+        return False
+    if isinstance(
+        error,
+        (
+            ArchiveSourceChanged,
+            ConversionCancelled,
+            FileNotFoundError,
+            PermissionError,
+            zipfile.BadZipFile,
+            zipfile.LargeZipFile,
+        ),
+    ):
+        return False
+    if isinstance(error, (subprocess.TimeoutExpired, TimeoutError)):
+        return True
+    if isinstance(error, OSError):
+        return error.errno in {
+            errno.EAGAIN,
+            errno.EBUSY,
+            errno.EINTR,
+            errno.EIO,
+            errno.ESTALE,
+            errno.ETIMEDOUT,
+        }
+    lowered = str(error).lower()
+    deterministic_tokens = (
+        "unsafe archive path",
+        "cannot preserve filename",
+        "duplicate archive path",
+        "filename invariant",
+        "exceeds the recovery limit",
+        "encrypted zip",
+        "no recoverable local zip",
+    )
+    if any(token in lowered for token in deterministic_tokens):
+        return False
+    retryable_tokens = (
+        "encoder",
+        "decoder",
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "resource busy",
+        "verification",
+        "selectformat failed",
+        "decompressjxltopackedpixelfile failed",
+    )
+    return isinstance(error, (PageConversionError, VerificationError)) or any(
+        token in lowered for token in retryable_tokens
+    )
+
+
 def record_archive_failure(conn_main, conn_fail, cbz_path_obj, path_str, error, duration, workspace=None):
     """Persist and publish a failure without turning it into a run-level failure."""
     (
@@ -1459,6 +1552,169 @@ def queue_format_inventory(archive_id, cbz_path, fingerprint):
     PENDING_FORMAT_INVENTORIES.append(
         (archive_id, Path(cbz_path), fingerprint)
     )
+
+
+def record_archive_commit_intent(
+    conn,
+    path_str,
+    input_fingerprint,
+    candidate_fingerprint,
+    payload,
+):
+    """Durably describe a verified replacement before changing the CBZ."""
+    if DRY_RUN or conn is None or not RUN_ID:
+        return
+    conn.execute(
+        """
+        INSERT INTO archive_commit_intents(
+            library_id, job_id, path, input_fingerprint,
+            candidate_fingerprint, payload_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(library_id, path) DO UPDATE SET
+            job_id=excluded.job_id,
+            input_fingerprint=excluded.input_fingerprint,
+            candidate_fingerprint=excluded.candidate_fingerprint,
+            payload_json=excluded.payload_json,
+            created_at=excluded.created_at
+        """,
+        (
+            LIBRARY_ID,
+            RUN_ID,
+            path_str,
+            input_fingerprint,
+            candidate_fingerprint,
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            utc_now(),
+        ),
+    )
+    conn.commit()
+
+
+def clear_archive_commit_intent(conn, path_str, *, commit=True):
+    if conn is None:
+        return
+    conn.execute(
+        "DELETE FROM archive_commit_intents WHERE library_id=? AND path=?",
+        (LIBRARY_ID, path_str),
+    )
+    if commit:
+        conn.commit()
+
+
+def recover_archive_commit_intents(conn, library_root):
+    """Finalize or safely discard write-ahead records left by a stopped run."""
+    if conn is None:
+        return {"recovered": 0, "discarded": 0, "conflicted": 0}
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM archive_commit_intents
+        WHERE library_id=?
+        ORDER BY created_at, id
+        """,
+        (LIBRARY_ID,),
+    ).fetchall()
+    recovered = 0
+    discarded = 0
+    conflicted = 0
+    library_root = Path(library_root).resolve()
+    for row in rows:
+        target = (library_root / Path(row["path"])).resolve()
+        try:
+            if os.path.commonpath([library_root, target]) != str(library_root):
+                raise ValueError("Commit intent path escapes the library")
+            current_fingerprint = archive_guard_fingerprint(target)
+        except (OSError, ValueError):
+            current_fingerprint = None
+        if current_fingerprint == row["input_fingerprint"]:
+            clear_archive_commit_intent(conn, row["path"], commit=False)
+            conn.commit()
+            discarded += 1
+            continue
+        if current_fingerprint == row["candidate_fingerprint"]:
+            payload = json.loads(row["payload_json"])
+            mark_processed(
+                conn,
+                target,
+                row["path"],
+                int(payload["original_size"]),
+                int(payload["final_size"]),
+                int(payload["saved_bytes"]),
+                payload["dominant_type"],
+                int(payload["jxl_effort"]),
+                float(payload["duration"]),
+                int(payload["image_count"]),
+                int(payload["jpg_count"]),
+                int(payload["png_count"]),
+                payload["conversion_mode"],
+                payload["megapixels_info"],
+                row["candidate_fingerprint"],
+                input_fingerprint=row["input_fingerprint"],
+                converted_pages=int(payload.get("converted_pages") or 0),
+                lossless_pages=int(payload.get("lossless_pages") or 0),
+                lossy_pages=int(payload.get("lossy_pages") or 0),
+                retained_pages=int(payload.get("retained_pages") or 0),
+                commit=False,
+                result_job_id=row["job_id"],
+            )
+            decisions = payload.get("page_decisions") or {}
+            if decisions:
+                persist_page_decisions(
+                    conn,
+                    row["path"],
+                    SimpleNamespace(
+                        manifest={"page_decisions": decisions}
+                    ),
+                    commit=False,
+                    job_id=row["job_id"],
+                )
+            clear_archive_commit_intent(conn, row["path"], commit=False)
+            conn.commit()
+            recovered += 1
+            continue
+
+        now = utc_now()
+        conn.execute(
+            """
+            INSERT INTO archives(
+                library_id, path, status, error_message, created_at, updated_at
+            ) VALUES (?, ?, 'failed', ?, ?, ?)
+            ON CONFLICT(library_id, path) DO UPDATE SET
+                error_message=excluded.error_message,
+                updated_at=excluded.updated_at
+            """,
+            (
+                LIBRARY_ID,
+                row["path"],
+                "An interrupted replacement no longer matches either the "
+                "original source or the verified candidate",
+                now,
+                now,
+            ),
+        )
+        archive_id = conn.execute(
+            "SELECT id FROM archives WHERE library_id=? AND path=?",
+            (LIBRARY_ID, row["path"]),
+        ).fetchone()["id"]
+        upsert_archive_issue(
+            conn,
+            archive_id=archive_id,
+            job_id=row["job_id"],
+            kind="source_changed",
+            stage="recovery",
+            message=(
+                "Archive changed after an interrupted replacement; CBZXL "
+                "left the current file untouched"
+            ),
+        )
+        clear_archive_commit_intent(conn, row["path"], commit=False)
+        conn.commit()
+        conflicted += 1
+    return {
+        "recovered": recovered,
+        "discarded": discarded,
+        "conflicted": conflicted,
+    }
 
 
 def get_size(file_path):
@@ -2661,21 +2917,27 @@ def convert_images(temp_dir_path, cli_args, workspace=None, archive_path=None):
         return ConversionStatus.PROCESSED_NO_SPACE_SAVED, *final_return
 
 
-def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args, fingerprint=None):
-    """Convert one archive through a resumable, verified, atomic pipeline."""
+def process_cbz(
+    cbz_path_obj,
+    conn_main,
+    conn_fail,
+    cli_args,
+    fingerprint=None,
+    *,
+    _auto_retry_attempt=0,
+):
+    """Convert one archive through an ephemeral, verified, atomic pipeline."""
     start_time = time.monotonic()
     rel_path_str = os.path.relpath(cbz_path_obj, Path(cli_args.input_dir).resolve()).replace(os.sep, "/")
     workspace = None
+    commit_phase_started = False
     try:
         emit("archive_started", message=f"Preparing {rel_path_str}", archive=rel_path_str, stage="preparing", page=0, total_pages=0)
         log(f"\n[bold]📦 Processing: {rel_path_str}[/bold]")
+        target_identity = capture_archive_identity(cbz_path_obj)
         repair_action = getattr(cli_args, "repair_action", None)
         if not fingerprint and repair_action in {"salvage", "salvage_partial"}:
-            digest = hashlib.blake2b(digest_size=20)
-            with open(cbz_path_obj, "rb") as damaged_archive:
-                for chunk in iter(lambda: damaged_archive.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            fingerprint = digest.hexdigest()
+            fingerprint = archive_guard_fingerprint(cbz_path_obj)
         fingerprint = fingerprint or archive_fingerprint(cbz_path_obj)
         source_archive_path = cbz_path_obj
         source_fingerprint = fingerprint
@@ -3092,9 +3354,49 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args, fingerprint=None):
                     return 0, False, False, "processed"
                 replace_path = cbz_path_obj.with_name(f".{cbz_path_obj.name}.cbzxl-replace")
                 try:
+                    require_unchanged_archive(
+                        cbz_path_obj,
+                        target_identity,
+                        fingerprint,
+                    )
+                    candidate_fingerprint = archive_fingerprint(candidate)
+                    candidate_size = candidate.stat().st_size
+                    commit_phase_started = True
+                    record_archive_commit_intent(
+                        conn_main,
+                        rel_path_str,
+                        fingerprint,
+                        candidate_fingerprint,
+                        {
+                            "original_size": original_cbz_size,
+                            "final_size": candidate_size,
+                            "saved_bytes": original_cbz_size - candidate_size,
+                            "dominant_type": dominant_type,
+                            "jxl_effort": JXL_EFFORT,
+                            "duration": time.monotonic() - start_time,
+                            "image_count": img_count,
+                            "jpg_count": num_jpg,
+                            "png_count": num_png,
+                            "conversion_mode": conv_mode,
+                            "megapixels_info": mp_info,
+                            "converted_pages": converted_pages,
+                            "lossless_pages": lossless_pages,
+                            "lossy_pages": lossy_pages,
+                            "retained_pages": retained_pages,
+                            "page_decisions": workspace.manifest.get(
+                                "page_decisions",
+                                {},
+                            ),
+                        },
+                    )
                     shutil.copy2(candidate, replace_path)
                     with open(replace_path, "rb") as replacement:
                         os.fsync(replacement.fileno())
+                    require_unchanged_archive(
+                        cbz_path_obj,
+                        target_identity,
+                        fingerprint,
+                    )
                     os.replace(replace_path, cbz_path_obj)
                     directory_fd = os.open(cbz_path_obj.parent, os.O_RDONLY)
                     try:
@@ -3126,6 +3428,11 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args, fingerprint=None):
             workspace,
             commit=False,
         )
+        clear_archive_commit_intent(
+            conn_main,
+            rel_path_str,
+            commit=False,
+        )
         if conn_main:
             conn_main.commit()
         workspace.complete()
@@ -3144,6 +3451,50 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args, fingerprint=None):
         emit("job_cancelled", level="warning", message="Conversion cancelled safely", archive=rel_path_str, stage="cancelled")
         raise
     except Exception as error:
+        if isinstance(error, ArchiveSourceChanged):
+            clear_archive_commit_intent(
+                conn_main,
+                rel_path_str,
+                commit=True,
+            )
+        if (
+            not commit_phase_started
+            and should_auto_retry_archive(
+                error,
+                cli_args,
+                _auto_retry_attempt,
+            )
+        ):
+            if workspace:
+                workspace.complete()
+            retry_args = copy.copy(cli_args)
+            retry_args.compatibility_mode = True
+            retry_args.smart_distance = False
+            retry_args.distance = None
+            emit(
+                "archive_retrying",
+                level="warning",
+                message=(
+                    f"Retrying {rel_path_str} once with conservative "
+                    "compatibility settings"
+                ),
+                archive=rel_path_str,
+                stage="retrying",
+                attempt=_auto_retry_attempt + 1,
+            )
+            log(
+                f"[yellow]Retrying {rel_path_str} once with conservative "
+                f"compatibility settings after: {error}",
+                level="warning",
+            )
+            return process_cbz(
+                cbz_path_obj,
+                conn_main,
+                conn_fail,
+                retry_args,
+                None,
+                _auto_retry_attempt=_auto_retry_attempt + 1,
+            )
         duration_value = time.monotonic() - start_time
         log(f"[red]❌ Failed to process {rel_path_str}: {error}", level="error")
         record_archive_failure(
@@ -3167,6 +3518,29 @@ def attempt_archive(cbz_path, resolved_input_dir, processed_paths, conn, fail_co
         rel_path_for_db = Path(cbz_path).name
 
     try:
+        if not archive_is_stable(cbz_path):
+            age = max(0, int(time.time() - Path(cbz_path).stat().st_mtime))
+            emit(
+                "archive_completed",
+                level="info",
+                message=(
+                    f"Deferred {rel_path_for_db}; the file changed {age} seconds ago"
+                ),
+                archive=rel_path_for_db,
+                stage="skipped",
+                skip_reason="file_still_arriving",
+                history_outcome="deferred",
+                history_label="Waiting for file copy",
+                history_detail=(
+                    "The archive will be eligible after "
+                    f"{ARCHIVE_STABLE_SECONDS} seconds without changes"
+                ),
+            )
+            log(
+                f"[yellow]Waiting for file copy to settle: {rel_path_for_db}",
+                msg_type="skipped",
+            )
+            return 0, False, False, "skipped"
         processed_row = processed_paths.get(rel_path_for_db)
         try:
             fingerprint = archive_fingerprint(cbz_path)
@@ -3433,6 +3807,23 @@ def reconcile_library(conn, library_root, discovered_paths):
     return {"moved": moved, "missing": len(missing_ids)}
 
 
+def load_processed_archive_rows(conn):
+    if conn is None:
+        return {}
+    cursor = conn.execute(
+        """
+        SELECT path, converted_at, archive_mtime, content_fingerprint,
+               image_count, converted_pages, lossless_pages, lossy_pages,
+               retained_pages, conversion_mode, dominant_type, bytes_saved,
+               percent_saved, jxl_effort, format_inventory_fingerprint
+        FROM archives
+        WHERE library_id=? AND status='processed'
+        """,
+        (LIBRARY_ID,),
+    )
+    return {row["path"]: dict(row) for row in cursor}
+
+
 def main():
     global VERBOSE, SUPPRESS_SKIPPED, DRY_RUN, BACKUP_ENABLED, JXL_EFFORT, THREADS, ENCODER_THREADS, RECHECK_ALL, DELETE_EMPTY_ARCHIVES, RUN_ID
 
@@ -3535,27 +3926,6 @@ def main():
     fail_conn = None
     
     processed_paths = {}
-    if conn:
-        try:
-            cursor = conn.execute(
-                """
-                SELECT path, converted_at, archive_mtime, content_fingerprint,
-                       image_count, converted_pages, lossless_pages, lossy_pages,
-                       retained_pages, conversion_mode, dominant_type, bytes_saved,
-                       percent_saved, jxl_effort, format_inventory_fingerprint
-                FROM archives
-                WHERE library_id=? AND status='processed'
-                """,
-                (LIBRARY_ID,),
-            )
-            processed_paths.update({
-                row["path"]: dict(row)
-                for row in cursor
-            })
-            if VERBOSE and processed_paths: log(f"Found {len(processed_paths)} successfully processed archives in the database to check for updates.")
-        except sqlite3.Error as e:
-            log(f"[red]Could not pre-load paths from DB: {e}", level="error")
-
     resolved_input_dir = Path(args.input_dir).resolve()
     cbz_files_path_obj_list = list(resolved_input_dir.rglob('*.cbz'))
     discovered_cbz_files = list(cbz_files_path_obj_list)
@@ -3564,6 +3934,10 @@ def main():
             resolved_input_dir,
             discovered_cbz_files,
             integrity_audit=args.integrity_audit,
+        )
+        recovery = recover_archive_commit_intents(
+            conn,
+            resolved_input_dir,
         )
         reconciliation = reconcile_library(
             conn,
@@ -3574,13 +3948,26 @@ def main():
             "Preflight passed: "
             f"{preflight['tools']} tools, "
             f"{preflight['required_free_bytes'] / (1024 ** 3):.1f} GB free-space reserve; "
-            f"{reconciliation['moved']} moved and {reconciliation['missing']} missing archives reconciled."
+            f"{reconciliation['moved']} moved and {reconciliation['missing']} missing archives reconciled; "
+            f"{recovery['recovered']} interrupted commits recovered."
         )
     except (OSError, RuntimeError) as exc:
         log(f"[red]❌ CRITICAL: {exc}", level="error")
         start_run(conn, args, 0)
         finish_run(conn, "failed", 0, 0, 0, 0, 0, 0, 0, 0)
         return 1
+    try:
+        processed_paths = load_processed_archive_rows(conn)
+        if VERBOSE and processed_paths:
+            log(
+                f"Found {len(processed_paths)} successfully processed "
+                "archives in the database to check for updates."
+            )
+    except sqlite3.Error as exc:
+        log(
+            f"[red]Could not pre-load paths from DB: {exc}",
+            level="error",
+        )
     if args.reprocess_failed:
         failed_paths = {
             row[0]

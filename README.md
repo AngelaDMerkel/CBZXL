@@ -1,66 +1,362 @@
 # CBZXL
 
-CBZXL is a self-hosted CBZ-to-JPEG XL archive optimizer with a portable SQLite database, durable scheduling, a separate conversion worker, and a minimalist web workspace.
+CBZXL is a self-hosted comic archive optimizer. It converts eligible images
+inside CBZ files to JPEG XL, keeps an indexed lifetime history in SQLite, and
+provides a minimalist web interface for running conversions, monitoring
+progress, reviewing statistics, and repairing problem archives.
 
-## What changed
+The project is designed around a conservative rule: a conversion should never
+make the library less usable merely to claim a conversion. Originals are kept
+when JPEG XL is not smaller, candidates are decoded and verified before use,
+archive replacement is atomic, and one damaged archive does not stop the rest
+of a run.
 
-- Application state lives in `/config/cbzxl-v3.sqlite3`. Earlier database files remain untouched and can be inspected and imported through the legacy importer.
-- The web API and conversion worker are separate processes.
-- Scan requests, durable checkpoints, cancellation, results, reviews, schedules, and activity survive restarts. Sub-checkpoint live progress is intentionally volatile.
-- Schedules use daily, weekly, monthly, or repeating interval choices—no cron expressions.
-- Existing `converted_archives`, `runs`, and `archive_results` tables can be imported from the previous SQLite database.
-- The legacy importer reads and explains the old schema before building the new record set; the source stays read-only.
-- RAM-backed structured events power smooth page-level progress without writing each update to the application database. Periodic checkpoints retain rolling throughput, ETA, momentum, and durable run statistics.
-- Engine 3 uses content signatures, ephemeral RAM workspaces, bounded libjxl scheduling, decode verification, and atomic archive replacement.
-- The streamlined interface centers the active conversion, lifetime statistics, an actionable attention queue, run history, and settings.
-- Failed archives retain structured diagnostics and can be retried normally or in compatibility mode. Page-level failures can be previewed, preserved, replaced without changing their internal filename, or explicitly deleted.
-- Database exports use SQLite's online backup mechanism to produce a consistent single-file snapshot.
+## Feature overview
 
-## Conversion engine
+### Web interface
 
-The worker treats `threads` as a total CPU budget. It automatically divides that budget between concurrent pages and each native `cjxl` encoder, preventing the oversubscription caused by giving every encoder the entire machine.
+The interface is organized into four focused pages:
 
-Extraction, candidate images, conversion decisions, and live WebUI state remain in RAM. Interrupted archives restart cleanly from their unchanged source CBZ; no resume manifest is written to durable storage. Unchanged results and format inventory are committed in a single checkpoint every five minutes by default. Set `DURABLE_CHECKPOINT_SECONDS` between `300` and `600` to choose a five-to-ten-minute interval. Modified archives, failures requiring attention, explicit user actions, and run boundaries are committed immediately because those records protect data integrity or user intent. `CBZXL_SHM_SIZE` and `CBZXL_MEMORY_LIMIT` control the Compose RAM allocation and container limit.
+- **Overview** shows the active or most recent run, smooth archive-and-page
+  progress, throughput, ETA, and the lifetime totals for Net Savings, Pages
+  Optimized, Archives Optimized, and Need Attention.
+- **Attention** groups unresolved items by failure type. Each archive can be
+  retried, inspected, or dismissed until the next full rescan. Inspection
+  reveals diagnostics, previews, and repair actions appropriate to that
+  specific failure.
+- **History** explains the result of each run and distinguishes optimized,
+  already-current, retained, and failed archives. It records page outcomes,
+  bytes saved, prior processing context, encoder effort, and technical events.
+- **Settings** manages conversion policies and schedules. Policies can be
+  created, edited, made the default, or deleted. Schedules can be created,
+  paused, assigned a policy, and deleted.
 
-The production server also disables routine HTTP access logging, so dashboard polling and health checks do not create a continuous Docker log stream. Startup, warning, and error logs remain available.
+The web process remains available in a degraded state if database startup
+fails, rather than making the interface disappear with the worker. `/health`
+reports the degraded state and `/ready` returns HTTP 503 until SQLite is
+available.
 
-The engine validates ZIP paths before extraction, writes each page through a partial file, checks the JXL signature, verifies the completed CBZ and its CRCs, decodes representative pages with `djxl`, syncs the replacement, and only then performs the atomic replacement.
+### Manual and scheduled runs
 
-Archive paths, archive filenames, image directories, and image basenames are immutable. Conversion may only replace an image extension with `.jxl` (for example, `Chapter 2/004.jpg` becomes `Chapter 2/004.jxl`). Flattening and empty-archive deletion are disabled. If two inputs would require the same `.jxl` path, the archive fails safely and remains unchanged.
+Manual conversion defaults to **Unprocessed** and offers three scopes:
 
-Every conversion is savings-gated per file: a JXL candidate is retained only when it is smaller than its source page. Smart mode remains lossless-first. Only when lossless is not smaller and the configured file-size or resolution threshold is met does the engine try distance `0.5`; that candidate must also be smaller. Otherwise the original page remains byte-for-byte unchanged. A final archive-level guard also rejects a non-repair result that is not smaller overall.
+- **Unprocessed** converts new archives and archives whose recorded source has
+  changed. Unchanged archives already known to CBZXL are skipped.
+- **Entire Library** attempts every CBZ in the library, including previously
+  processed archives. Reruns add to run history and processing-effort
+  statistics without resetting each archive's lifetime size baseline.
+- **Failed** retries archives currently recorded as failed.
 
-## Run with Docker Compose
+Scheduled runs use the scope saved in their assigned conversion policy. The
+worker persists the queue, claims one job at a time, detects stalled converter
+processes, and launches due daily, weekly, monthly, or interval schedules.
 
-Update the two host paths in `docker-compose.yml`, then pull and run the published x86-64 image:
+An unreadable or unconvertible archive is recorded for Attention and processing
+continues. A run reaches its terminal state only after every archive in scope
+has been attempted, unless the user cancels it or the worker itself is
+interrupted.
+
+### Conversion policies
+
+CBZXL includes four initial policies:
+
+- **Balanced lossless** — lossless JPEG XL, effort 10, and the default
+  Unprocessed scope.
+- **Smart lossy fallback** — tries lossless first, then distance `0.5` only
+  when the source page is larger than 10 MB or 5 megapixels.
+- **Recheck without conversion** — scans and refreshes records without
+  rewriting image data.
+- **Integrity audit** — read-only CRC checking of every archive entry plus a
+  full decode of every JXL page.
+
+Policies expose scope, conversion strategy, encoder effort, total CPU budget,
+backup behavior, and the thresholds relevant to lossy modes. Fixed-distance
+lossy policies are also supported.
+
+The `threads` setting is a total CPU budget, not a per-image thread count. The
+engine divides it between concurrent pages and each native `cjxl` process to
+avoid multiplying the requested concurrency. Docker's `cpus` setting is a
+separate hard quota: if the WebUI is set to 12 threads while Compose limits the
+worker to 4 CPUs, the worker still receives only four CPUs. Remove that quota or
+raise it to match the largest policy you intend to use.
+
+## Conversion and naming guarantees
+
+### Lossless-first, savings-gated conversion
+
+Every eligible page is judged independently:
+
+1. Encode a JPEG XL candidate.
+2. Verify its signature and decode it with `djxl`.
+3. For lossless conversion, compare the decoded pixels with the encoder input.
+4. Keep the candidate only if it is smaller than the source page.
+5. Otherwise retain the original page byte-for-byte.
+
+Smart lossy never bypasses that order. It first attempts lossless JPEG XL. A
+lossy candidate is attempted only when the configured size or resolution
+threshold is met and lossless did not save space; it must also be smaller to be
+kept. A final archive-level guard rejects an ordinary conversion if container
+overhead would still make the complete CBZ larger.
+
+The production image contains libjxl 0.12.0. Encoding defaults to effort 10;
+effort 11 is available as expert mode. If a lower configured effort produces a
+valid but non-saving lossless result, CBZXL can retry that page at effort 10
+before retaining the original.
+
+### Filename behavior
+
+CBZ and page names are treated as library data:
+
+- CBZ files are never renamed.
+- Image directories and basenames are never changed.
+- Successful conversion changes only the image extension to `.jxl`.
+- A mislabeled retained image can have only its extension corrected to its
+  detected format, such as `001.jpg` becoming `001.webp`.
+- Archives are never flattened and empty archives are never silently deleted.
+
+If extension correction would collide with another page, the source archive is
+left intact. Attention displays both images and lets the user choose which one
+to keep; the resulting archive is rebuilt and verified before replacement.
+
+### Archive safety
+
+Before a source can be replaced, CBZXL:
+
+- rejects unsafe ZIP paths and symlink entries;
+- enforces a configurable maximum uncompressed archive size;
+- extracts into an isolated RAM workspace;
+- writes candidates through `.cbzxl-partial` files;
+- checks every output entry and CRC;
+- decodes representative JXL pages;
+- syncs the completed candidate;
+- rechecks that the source archive has not changed during processing; and
+- atomically replaces the source only after all checks pass.
+
+Newly discovered or changed archives must remain stable for 90 seconds by
+default. This prevents CBZXL from opening a file that another process is still
+copying to the library.
+
+A small write-ahead commit intent is stored in SQLite immediately before an
+atomic replacement. If the worker stops after the filesystem replacement but
+before the result is committed, the next run recognizes and adopts the verified
+candidate instead of converting it again.
+
+Transient encoder, decoder, or verification failures receive at most one
+conservative compatibility retry. Corrupt ZIP structures, unsafe paths,
+permission errors, missing sources, source changes, and user-decision failures
+are not automatically retried.
+
+## Attention and archive recovery
+
+Attention groups failures without changing the compact queue layout. Opening an
+item provides context-aware actions.
+
+Available recovery paths include:
+
+- **CRC-32 failures** — inspect stored and calculated CRC values; recover and
+  convert a decodable entry; keep that page unchanged while converting the
+  rest; replace it; or explicitly delete it.
+- **Unreadable or truncated ZIP files** — inspect recoverable local entries;
+  salvage the complete archive when every entry verifies; or, with explicit
+  confirmation, rebuild only the fully recovered entries before a truncated
+  tail.
+- **Image processing failures** — preview the page when possible, retry in
+  compatibility mode, preserve it while converting the rest, upload a
+  replacement, or explicitly delete the page.
+- **Filename collisions** — compare both conflicting images and choose which
+  one the verified rebuild should retain.
+- **Archives larger than their lifetime baseline** — retry lossless, try the
+  conservative Smart Lossy policy, repack, restore an available original
+  `.cbz.bak`, or accept the archive unchanged.
+- **Candidate verification failures** — use compatibility or lossless-only
+  verification without risking the original.
+- **System failures** — surface missing files, permissions, unavailable
+  encoders, unsafe paths, and source files modified during conversion with
+  specific diagnostic context.
+
+The top-level Retry action uses the default conversion behavior. After a retry
+also fails, the archive can be explicitly deleted from the library. Dismissed
+items stay out of Attention until a full rescan rediscovers them.
+
+Destructive actions require confirmation in the WebUI. Candidate archives are
+verified before they replace a source; the one intentional exception is an
+explicit request to delete an image or archive.
+
+## Statistics and reporting
+
+The four lifetime summary values remain visible on Overview. More expensive
+reports are loaded only after **Detailed Statistics** is opened.
+
+Detailed reporting includes:
+
+- library coverage, average reduction, retained originals, and success rate;
+- cumulative net savings and average percentage saved over 90 days, one year,
+  or the full recorded lifetime;
+- archive count, page count, source size, current size, and JXL coverage;
+- current image-format composition by both file count and compressed storage;
+- compression effectiveness by source format;
+- lossless, Smart Lossy, retained-original, skipped/current, and failed page
+  outcomes;
+- archive savings distribution with median, average, and middle 50%;
+- median, 90th-percentile, and distributed archive processing times;
+- efficiency by conversion policy;
+- unresolved Attention items by failure category; and
+- lifetime completed runs, archives attempted, pages examined, and encoder
+  time.
+
+Repeated Entire Library runs contribute to run history and lifetime effort.
+Archive-level Net Savings remains based on the current library versus each
+archive's established lifetime baseline, preventing reruns from resetting or
+double-counting the library total.
+
+## Low-write runtime model
+
+Live progress is structured state, not a text log:
+
+- extraction, candidate images, and converter workspaces live in `/dev/shm`;
+- the web and worker share live job state through the RAM-backed `/runtime`
+  mount;
+- dashboard polling does not write to SQLite;
+- Uvicorn access logging is disabled;
+- no durable per-archive resume manifest is written; an interrupted archive
+  restarts from its unchanged source; and
+- unchanged results and format inventory are batched into durable checkpoints
+  every five minutes by default.
+
+Modified archives, failures requiring attention, explicit user actions,
+replacement commit intents, and run boundaries are written immediately because
+they protect data integrity or user intent. Detailed page-decision records are
+retained for 180 days by default; current archive state, run totals, and
+unresolved Attention items remain durable.
+
+## Docker Compose deployment
+
+The published image is `angeladmerkel/cbzxl-web:latest` for `linux/amd64`.
+CBZXL uses two containers built from the same image:
+
+- `cbzxl-web` serves the React application and FastAPI API on port 5000.
+- `cbzxl-worker` runs schedules and conversion jobs independently.
+
+Edit the two host paths in the included `docker-compose.yml`:
+
+```yaml
+volumes:
+  - /mnt/Array/Media/Manga:/data
+  - /mnt/Array/appdata/cbzxl:/config
+  - /dev/shm/cbzxl-runtime:/runtime
+```
+
+`/data` must be writable if conversions or repairs are enabled. Keep `/config`
+on storage local to the Docker host so SQLite WAL locking is reliable. The
+`/runtime` mount must be the same RAM-backed path for both services.
+
+Then start both services:
 
 ```sh
 docker compose pull
 docker compose up -d
 ```
 
-Open `http://localhost:5000`. The web and worker containers share `/data` and `/config`; keep `/config` on storage local to the Docker host so SQLite WAL locking remains reliable.
+Open `http://<nas-host>:5000`.
 
-## Import the existing database
-
-The one-time importer remains available from the command line rather than occupying permanent space in the web interface. Pass the old database path as it appears inside the container—by default `/data/converted_archives.db`. Begin with a dry run; CBZXL checks database integrity and reports the available record counts while opening the source read-only:
+The included Compose file gives each container a 32 GB memory/shm allowance by
+default and currently applies a four-CPU quota to the worker. Both memory
+settings can be overridden:
 
 ```sh
-docker compose run --rm cbzxl-web python -m cbzxl_web.legacy /data/converted_archives.db --dry-run
+CBZXL_SHM_SIZE=48g CBZXL_MEMORY_LIMIT=48g docker compose up -d
 ```
 
-Remove `--dry-run` to perform the import. The importer is idempotent, so the same source snapshot will not be imported twice.
+To make a 12-thread WebUI policy meaningful, change the worker quota to:
 
-## Homepage widget
+```yaml
+cpus: "12.0"
+```
 
-CBZXL exposes a read-only summary at `/api/integrations/homepage` for
+or remove `cpus` and manage CPU limits in the NAS container interface.
+
+### Important paths
+
+| Container path | Purpose | Persistence |
+| --- | --- | --- |
+| `/data` | CBZ library | Durable library storage |
+| `/config/cbzxl-v3.sqlite3` | Application database | Durable |
+| `/config/backups` | Verified pre-migration database backups | Durable |
+| `/config/replacements` | Staged user-uploaded replacement images | Durable until consumed |
+| `/runtime` | Cross-container live progress | RAM only |
+| `/dev/shm/cbzxl` | Extraction and conversion workspaces | RAM only |
+
+### Environment variables
+
+| Variable | Default | Purpose |
+| --- | ---: | --- |
+| `TZ` | `UTC` | Schedule and display timezone |
+| `CONFIG_DIR` | `/config` | Durable application configuration directory |
+| `DB_PATH` | `/config/cbzxl-v3.sqlite3` | SQLite database path |
+| `LIBRARY_PATH` | `/data` | CBZ library root |
+| `SCRATCH_DIR` | `/dev/shm/cbzxl` | RAM conversion scratch directory |
+| `WORKSPACE_DIR` | `/dev/shm/cbzxl/workspaces` | Per-archive RAM workspaces |
+| `RUNTIME_DIR` | `/dev/shm/cbzxl-runtime` | Volatile live-progress state |
+| `LOG_FILE` | empty | Optional converter text log; empty avoids durable log writes |
+| `DURABLE_CHECKPOINT_SECONDS` | `300` | Batch interval for unchanged results; minimum 300 seconds |
+| `DURABLE_CHECKPOINT_ARCHIVES` | `10000` | Archive count that can also trigger a batch checkpoint |
+| `PAGE_DECISION_RETENTION_DAYS` | `180` | Retention for detailed per-page decisions |
+| `ARCHIVE_STABLE_SECONDS` | `90` | Required source quiet period before processing |
+| `AUTO_RETRY_ATTEMPTS` | `1` | Conservative automatic compatibility retries; capped at one |
+| `DATABASE_MAINTENANCE_SECONDS` | `604800` | SQLite maintenance interval; minimum one day |
+| `MIGRATION_BACKUP_KEEP` | `3` | Number of verified pre-migration backups retained |
+| `WORKER_STALL_SECONDS` | `900` | Time without converter heartbeat before worker intervention |
+| `MAX_ARCHIVE_UNCOMPRESSED_MB` | `8192` | Extraction safety ceiling |
+| `ENCODER_MAX_SECONDS` | `0` | Optional per-encode timeout; zero disables it |
+| `AUXILIARY_TIMEOUT_SECONDS` | `300` | Timeout for supporting image inspection commands |
+
+Compose also recognizes `CBZXL_SHM_SIZE` and `CBZXL_MEMORY_LIMIT` for container
+resource configuration. Temporary-file variables should continue to point to
+`/dev/shm`.
+
+## Database lifecycle
+
+Application state lives in `/config/cbzxl-v3.sqlite3`. Schema migrations run
+automatically. Before a schema upgrade, CBZXL:
+
+1. checks the current database;
+2. creates a timestamped backup in `/config/backups`;
+3. verifies the backup; and
+4. retains the newest configured number of migration backups.
+
+Normal maintenance runs a SQLite `quick_check` and passive WAL checkpoint once
+per week by default.
+
+The database can be exported from `/api/database/export`. Export uses SQLite's
+online backup mechanism, producing a consistent single-file snapshot while the
+application is running.
+
+### Importing an older CBZXL database
+
+The old schema importer remains a command-line migration tool instead of a
+permanent WebUI page. It opens the source read-only, validates it, explains the
+recognized schema, and imports earlier `converted_archives`, `runs`, and
+`archive_results` records into the current database.
+
+Pass the old database path as seen inside the container. Start with a dry run:
+
+```sh
+docker compose run --rm cbzxl-web \
+  python -m cbzxl_web.legacy /data/converted_archives.db --dry-run
+```
+
+Remove `--dry-run` to import. Imports are idempotent for the same source
+snapshot, and the legacy database is never modified.
+
+## Homepage integration
+
+CBZXL exposes `/api/integrations/homepage` for
 [Homepage's Custom API widget](https://gethomepage.dev/widgets/services/customapi/).
-It reports exact net savings in bytes, the current run stage, smooth progress, the
-current archive, attention count, throughput, and ETA. The endpoint continues to
-return HTTP 200 with a `Degraded` status if the database is temporarily
-unavailable.
+It returns Net Savings, current run state, smooth progress, the current archive,
+Attention count, throughput, and ETA. The endpoint continues to return HTTP 200
+with a degraded status if SQLite is temporarily unavailable.
 
-Add this service to Homepage's `services.yaml`:
+Example `services.yaml`:
 
 ```yaml
 - Media:
@@ -85,16 +381,73 @@ Add this service to Homepage's `services.yaml`:
               suffix: "%"
 ```
 
-Homepage fetches service widgets from its server container. The `url` must
-therefore be reachable from that container; use the CBZXL container name and
-Docker network instead of `supertanker` if the containers share a network.
+Homepage requests widget data from its own server container. The widget URL
+must therefore be reachable from that container; use a shared Docker network
+and the CBZXL service name when host DNS is unavailable.
 
-## Development checks
+## API and health endpoints
+
+Interactive API documentation is available at `/api/docs`.
+
+Useful read-only endpoints include:
+
+| Endpoint | Purpose |
+| --- | --- |
+| `/api/dashboard` | Summary totals and active/recent runs |
+| `/api/statistics` | Detailed lifetime reporting |
+| `/api/jobs` | Run history |
+| `/api/issues` | Grouped unresolved Attention items |
+| `/api/schedules` | Schedule definitions |
+| `/api/archives` | Indexed archive records |
+| `/api/integrations/homepage` | Homepage widget payload |
+| `/api/database/export` | Consistent SQLite download |
+| `/health` | Liveness and database status |
+| `/ready` | Readiness; HTTP 503 when the database is unavailable |
+
+The WebUI also uses mutation endpoints for jobs, issue remedies, replacement
+uploads, reviews, schedules, and conversion policies.
+
+## Current code map
+
+| Path | Responsibility |
+| --- | --- |
+| `frontend/src/App.tsx` | React interface and client-side interactions |
+| `app.py` | FastAPI routes, request models, reporting, and repair orchestration |
+| `cbzxl_web/worker.py` | Durable queue, scheduler, subprocess lifecycle, and stall detection |
+| `cbzxl.py` | Conversion-run orchestration and persistence |
+| `cbzxl_web/engine.py` | ZIP safety, recovery primitives, verification, and workspace mechanics |
+| `cbzxl_web/database.py` | Schema, migrations, transactions, schedules, and maintenance |
+| `cbzxl_web/runtime_state.py` | RAM-backed live progress shared by web and worker |
+| `cbzxl_web/protocol.py` | Structured converter event protocol |
+| `cbzxl_web/legacy.py` | Read-only legacy database inspection and import |
+
+The web and worker processes coordinate through SQLite for durable intent and
+through `/runtime` for high-frequency volatile progress. They do not depend on
+one another for HTTP availability.
+
+## Development and validation
+
+Run the Python test suite:
 
 ```sh
 python -m unittest discover -s tests -v
-cd frontend && pnpm install && pnpm run build
+```
+
+Build the frontend:
+
+```sh
+cd frontend
+corepack enable
+pnpm install --frozen-lockfile
+pnpm run build
+```
+
+Validate deployment configuration:
+
+```sh
 docker compose config
 ```
 
-The published `angeladmerkel/cbzxl-web:latest` image targets `linux/amd64`. The production Dockerfile builds the React interface first, then packages it with the FastAPI application and Python worker.
+The production Dockerfile builds the React application, verifies the pinned
+libjxl binary, and packages it with FastAPI and the Python worker in a
+`linux/amd64` image.

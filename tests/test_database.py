@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -25,7 +26,7 @@ class DatabaseTests(unittest.TestCase):
                 row[0]
                 for row in conn.execute("SELECT name FROM conversion_profiles")
             }
-        self.assertEqual(version, 10)
+        self.assertEqual(version, 11)
         self.assertEqual(library["root_path"], database.LIBRARY_PATH)
         self.assertEqual(profile["name"], "Balanced lossless")
         self.assertEqual(
@@ -53,6 +54,12 @@ class DatabaseTests(unittest.TestCase):
             result_indexes = {
                 row[1] for row in conn.execute("PRAGMA index_list(archive_results)")
             }
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
         self.assertIn("entry_path", issue_columns)
         self.assertIn("related_entry_path", issue_columns)
         self.assertIn("dismissed_until_rescan", archive_columns)
@@ -66,6 +73,8 @@ class DatabaseTests(unittest.TestCase):
         self.assertIn("candidate_size", decision_columns)
         self.assertIn("attempts_json", decision_columns)
         self.assertIn("idx_results_latest_processed", result_indexes)
+        self.assertIn("archive_commit_intents", tables)
+        self.assertIn("maintenance_state", tables)
         self.assertEqual(json.loads(profile["options_json"])["effort"], 10)
 
     def test_new_database_does_not_modify_legacy_v2_file(self):
@@ -177,6 +186,45 @@ class DatabaseTests(unittest.TestCase):
         options = json.loads(stored)
         self.assertTrue(options["no_flatten"])
         self.assertFalse(options["delete_empty"])
+
+    def test_schema_upgrade_creates_a_verified_rotating_backup(self):
+        with database.transaction() as conn:
+            conn.execute("DELETE FROM schema_migrations WHERE version=11")
+
+        database.initialize()
+
+        backups = list(
+            (database.DB_PATH.parent / "backups").glob(
+                "cbzxl.pre-v10-*.sqlite3"
+            )
+        )
+        self.assertEqual(len(backups), 1)
+        backup = sqlite3.connect(str(backups[0]))
+        try:
+            self.assertEqual(
+                backup.execute("PRAGMA quick_check").fetchone()[0],
+                "ok",
+            )
+            self.assertEqual(
+                backup.execute(
+                    "SELECT MAX(version) FROM schema_migrations"
+                ).fetchone()[0],
+                10,
+            )
+        finally:
+            backup.close()
+
+    def test_database_maintenance_is_weekly_unless_forced(self):
+        self.assertFalse(database.run_database_maintenance())
+        self.assertTrue(database.run_database_maintenance(force=True))
+        with database.connect() as conn:
+            state = conn.execute(
+                """
+                SELECT value FROM maintenance_state
+                WHERE key='quick_check'
+                """
+            ).fetchone()
+        self.assertEqual(state["value"], "ok")
 
 
 if __name__ == "__main__":

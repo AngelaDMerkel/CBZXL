@@ -18,6 +18,7 @@ from .database import (
     initialize,
     recover_interrupted_jobs,
     row_dict,
+    run_database_maintenance,
     transaction,
     utc_now,
 )
@@ -319,7 +320,18 @@ def run_job(job):
 def main():
     initialize()
     recover_interrupted_jobs()
+    next_maintenance_check = time.monotonic() + 3600
     while True:
+        if time.monotonic() >= next_maintenance_check:
+            try:
+                run_database_maintenance()
+            except Exception as exc:
+                print(
+                    f"Database maintenance failed: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            next_maintenance_check = time.monotonic() + 3600
         enqueue_due_schedules()
         job = claim_next_job()
         if job:

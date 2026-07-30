@@ -26,6 +26,7 @@ class ConverterPersistenceTests(unittest.TestCase):
             )
         cbzxl.RUN_ID = self.job_id
         cbzxl.DRY_RUN = False
+        cbzxl.ARCHIVE_STABLE_SECONDS = 0
         cbzxl.PENDING_NO_CHANGE_RESULTS.clear()
         cbzxl.PENDING_FORMAT_INVENTORIES.clear()
         cbzxl.PENDING_ARCHIVES = 0
@@ -942,6 +943,251 @@ class ConverterPersistenceTests(unittest.TestCase):
             ]
         self.assertEqual(sample_count, 180)
         self.assertEqual(decisions, ["Series/Attention.cbz"])
+
+    def test_recent_archive_is_deferred_before_zip_processing(self):
+        library_root = Path(self.temp.name) / "stable-library"
+        library_root.mkdir()
+        archive_path = library_root / "Arriving.cbz"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("001.jpg", b"still-arriving")
+        cbzxl.ARCHIVE_STABLE_SECONDS = 90
+        args = SimpleNamespace(input_dir=str(library_root))
+        conn = cbzxl.init_db(cbzxl.DB_FILE)
+
+        with mock.patch.object(cbzxl, "process_cbz") as process:
+            outcome = cbzxl.attempt_archive(
+                archive_path,
+                library_root.resolve(),
+                {},
+                conn,
+                None,
+                args,
+            )
+
+        self.assertEqual(outcome[-1], "skipped")
+        process.assert_not_called()
+        conn.close()
+        cbzxl.ARCHIVE_STABLE_SECONDS = 0
+
+    def test_source_guard_rejects_an_archive_changed_during_conversion(self):
+        archive_path = Path(self.temp.name) / "Changing.cbz"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("001.jpg", b"first")
+        identity = cbzxl.capture_archive_identity(archive_path)
+        fingerprint = cbzxl.archive_guard_fingerprint(archive_path)
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("001.jpg", b"externally-replaced")
+
+        with self.assertRaises(cbzxl.ArchiveSourceChanged):
+            cbzxl.require_unchanged_archive(
+                archive_path,
+                identity,
+                fingerprint,
+            )
+
+    def test_source_changed_before_commit_is_never_overwritten(self):
+        library_root = Path(self.temp.name) / "change-guard-library"
+        library_root.mkdir()
+        archive_path = library_root / "Guarded.cbz"
+        backup_path = archive_path.with_suffix(".cbz.bak")
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("current.bin", b"x" * 4096)
+        with zipfile.ZipFile(backup_path, "w") as archive:
+            archive.writestr("original.bin", b"original")
+        external_bytes = None
+        args = SimpleNamespace(
+            input_dir=str(library_root),
+            no_convert=True,
+            smart_distance=False,
+            distance=None,
+            smart_mb=10.0,
+            smart_mp=5.0,
+            compatibility_mode=False,
+            continue_on_page_error=False,
+            repair_action="restore_original",
+            repair_entry=None,
+            repair_entries=[],
+            repair_source=None,
+        )
+        cbzxl.WORKSPACE_DIR = Path(self.temp.name) / "workspace"
+        conn = cbzxl.init_db(cbzxl.DB_FILE)
+        real_guard = cbzxl.require_unchanged_archive
+        calls = 0
+
+        def change_before_second_guard(path, identity, fingerprint):
+            nonlocal calls, external_bytes
+            calls += 1
+            if calls == 2:
+                with zipfile.ZipFile(path, "w") as archive:
+                    archive.writestr("external.bin", b"newer-content")
+                external_bytes = Path(path).read_bytes()
+            return real_guard(path, identity, fingerprint)
+
+        with mock.patch.object(
+            cbzxl,
+            "require_unchanged_archive",
+            side_effect=change_before_second_guard,
+        ):
+            outcome = cbzxl.process_cbz(
+                archive_path,
+                conn,
+                None,
+                args,
+            )
+
+        self.assertEqual(outcome[-1], "failed")
+        self.assertEqual(archive_path.read_bytes(), external_bytes)
+        with database.connect() as check:
+            issue = check.execute(
+                "SELECT kind FROM archive_issues"
+            ).fetchone()
+            intents = check.execute(
+                "SELECT COUNT(*) FROM archive_commit_intents"
+            ).fetchone()[0]
+        self.assertEqual(issue["kind"], "source_changed")
+        self.assertEqual(intents, 0)
+        conn.close()
+
+    def test_automatic_retry_is_bounded_and_avoids_deterministic_damage(self):
+        args = SimpleNamespace(repair_action=None)
+        retryable = cbzxl.VerificationError("decoder process vanished")
+
+        self.assertTrue(
+            cbzxl.should_auto_retry_archive(retryable, args, 0)
+        )
+        self.assertFalse(
+            cbzxl.should_auto_retry_archive(retryable, args, 1)
+        )
+        self.assertFalse(
+            cbzxl.should_auto_retry_archive(
+                zipfile.BadZipFile("File is not a zip file"),
+                args,
+                0,
+            )
+        )
+
+    def test_transient_verification_failure_retries_once(self):
+        library_root = Path(self.temp.name) / "retry-library"
+        library_root.mkdir()
+        archive_path = library_root / "Retry.cbz"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("ComicInfo.xml", "<ComicInfo />")
+        cbzxl.WORKSPACE_DIR = Path(self.temp.name) / "retry-workspace"
+        args = SimpleNamespace(
+            input_dir=str(library_root),
+            no_convert=True,
+            smart_distance=False,
+            distance=None,
+            smart_mb=10.0,
+            smart_mp=5.0,
+            compatibility_mode=False,
+            continue_on_page_error=False,
+            repair_action=None,
+            repair_entry=None,
+            repair_entries=[],
+            repair_source=None,
+        )
+        conn = cbzxl.init_db(cbzxl.DB_FILE)
+        real_workspace = cbzxl.EphemeralWorkspace
+        workspaces = []
+
+        def workspace_factory(*factory_args, **factory_kwargs):
+            workspace = real_workspace(*factory_args, **factory_kwargs)
+            workspaces.append(workspace)
+            if len(workspaces) == 1:
+                workspace.prepare = mock.Mock(
+                    side_effect=cbzxl.VerificationError(
+                        "decoder process vanished"
+                    )
+                )
+            return workspace
+
+        with mock.patch.object(
+            cbzxl,
+            "EphemeralWorkspace",
+            side_effect=workspace_factory,
+        ):
+            outcome = cbzxl.process_cbz(
+                archive_path,
+                conn,
+                None,
+                args,
+            )
+
+        self.assertEqual(outcome[-1], "processed")
+        self.assertEqual(len(workspaces), 2)
+        with database.connect() as check:
+            failures = check.execute(
+                "SELECT COUNT(*) FROM archive_issues"
+            ).fetchone()[0]
+        self.assertEqual(failures, 0)
+        conn.close()
+
+    def test_interrupted_atomic_commit_is_adopted_without_reconversion(self):
+        library_root = Path(self.temp.name) / "recovery-library"
+        library_root.mkdir()
+        archive_path = library_root / "Recovered.cbz"
+        candidate_path = Path(self.temp.name) / "candidate.cbz"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("001.jpg", b"source")
+        with zipfile.ZipFile(candidate_path, "w") as archive:
+            archive.writestr("001.jxl", b"\xff\x0a" + b"candidate")
+        original_size = archive_path.stat().st_size
+        input_fingerprint = cbzxl.archive_guard_fingerprint(archive_path)
+        candidate_fingerprint = cbzxl.archive_guard_fingerprint(
+            candidate_path
+        )
+        payload = {
+            "original_size": original_size,
+            "final_size": candidate_path.stat().st_size,
+            "saved_bytes": original_size - candidate_path.stat().st_size,
+            "dominant_type": "JXL",
+            "jxl_effort": 10,
+            "duration": 1.25,
+            "image_count": 1,
+            "jpg_count": 1,
+            "png_count": 0,
+            "conversion_mode": "Lossless",
+            "megapixels_info": "N/A",
+            "converted_pages": 1,
+            "lossless_pages": 1,
+            "lossy_pages": 0,
+            "retained_pages": 0,
+            "page_decisions": {},
+        }
+        conn = cbzxl.init_db(cbzxl.DB_FILE)
+        cbzxl.record_archive_commit_intent(
+            conn,
+            "Recovered.cbz",
+            input_fingerprint,
+            candidate_fingerprint,
+            payload,
+        )
+        archive_path.write_bytes(candidate_path.read_bytes())
+
+        outcome = cbzxl.recover_archive_commit_intents(
+            conn,
+            library_root,
+        )
+
+        self.assertEqual(outcome["recovered"], 1)
+        with database.connect() as check:
+            archive = check.execute(
+                """
+                SELECT status, content_fingerprint
+                FROM archives WHERE path='Recovered.cbz'
+                """
+            ).fetchone()
+            result = check.execute(
+                "SELECT status FROM archive_results WHERE path='Recovered.cbz'"
+            ).fetchone()
+            intents = check.execute(
+                "SELECT COUNT(*) FROM archive_commit_intents"
+            ).fetchone()[0]
+        self.assertEqual(tuple(archive), ("processed", candidate_fingerprint))
+        self.assertEqual(result["status"], "processed")
+        self.assertEqual(intents, 0)
+        conn.close()
 
     def test_libjxl_version_parser_accepts_current_cli_formats(self):
         self.assertEqual(
