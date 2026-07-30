@@ -599,11 +599,12 @@ def verify_filename_invariants(original_files, final_files, completed_pages):
         raise VerificationError("Archive contains case-insensitive filename collisions")
 
 
-class ResumeWorkspace:
+class EphemeralWorkspace:
+    """RAM-backed per-archive workspace with no restart persistence."""
+
     def __init__(self, root, archive_path, fingerprint, option_key):
         self.root = Path(root) / fingerprint[:24]
         self.files = self.root / "files"
-        self.manifest_path = self.root / "manifest.json"
         self.archive_path = str(Path(archive_path).resolve())
         self.fingerprint = fingerprint
         self.option_key = option_key
@@ -611,13 +612,9 @@ class ResumeWorkspace:
         self.manifest = {}
 
     def _write_manifest(self):
-        self.root.mkdir(parents=True, exist_ok=True)
-        temporary = self.manifest_path.with_suffix(".tmp")
-        with open(temporary, "w", encoding="utf-8") as handle:
-            json.dump(self.manifest, handle, sort_keys=True, separators=(",", ":"))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, self.manifest_path)
+        # Decisions are deliberately retained in memory only and persisted to
+        # SQLite in one transaction after the archive reaches a final outcome.
+        return None
 
     def prepare(
         self,
@@ -631,68 +628,44 @@ class ResumeWorkspace:
         salvage_partial=False,
         defer_entries=None,
     ):
-        resumed = False
-        if self.manifest_path.is_file() and self.files.is_dir():
-            try:
-                self.manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
-                resumed = (
-                    self.manifest.get("version") == 5
-                    and self.manifest.get("archive_path") == self.archive_path
-                    and self.manifest.get("fingerprint") == self.fingerprint
-                    and self.manifest.get("options") == self.option_key
-                )
-            except (OSError, json.JSONDecodeError):
-                resumed = False
-        if resumed:
-            for page in self.manifest.get("completed_pages", {}).values():
-                output = self.files / page.get("output", "")
-                operation = page.get("operation") or "jxl_conversion"
-                if not output.is_file() or (
-                    operation != "extension_corrected"
-                    and not jxl_has_valid_signature(output)
-                ):
-                    resumed = False
-                    break
-        if not resumed:
-            if self.root.exists():
-                shutil.rmtree(self.root)
-            self.files.mkdir(parents=True)
-            if salvage_archive:
-                original_files = safe_extract_salvage_archive(
-                    self.archive_path,
-                    self.files,
-                    max_uncompressed_bytes,
-                    token,
-                    allow_partial=salvage_partial,
-                )
-            else:
-                original_files = safe_extract_archive(
-                    self.archive_path,
-                    self.files,
-                    max_uncompressed_bytes,
-                    token,
-                    recover_crc_entry=recover_crc_entry,
-                    recover_crc_entries=recover_crc_entries,
-                    recover_size_mismatch=recover_size_mismatch,
-                    defer_entries=defer_entries,
-                )
-            self.manifest = {
-                "version": 5,
-                "archive_path": self.archive_path,
-                "fingerprint": self.fingerprint,
-                "options": self.option_key,
-                "stage": "extracted",
-                "original_files": original_files,
-                "completed_pages": {},
-                "page_decisions": {},
-            }
-            self._write_manifest()
+        if self.root.exists():
+            shutil.rmtree(self.root)
+        self.files.mkdir(parents=True)
+        if salvage_archive:
+            original_files = safe_extract_salvage_archive(
+                self.archive_path,
+                self.files,
+                max_uncompressed_bytes,
+                token,
+                allow_partial=salvage_partial,
+            )
+        else:
+            original_files = safe_extract_archive(
+                self.archive_path,
+                self.files,
+                max_uncompressed_bytes,
+                token,
+                recover_crc_entry=recover_crc_entry,
+                recover_crc_entries=recover_crc_entries,
+                recover_size_mismatch=recover_size_mismatch,
+                defer_entries=defer_entries,
+            )
+        self.manifest = {
+            "version": 1,
+            "archive_path": self.archive_path,
+            "fingerprint": self.fingerprint,
+            "options": self.option_key,
+            "stage": "extracted",
+            "original_files": original_files,
+            "completed_pages": {},
+            "page_decisions": {},
+        }
         for partial in self.files.rglob(f"*{PARTIAL_SUFFIX}*"):
             partial.unlink(missing_ok=True)
         for pattern in ("*.cbzxl-input.*", "*.cbzxl.png"):
             for normalized in self.files.rglob(pattern):
                 normalized.unlink(missing_ok=True)
-        return resumed, len(self.manifest.get("completed_pages", {}))
+        return False, 0
 
     def set_stage(self, stage):
         with self._lock:
@@ -796,6 +769,11 @@ class ResumeWorkspace:
     def complete(self):
         if self.root.exists():
             shutil.rmtree(self.root)
+
+
+# Compatibility for third-party imports; restart-resume behavior no longer
+# exists and both names create the same ephemeral workspace.
+ResumeWorkspace = EphemeralWorkspace
 
 
 def jxl_has_valid_signature(path):

@@ -37,6 +37,7 @@ from cbzxl_web.database import (
     transaction,
     utc_now,
 )
+from cbzxl_web.runtime_state import read_live_job
 from cbzxl_web.legacy import import_legacy, inspect_legacy
 from cbzxl_web.engine import (
     IMAGE_SUFFIXES,
@@ -52,7 +53,7 @@ ROOT = Path(__file__).parent
 FRONTEND_DIST = ROOT / "frontend" / "dist"
 LEGACY_STATIC = ROOT / "static"
 
-VERSION = "4.4.0"
+VERSION = "4.5.0"
 LOGGER = logging.getLogger("cbzxl.web")
 DATABASE_STARTUP_ERROR: str | None = None
 
@@ -196,6 +197,8 @@ def parse_json(value, fallback=None):
 def hydrate_job(job, samples=None):
     if not job:
         return job
+    if job.get("id") and job.get("status") in {"queued", "running", "stopping"}:
+        job.update(read_live_job(job["id"]))
     job["options"] = parse_json(job.pop("options_json", None))
     job["saved_gb"] = gb(job.get("bytes_saved"))
     job["increased_gb"] = gb(job.get("bytes_increased"))
@@ -1412,43 +1415,58 @@ def list_issues(
         rows = rows_dict(
             conn.execute(
                 f"""
+                WITH issue_page AS MATERIALIZED (
+                    SELECT
+                        ai.*,
+                        CASE WHEN issue_job.source='retry' THEN 1 ELSE 0 END AS retry_failed,
+                        a.library_id AS issue_library_id,
+                        a.path,
+                        a.status AS archive_status,
+                        a.original_size,
+                        a.final_size,
+                        a.bytes_saved,
+                        a.percent_saved,
+                        a.dominant_type,
+                        a.image_count,
+                        l.root_path
+                    FROM archive_issues ai
+                    JOIN archives a ON a.id=ai.archive_id
+                    JOIN libraries l ON l.id=a.library_id
+                    LEFT JOIN jobs issue_job ON issue_job.id=ai.job_id
+                    WHERE ai.status IN ('open', 'queued')
+                      {group_clause}
+                    ORDER BY
+                        CASE ai.status WHEN 'open' THEN 0 ELSE 1 END,
+                        ai.updated_at DESC
+                    LIMIT ?
+                ),
+                latest_results AS MATERIALIZED (
+                    SELECT
+                        issue_page.id AS issue_id,
+                        MAX(ar.id) AS result_id
+                    FROM issue_page
+                    JOIN archive_results ar
+                      ON ar.path=issue_page.path
+                     AND ar.status='processed'
+                    JOIN jobs ar_job
+                      ON ar_job.id=ar.job_id
+                     AND ar_job.library_id=issue_page.issue_library_id
+                    GROUP BY issue_page.id
+                )
                 SELECT
-                    ai.*,
-                    CASE WHEN issue_job.source='retry' THEN 1 ELSE 0 END AS retry_failed,
-                    a.path,
-                    a.status AS archive_status,
-                    a.original_size,
-                    a.final_size,
-                    a.bytes_saved,
-                    a.percent_saved,
-                    a.dominant_type,
-                    a.image_count,
+                    issue_page.*,
                     latest_result.original_size AS latest_original_size,
                     latest_result.final_size AS latest_final_size,
                     latest_result.bytes_saved AS latest_bytes_saved,
-                    latest_result.percent_saved AS latest_percent_saved,
-                    l.root_path
-                FROM archive_issues ai
-                JOIN archives a ON a.id=ai.archive_id
-                JOIN libraries l ON l.id=a.library_id
-                LEFT JOIN jobs issue_job ON issue_job.id=ai.job_id
+                    latest_result.percent_saved AS latest_percent_saved
+                FROM issue_page
+                LEFT JOIN latest_results
+                  ON latest_results.issue_id=issue_page.id
                 LEFT JOIN archive_results latest_result
-                  ON latest_result.id=(
-                    SELECT ar.id
-                    FROM archive_results ar
-                    JOIN jobs ar_job ON ar_job.id=ar.job_id
-                    WHERE ar.path=a.path
-                      AND ar_job.library_id=a.library_id
-                      AND ar.status='processed'
-                    ORDER BY ar.id DESC
-                    LIMIT 1
-                  )
-                WHERE ai.status IN ('open', 'queued')
-                  {group_clause}
+                  ON latest_result.id=latest_results.result_id
                 ORDER BY
-                    CASE ai.status WHEN 'open' THEN 0 ELSE 1 END,
-                    ai.updated_at DESC
-                LIMIT ?
+                    CASE issue_page.status WHEN 'open' THEN 0 ELSE 1 END,
+                    issue_page.updated_at DESC
                 """,
                 (*group_params, limit),
             ).fetchall()
@@ -1485,6 +1503,7 @@ def list_issues(
             if row.get("kind") in {"crc_mismatch", "archive_corrupt"}
             else None
         )
+        row.pop("issue_library_id", None)
         row.pop("root_path", None)
     groups = {}
     for count_row in kind_counts:

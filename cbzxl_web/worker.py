@@ -22,6 +22,7 @@ from .database import (
     utc_now,
 )
 from .protocol import PROTOCOL_PREFIX, parse_event
+from .runtime_state import clear_live_job, publish_event
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -156,6 +157,7 @@ def persist_output(job_id, raw):
 
 def persist_structured_event(job_id, event):
     event_type = event["type"]
+    publish_event(job_id, event)
     archive_path = event.get("archive")
     stage = event.get("stage")
     page = max(0, int(event.get("page") or 0))
@@ -163,9 +165,10 @@ def persist_structured_event(job_id, event):
     now = event.get("at") or utc_now()
     durable_types = {
         "job_started", "job_completed", "job_failed", "job_cancelled",
-        "archive_started", "archive_resumed", "archive_completed", "archive_failed",
-        "verification_started", "verification_completed", "page_failed", "repair_applied",
+        "repair_applied",
     }
+    if event_type not in durable_types:
+        return
     with transaction() as conn:
         conn.execute(
             """
@@ -179,25 +182,6 @@ def persist_structured_event(job_id, event):
             """,
             (archive_path, stage, page, event_type, page, total_pages, event_type, total_pages, now, job_id),
         )
-        if event_type in {"page_completed", "page_started"}:
-            job = row_dict(conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
-            completed = sum(int(job.get(key) or 0) for key in ("processed", "skipped", "failed", "deleted"))
-            conn.execute(
-                """
-                INSERT INTO job_progress_samples(
-                    job_id, recorded_at, completed, processed, skipped, failed, deleted,
-                    bytes_saved, bytes_increased, net_bytes_saved, current_archive,
-                    current_stage, current_page, total_pages
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    job_id, now, completed, job.get("processed") or 0, job.get("skipped") or 0,
-                    job.get("failed") or 0, job.get("deleted") or 0, job.get("bytes_saved") or 0,
-                    job.get("bytes_increased") or 0, job.get("net_bytes_saved") or 0,
-                    archive_path or job.get("current_archive"), stage or job.get("current_stage"),
-                    page or job.get("current_page") or 0, total_pages or job.get("total_pages") or 0,
-                ),
-            )
         if event_type in durable_types:
             add_event(
                 conn,
@@ -328,6 +312,7 @@ def run_job(job):
                 message,
                 data={"return_code": return_code, "output": detail} if return_code else None,
             )
+    clear_live_job(job["id"])
     STRUCTURED_JOBS.discard(job["id"])
 
 

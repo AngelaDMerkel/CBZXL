@@ -381,10 +381,24 @@ def rows_dict(rows: Iterable[sqlite3.Row]) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+class ClosingConnection(sqlite3.Connection):
+    """Preserve SQLite transaction semantics and close after a with block."""
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 def connect(path: Path | str | None = None) -> sqlite3.Connection:
     target = Path(path or DB_PATH)
     target.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(target), timeout=30)
+    conn = sqlite3.connect(
+        str(target),
+        timeout=30,
+        factory=ClosingConnection,
+    )
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 5000")
@@ -455,6 +469,12 @@ def initialize() -> None:
             for column, definition in additions.items():
                 if column not in existing_columns:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_results_latest_processed
+            ON archive_results(path, status, id DESC, job_id)
+            """
+        )
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (3, ?)",
             (utc_now(),),
@@ -630,6 +650,10 @@ def initialize() -> None:
                 "INSERT INTO schema_migrations(version, applied_at) VALUES (9, ?)",
                 (now,),
             )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (10, ?)",
+            (now,),
+        )
         conn.execute(
             """
             INSERT OR IGNORE INTO archive_issues(

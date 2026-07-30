@@ -19,14 +19,14 @@ RUN /opt/libjxl/tools/cjxl --version 2>&1 | grep -F "v${LIBJXL_VERSION}" \
     && /opt/libjxl/tools/djxl --version 2>&1 | grep -F "v${LIBJXL_VERSION}"
 
 FROM python:3.13-alpine
-LABEL name="cbzxl-web" version="4.4.0"
+LABEL name="cbzxl-web" version="4.5.0"
 
 RUN apk add --no-cache tzdata imagemagick file
 COPY --from=libjxl /opt/libjxl/tools/cjxl /usr/local/bin/cjxl
 COPY --from=libjxl /opt/libjxl/tools/djxl /usr/local/bin/djxl
 
 WORKDIR /app
-RUN mkdir -p /data /config /dev/shm/cbzxl
+RUN mkdir -p /data /config /dev/shm/cbzxl /dev/shm/cbzxl-runtime
 
 COPY requirements.txt cbzxl.py app.py /app/
 COPY cbzxl_web /app/cbzxl_web
@@ -37,9 +37,13 @@ ENV PYTHONUNBUFFERED=1 \
     CONFIG_DIR=/config \
     DB_PATH=/config/cbzxl-v3.sqlite3 \
     LIBRARY_PATH=/data \
-    LOG_FILE=/config/cbzxl.log \
+    LOG_FILE= \
     SCRATCH_DIR=/dev/shm/cbzxl \
-    RESUME_DIR=/config/resume \
+    WORKSPACE_DIR=/dev/shm/cbzxl/workspaces \
+    RUNTIME_DIR=/dev/shm/cbzxl-runtime \
+    DURABLE_CHECKPOINT_SECONDS=300 \
+    DURABLE_CHECKPOINT_ARCHIVES=10000 \
+    PAGE_DECISION_RETENTION_DAYS=180 \
     WORKER_STALL_SECONDS=900 \
     TMPDIR=/dev/shm \
     TEMP=/dev/shm \
@@ -47,4 +51,4 @@ ENV PYTHONUNBUFFERED=1 \
 
 VOLUME ["/data", "/config"]
 EXPOSE 5000
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "5000"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "5000", "--no-access-log"]

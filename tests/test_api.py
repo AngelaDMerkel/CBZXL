@@ -9,7 +9,7 @@ from unittest import mock
 
 from fastapi.testclient import TestClient
 
-from cbzxl_web import database
+from cbzxl_web import database, runtime_state
 import app as web_app
 
 
@@ -17,6 +17,8 @@ class ApiTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         database.DB_PATH = Path(self.temp.name) / "api.sqlite3"
+        runtime_state.RUNTIME_DIR = Path(self.temp.name) / "runtime"
+        runtime_state._STATES.clear()
         database.initialize()
         self.client = TestClient(web_app.app)
 
@@ -1152,6 +1154,61 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(payload["current_archive"], "Volume 04.cbz")
         self.assertEqual(payload["completed_archives"], 4)
         self.assertEqual(payload["total_archives"], 10)
+
+    def test_homepage_widget_uses_ram_progress_without_database_checkpoint(self):
+        created = self.client.post("/api/jobs", json={}).json()
+        with database.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status='running', started_at=?, heartbeat_at=?,
+                    archives_found=10, processed=0
+                WHERE id=?
+                """,
+                (database.utc_now(), database.utc_now(), created["id"]),
+            )
+        runtime_state.publish_event(
+            created["id"],
+            {
+                "type": "job_started",
+                "archives_found": 10,
+                "stage": "discovering",
+            },
+        )
+        for index in range(4):
+            runtime_state.publish_event(
+                created["id"],
+                {
+                    "type": "archive_completed",
+                    "archive": f"Series/Volume {index + 1:02}.cbz",
+                    "stage": "complete",
+                    "bytes_saved": 1024,
+                },
+            )
+        runtime_state.publish_event(
+            created["id"],
+            {
+                "type": "page_completed",
+                "archive": "Series/Volume 05.cbz",
+                "stage": "encoding",
+                "page": 5,
+                "total_pages": 10,
+            },
+        )
+
+        payload = self.client.get("/api/integrations/homepage").json()
+
+        self.assertEqual(payload["status"], "Encoding")
+        self.assertEqual(payload["progress_percent"], 45)
+        self.assertEqual(payload["current_archive"], "Volume 05.cbz")
+        self.assertEqual(payload["completed_archives"], 4)
+        with database.connect() as conn:
+            durable = conn.execute(
+                "SELECT processed, current_archive FROM jobs WHERE id=?",
+                (created["id"],),
+            ).fetchone()
+        self.assertEqual(durable["processed"], 0)
+        self.assertIsNone(durable["current_archive"])
 
     def test_homepage_widget_remains_available_when_database_is_not(self):
         bad_path = Path(self.temp.name) / "homepage-not-a-database"

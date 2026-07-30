@@ -25,7 +25,7 @@ class DatabaseTests(unittest.TestCase):
                 row[0]
                 for row in conn.execute("SELECT name FROM conversion_profiles")
             }
-        self.assertEqual(version, 9)
+        self.assertEqual(version, 10)
         self.assertEqual(library["root_path"], database.LIBRARY_PATH)
         self.assertEqual(profile["name"], "Balanced lossless")
         self.assertEqual(
@@ -50,6 +50,9 @@ class DatabaseTests(unittest.TestCase):
             decision_columns = {
                 row[1] for row in conn.execute("PRAGMA table_info(page_decisions)")
             }
+            result_indexes = {
+                row[1] for row in conn.execute("PRAGMA index_list(archive_results)")
+            }
         self.assertIn("entry_path", issue_columns)
         self.assertIn("related_entry_path", issue_columns)
         self.assertIn("dismissed_until_rescan", archive_columns)
@@ -62,6 +65,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertIn("compressed_bytes", format_columns)
         self.assertIn("candidate_size", decision_columns)
         self.assertIn("attempts_json", decision_columns)
+        self.assertIn("idx_results_latest_processed", result_indexes)
         self.assertEqual(json.loads(profile["options_json"])["effort"], 10)
 
     def test_new_database_does_not_modify_legacy_v2_file(self):

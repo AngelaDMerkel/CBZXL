@@ -8,13 +8,15 @@ import threading
 import zipfile
 import subprocess
 import argparse
+import copy
+import errno
 import re
 import stat
 import sys
 import time
 import uuid
 from pathlib import Path, PurePosixPath
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from rich.console import Console
 from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn, SpinnerColumn
@@ -31,7 +33,7 @@ from cbzxl_web.engine import (
     ConversionCancelled,
     PageConversionError,
     PARTIAL_SUFFIX,
-    ResumeWorkspace,
+    EphemeralWorkspace,
     VerificationError,
     archive_fingerprint,
     install_signal_handlers,
@@ -47,17 +49,21 @@ from cbzxl_web.protocol import EventEmitter
 # Default Constants (can be overwritten by args)
 DEFAULT_JXL_EFFORT = 10
 DEFAULT_THREADS = 10
-SCRIPT_VERSION = "4.4.0"
+SCRIPT_VERSION = "4.5.0"
 
 # Constants for use only in the Docker Container.
 CONFIG_DIR = os.getenv("CONFIG_DIR", "/config")
 DB_FILE = os.getenv("DB_PATH", os.path.join(CONFIG_DIR, "cbzxl-v3.sqlite3"))
-LOG_FILE = os.getenv("LOG_FILE", os.path.join(CONFIG_DIR, "cbzxl.log"))
+LOG_FILE = os.getenv("LOG_FILE", "")
 ENCODER_MAX_SECONDS = int(os.getenv("ENCODER_MAX_SECONDS", "0"))
 SUBPROCESS_TIMEOUT = int(os.getenv("AUXILIARY_TIMEOUT_SECONDS", "300"))
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = int(os.getenv("MAX_ARCHIVE_UNCOMPRESSED_MB", "8192")) * 1024 * 1024
 SCRATCH_DIR = Path(os.getenv("SCRATCH_DIR", "/dev/shm/cbzxl"))
-RESUME_DIR = Path(os.getenv("RESUME_DIR", os.path.join(CONFIG_DIR, "resume")))
+WORKSPACE_DIR = Path(os.getenv("WORKSPACE_DIR", "/dev/shm/cbzxl/workspaces"))
+# Import compatibility only. Runtime code deliberately ignores the historical
+# RESUME_DIR environment variable so stale settings cannot redirect temporary
+# conversion data from RAM to persistent storage.
+RESUME_DIR = WORKSPACE_DIR
 
 # Global variables - will be set in main()
 console = Console()
@@ -80,6 +86,82 @@ HEARTBEAT_LOCK = threading.Lock()
 PILLOW_RECOVERY_LOCK = threading.Lock()
 LAST_HEARTBEAT = 0.0
 MINIMUM_JXL_VERSION = (0, 12, 0)
+DURABLE_CHECKPOINT_SECONDS = max(
+    300,
+    int(os.getenv("DURABLE_CHECKPOINT_SECONDS", "300")),
+)
+DURABLE_CHECKPOINT_ARCHIVES = max(
+    1,
+    int(os.getenv("DURABLE_CHECKPOINT_ARCHIVES", "10000")),
+)
+PAGE_DECISION_RETENTION_DAYS = max(
+    1,
+    int(os.getenv("PAGE_DECISION_RETENTION_DAYS", "180")),
+)
+ARCHIVE_STABLE_SECONDS = max(
+    0,
+    int(os.getenv("ARCHIVE_STABLE_SECONDS", "90")),
+)
+AUTO_RETRY_ATTEMPTS = min(
+    1,
+    max(0, int(os.getenv("AUTO_RETRY_ATTEMPTS", "1"))),
+)
+LAST_DURABLE_CHECKPOINT = time.monotonic()
+PENDING_NO_CHANGE_RESULTS = []
+PENDING_FORMAT_INVENTORIES = []
+PENDING_ARCHIVES = 0
+
+
+class ArchiveSourceChanged(RuntimeError):
+    kind = "source_changed"
+    stage = "committing"
+
+
+def capture_archive_identity(path):
+    """Return the inexpensive identity used to guard an atomic replacement."""
+    stat_result = Path(path).stat()
+    return {
+        "device": stat_result.st_dev,
+        "inode": stat_result.st_ino,
+        "size": stat_result.st_size,
+        "mtime_ns": stat_result.st_mtime_ns,
+    }
+
+
+def require_unchanged_archive(path, expected_identity, expected_fingerprint):
+    """Refuse to overwrite a source that changed after conversion began."""
+    current_identity = capture_archive_identity(path)
+    if current_identity != expected_identity:
+        raise ArchiveSourceChanged(
+            "Source archive changed during conversion; the verified candidate "
+            "was discarded"
+        )
+    try:
+        current_fingerprint = archive_fingerprint(path)
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise ArchiveSourceChanged(
+            "Source archive became unreadable during conversion; the verified "
+            "candidate was discarded"
+        ) from exc
+    if current_fingerprint != expected_fingerprint:
+        raise ArchiveSourceChanged(
+            "Source archive contents changed during conversion; the verified "
+            "candidate was discarded"
+        )
+
+
+def archive_is_stable(path, minimum_age_seconds=None, *, now=None):
+    """Return whether an archive is old enough to no longer be an active copy."""
+    minimum_age = (
+        ARCHIVE_STABLE_SECONDS
+        if minimum_age_seconds is None
+        else max(0, int(minimum_age_seconds))
+    )
+    if minimum_age == 0:
+        return True
+    stat_result = Path(path).stat()
+    wall_time = time.time() if now is None else float(now)
+    return wall_time - stat_result.st_mtime >= minimum_age
 
 
 def emit(event_type, *, level="info", message="", **data):
@@ -167,21 +249,19 @@ def format_summary(paths):
 
 
 def log(msg, level="info", msg_type="general"):
-    """Log messages to console and log file, with optional [DRY RUN] prefix"""
+    """Log to the captured console; persistent text logging is opt-in."""
     log_prefix = "[DRY RUN] " if DRY_RUN else ""
     full_msg = f"{log_prefix}{msg}"
-    Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
-
     if msg_type == "skipped" and SUPPRESS_SKIPPED and not DRY_RUN:
-        with open(LOG_FILE, 'a', encoding='utf-8') as f:
-            f.write(full_msg + "\n")
         return
 
     if VERBOSE or level == "error" or DRY_RUN:
         console.print(full_msg)
 
-    with open(LOG_FILE, 'a', encoding='utf-8') as f:
-        f.write(full_msg + "\n")
+    if LOG_FILE:
+        Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
+        with open(LOG_FILE, "a", encoding="utf-8") as handle:
+            handle.write(full_msg + "\n")
 
 
 def init_db(db_path):
@@ -404,6 +484,11 @@ def unchanged_archive_context(db_row):
 
 
 def start_run(conn, args, total_files):
+    global LAST_DURABLE_CHECKPOINT, PENDING_ARCHIVES
+    PENDING_NO_CHANGE_RESULTS.clear()
+    PENDING_FORMAT_INVENTORIES.clear()
+    PENDING_ARCHIVES = 0
+    LAST_DURABLE_CHECKPOINT = time.monotonic()
     emit(
         "job_started",
         message=f"Conversion started for {total_files} archives",
@@ -516,6 +601,43 @@ def record_library_snapshot(conn, job_id):
     )
 
 
+def prune_operational_history(conn, job_id):
+    """Bound high-volume diagnostic detail while retaining durable outcomes."""
+    conn.execute(
+        """
+        DELETE FROM job_progress_samples
+        WHERE job_id=?
+          AND id NOT IN (
+              SELECT id
+              FROM job_progress_samples
+              WHERE job_id=?
+              ORDER BY id DESC
+              LIMIT 180
+          )
+        """,
+        (job_id, job_id),
+    )
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(days=PAGE_DECISION_RETENTION_DAYS)
+    ).isoformat().replace("+00:00", "Z")
+    conn.execute(
+        """
+        DELETE FROM page_decisions
+        WHERE created_at < ?
+          AND outcome IN (
+              'converted', 'retained', 'extension_corrected',
+              'already_current', 'unsupported'
+          )
+          AND archive_id NOT IN (
+              SELECT archive_id
+              FROM archive_issues
+              WHERE status IN ('open', 'queued')
+          )
+        """,
+        (cutoff,),
+    )
+
+
 def finish_run(conn, status, processed, skipped, failed, flattened, deleted, saved_bytes, increased_bytes, net_bytes):
     normalized_status = "partial" if status == "finished_with_errors" else "succeeded" if status == "finished" else status
     event_type = "job_completed" if normalized_status in {"succeeded", "partial"} else "job_cancelled" if normalized_status == "cancelled" else "job_failed"
@@ -534,6 +656,18 @@ def finish_run(conn, status, processed, skipped, failed, flattened, deleted, sav
     )
     if conn is None or not RUN_ID:
         return
+    update_run_progress(
+        conn,
+        processed,
+        skipped,
+        failed,
+        flattened,
+        deleted,
+        saved_bytes,
+        increased_bytes,
+        net_bytes,
+        force=True,
+    )
     conn.execute("""
         UPDATE jobs
         SET finished_at = ?,
@@ -561,54 +695,119 @@ def finish_run(conn, status, processed, skipped, failed, flattened, deleted, sav
         RUN_ID,
     ))
     record_library_snapshot(conn, RUN_ID)
+    prune_operational_history(conn, RUN_ID)
     conn.commit()
 
 
-def update_run_progress(conn, processed, skipped, failed, flattened, deleted, saved_bytes, increased_bytes, net_bytes):
+def update_run_progress(
+    conn,
+    processed,
+    skipped,
+    failed,
+    flattened,
+    deleted,
+    saved_bytes,
+    increased_bytes,
+    net_bytes,
+    *,
+    force=False,
+):
+    global LAST_DURABLE_CHECKPOINT, PENDING_ARCHIVES
     if conn is None or not RUN_ID:
         return
-    conn.execute("""
-        UPDATE jobs
-        SET processed = ?,
-            skipped = ?,
-            failed = ?,
-            flattened = ?,
-            deleted = ?,
-            bytes_saved = ?,
-            bytes_increased = ?,
-            net_bytes_saved = ?
-        WHERE id = ?
-    """, (
-        processed,
-        skipped,
-        failed,
-        flattened,
-        deleted,
-        saved_bytes,
-        increased_bytes,
-        net_bytes,
-        RUN_ID,
-    ))
-    current = conn.execute("SELECT current_archive FROM jobs WHERE id=?", (RUN_ID,)).fetchone()
-    conn.execute("""
-        INSERT INTO job_progress_samples(
-            job_id, recorded_at, completed, processed, skipped, failed, deleted,
-            bytes_saved, bytes_increased, net_bytes_saved, current_archive
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        RUN_ID,
-        utc_now(),
-        processed + skipped + failed + deleted,
-        processed,
-        skipped,
-        failed,
-        deleted,
-        saved_bytes,
-        increased_bytes,
-        net_bytes,
-        current[0] if current else None,
-    ))
-    conn.commit()
+    if not force:
+        PENDING_ARCHIVES += 1
+    due = (
+        force
+        or PENDING_ARCHIVES >= DURABLE_CHECKPOINT_ARCHIVES
+        or time.monotonic() - LAST_DURABLE_CHECKPOINT
+        >= DURABLE_CHECKPOINT_SECONDS
+    )
+    if not due:
+        return
+    pending_results = list(PENDING_NO_CHANGE_RESULTS)
+    pending_inventories = list(PENDING_FORMAT_INVENTORIES)
+    try:
+        for operation, args, kwargs in pending_results:
+            operation(*args, **kwargs, commit=False)
+        for archive_id, cbz_path, fingerprint in pending_inventories:
+            try:
+                record_archive_format_inventory(
+                    conn,
+                    archive_id,
+                    cbz_path,
+                    fingerprint,
+                )
+            except (
+                OSError,
+                ValueError,
+                sqlite3.Error,
+                zipfile.BadZipFile,
+                zipfile.LargeZipFile,
+            ) as exc:
+                log(
+                    "Deferred format inventory could not be refreshed for "
+                    f"{cbz_path}: {exc}",
+                    "WARNING",
+                )
+        conn.execute(
+            """
+            UPDATE jobs
+            SET processed = ?,
+                skipped = ?,
+                failed = ?,
+                flattened = ?,
+                deleted = ?,
+                bytes_saved = ?,
+                bytes_increased = ?,
+                net_bytes_saved = ?
+            WHERE id = ?
+            """,
+            (
+                processed,
+                skipped,
+                failed,
+                flattened,
+                deleted,
+                saved_bytes,
+                increased_bytes,
+                net_bytes,
+                RUN_ID,
+            ),
+        )
+        current = conn.execute(
+            "SELECT current_archive FROM jobs WHERE id=?",
+            (RUN_ID,),
+        ).fetchone()
+        conn.execute(
+            """
+            INSERT INTO job_progress_samples(
+                job_id, recorded_at, completed, processed, skipped, failed, deleted,
+                bytes_saved, bytes_increased, net_bytes_saved, current_archive
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                RUN_ID,
+                utc_now(),
+                processed + skipped + failed + deleted,
+                processed,
+                skipped,
+                failed,
+                deleted,
+                saved_bytes,
+                increased_bytes,
+                net_bytes,
+                current[0] if current else None,
+            ),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    del PENDING_NO_CHANGE_RESULTS[: len(pending_results)]
+    del PENDING_FORMAT_INVENTORIES[: len(pending_inventories)]
+    PENDING_ARCHIVES = 0
+    LAST_DURABLE_CHECKPOINT = time.monotonic()
 
 
 def record_archive_result(
@@ -684,7 +883,7 @@ def record_archive_result(
     ))
 
 
-def persist_page_decisions(conn, path_str, workspace):
+def persist_page_decisions(conn, path_str, workspace, *, commit=True):
     """Persist the final per-page decision trail for one archive attempt."""
     if DRY_RUN or conn is None or not RUN_ID or not workspace:
         return
@@ -737,7 +936,8 @@ def persist_page_decisions(conn, path_str, workspace):
                 now,
             ),
         )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def mark_integrity_audited(
@@ -751,6 +951,7 @@ def mark_integrity_audited(
     jpg_count=0,
     png_count=0,
     dominant_type="N/A",
+    commit=True,
 ):
     """Record a read-only audit without treating it as a conversion."""
     if DRY_RUN or conn is None:
@@ -843,7 +1044,8 @@ def mark_integrity_audited(
         "N/A",
         archive_mtime_value=current_mtime,
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def mark_processed(
@@ -868,6 +1070,7 @@ def mark_processed(
     lossless_pages=0,
     lossy_pages=0,
     retained_pages=0,
+    commit=True,
 ):
     """Mark an archive as processed with enhanced metadata."""
     if DRY_RUN or conn is None:
@@ -1044,9 +1247,12 @@ def mark_processed(
             archive_mtime_value=archive_mtime_value,
             generation=generation,
         )
-        conn.commit()
+        if commit:
+            conn.commit()
     except sqlite3.DatabaseError as e:
         log(f"[red]❌ Failed to mark as processed in DB: {path_str} — {e}", level="error")
+        if not commit:
+            raise
 
 
 def mark_failed(
@@ -1061,6 +1267,7 @@ def mark_failed(
     issue_entry=None,
     issue_related_entry=None,
     issue_detail=None,
+    commit=True,
 ):
     """Mark an archive as failed with duration and a specific error message."""
     if DRY_RUN or conn is None:
@@ -1131,9 +1338,12 @@ def mark_failed(
             archive_mtime_value=archive_mtime_value,
             generation=int(archive["generation"] or 1),
         )
-        conn.commit()
+        if commit:
+            conn.commit()
     except sqlite3.DatabaseError as e:
         log(f"[red]❌ Failed to mark as failed in DB: {path_str} — {e}", level="error")
+        if not commit:
+            raise
 
 
 def classify_archive_error(error, workspace=None):
@@ -1198,7 +1408,7 @@ def record_archive_failure(conn_main, conn_fail, cbz_path_obj, path_str, error, 
         related_entry_path=issue_related_entry,
         detail=issue_detail,
     )
-    if conn_fail:
+    if conn_fail and conn_fail is not conn_main:
         mark_failed(
             conn_fail,
             cbz_path_obj,
@@ -1223,7 +1433,32 @@ def record_archive_failure(conn_main, conn_fail, cbz_path_obj, path_str, error, 
             issue_entry=issue_entry,
             issue_related_entry=issue_related_entry,
             issue_detail=issue_detail,
+            commit=False,
         )
+        persist_page_decisions(
+            conn_main,
+            path_str,
+            workspace,
+            commit=False,
+        )
+        conn_main.commit()
+
+
+def queue_no_change_result(*args, **kwargs):
+    """Buffer a no-change archive result until the next durable checkpoint."""
+    PENDING_NO_CHANGE_RESULTS.append((mark_processed, args, kwargs))
+
+
+def queue_integrity_audit(*args, **kwargs):
+    """Buffer a successful read-only audit until the next checkpoint."""
+    PENDING_NO_CHANGE_RESULTS.append((mark_integrity_audited, args, kwargs))
+
+
+def queue_format_inventory(archive_id, cbz_path, fingerprint):
+    """Buffer one statistics-backfill inventory for the next checkpoint."""
+    PENDING_FORMAT_INVENTORIES.append(
+        (archive_id, Path(cbz_path), fingerprint)
+    )
 
 
 def get_size(file_path):
@@ -2185,52 +2420,9 @@ def convert_images(temp_dir_path, cli_args, workspace=None, archive_path=None):
                     )
                 break
 
-    if workspace:
-        completed_outputs = {
-            page.get("output")
-            for page in workspace.manifest.get("completed_pages", {}).values()
-            if page.get("output")
-        }
-        for path in jxl_paths:
-            relative = path.relative_to(temp_dir_path).as_posix()
-            if relative in completed_outputs:
-                continue
-            workspace.record_decision(
-                relative,
-                source_format="image/jxl",
-                source_size=get_size(path),
-                candidate_size=None,
-                final_size=get_size(path),
-                outcome="already_current",
-                mode="Existing JPEG XL",
-                distance=None,
-                effort=None,
-                reason="The page already uses JPEG XL",
-                attempts=[],
-            )
-        for path in other_image_paths:
-            relative = path.relative_to(temp_dir_path).as_posix()
-            if relative in completed_outputs:
-                continue
-            workspace.record_decision(
-                relative,
-                source_format=IMAGE_FORMAT_LABELS.get(
-                    path.suffix.lower(),
-                    path.suffix.lower().lstrip("."),
-                ),
-                source_size=get_size(path),
-                candidate_size=None,
-                final_size=get_size(path),
-                outcome="unsupported",
-                mode="Retained original",
-                distance=None,
-                effort=None,
-                reason=(
-                    f"{path.suffix.lower() or 'This format'} is not currently "
-                    "eligible for JPEG XL conversion"
-                ),
-                attempts=[],
-            )
+    # Existing JXL and unsupported pages require no action. Their aggregate
+    # counts belong in archive statistics; per-page rows add no troubleshooting
+    # value and can generate millions of unnecessary writes.
     
     other_type = format_summary(other_image_paths) if other_image_paths else "Other"
     image_count = jpg_count + png_count + tiff_count + bmp_count + jxl_count + other_count
@@ -2521,8 +2713,8 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args, fingerprint=None):
             "target_fingerprint": fingerprint,
             "source_fingerprint": source_fingerprint,
         })
-        workspace = ResumeWorkspace(
-            RESUME_DIR,
+        workspace = EphemeralWorkspace(
+            WORKSPACE_DIR,
             source_archive_path,
             source_fingerprint,
             option_key,
@@ -2538,7 +2730,7 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args, fingerprint=None):
 
         emit("heartbeat", archive=rel_path_str, stage="extracting")
         repair_entry = getattr(cli_args, "repair_entry", None)
-        resumed, resumed_pages = workspace.prepare(
+        _resumed, _resumed_pages = workspace.prepare(
             MAX_ARCHIVE_UNCOMPRESSED_BYTES,
             CANCEL_TOKEN,
             recover_crc_entry=repair_entry
@@ -2567,15 +2759,6 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args, fingerprint=None):
             ):
                 CANCEL_TOKEN.check()
                 verify_source_image(recovered_image)
-        if resumed:
-            emit(
-                "archive_resumed",
-                message=f"Resumed {rel_path_str} with {resumed_pages} pages already encoded",
-                archive=rel_path_str,
-                stage=workspace.manifest.get("stage", "encoding"),
-                page=resumed_pages,
-                total_pages=resumed_pages,
-            )
         if getattr(cli_args, "integrity_audit", False):
             workspace.set_stage("verifying")
             expected_files = sorted(
@@ -2616,7 +2799,7 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args, fingerprint=None):
                 label = IMAGE_FORMAT_LABELS[path.suffix.lower()]
                 format_counts[label] = format_counts.get(label, 0) + 1
             duration_value = time.monotonic() - start_time
-            mark_integrity_audited(
+            queue_integrity_audit(
                 conn_main,
                 cbz_path_obj,
                 rel_path_str,
@@ -2777,7 +2960,7 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args, fingerprint=None):
 
         duration_value = time.monotonic() - start_time
         if not action_taken:
-            mark_processed(
+            queue_no_change_result(
                 conn_main, cbz_path_obj, rel_path_str, original_cbz_size, original_cbz_size, 0,
                 dominant_type, JXL_EFFORT, duration_value, img_count, num_jpg, num_png, conv_mode, mp_info, fingerprint,
                 input_fingerprint=fingerprint,
@@ -2786,7 +2969,6 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args, fingerprint=None):
                 lossy_pages=lossy_pages,
                 retained_pages=retained_pages,
             )
-            persist_page_decisions(conn_main, rel_path_str, workspace)
             workspace.complete()
             emit("archive_completed", message=f"No changes required for {rel_path_str}", archive=rel_path_str, stage="complete", bytes_saved=0)
             return 0, False, False, "processed"
@@ -2887,12 +3069,16 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args, fingerprint=None):
                         lossless_pages=0,
                         lossy_pages=0,
                         retained_pages=img_count,
+                        commit=False,
                     )
                     persist_page_decisions(
                         conn_main,
                         rel_path_str,
                         workspace,
+                        commit=False,
                     )
+                    if conn_main:
+                        conn_main.commit()
                     workspace.complete()
                     emit(
                         "archive_completed",
@@ -2932,8 +3118,16 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args, fingerprint=None):
             lossless_pages=lossless_pages,
             lossy_pages=lossy_pages,
             retained_pages=retained_pages,
+            commit=False,
         )
-        persist_page_decisions(conn_main, rel_path_str, workspace)
+        persist_page_decisions(
+            conn_main,
+            rel_path_str,
+            workspace,
+            commit=False,
+        )
+        if conn_main:
+            conn_main.commit()
         workspace.complete()
         cleanup_repair_source(cli_args)
         emit(
@@ -2961,7 +3155,6 @@ def process_cbz(cbz_path_obj, conn_main, conn_fail, cli_args, fingerprint=None):
             duration_value,
             workspace,
         )
-        persist_page_decisions(conn_main, rel_path_str, workspace)
         return 0, False, False, "failed"
 
 
@@ -2999,13 +3192,11 @@ def attempt_archive(cbz_path, resolved_input_dir, processed_paths, conn, fail_co
                         (LIBRARY_ID, rel_path_for_db),
                     ).fetchone()
                     if archive_row:
-                        record_archive_format_inventory(
-                            conn,
+                        queue_format_inventory(
                             archive_row["id"],
                             cbz_path,
                             fingerprint,
                         )
-                        conn.commit()
                 except (
                     OSError,
                     ValueError,
@@ -3140,7 +3331,7 @@ def run_preflight(input_dir, archive_paths, *, integrity_audit=False):
                 + ", ".join(unwritable_parents[:3])
             )
     writable_directory_check(Path(DB_FILE).parent, "Configuration directory")
-    writable_directory_check(RESUME_DIR, "Resume directory")
+    writable_directory_check(WORKSPACE_DIR, "RAM workspace")
     scratch_dir = None
     if not integrity_audit:
         scratch_dir = get_scratch_dir()
@@ -3151,7 +3342,7 @@ def run_preflight(input_dir, archive_paths, *, integrity_audit=False):
         default=0,
     )
     required = max(256 * 1024 * 1024, largest_archive * 2)
-    checks = {"resume": RESUME_DIR}
+    checks = {"workspace": WORKSPACE_DIR}
     if not integrity_audit:
         checks.update({"scratch": scratch_dir, "library": input_dir})
     low_space = []
@@ -3325,7 +3516,7 @@ def main():
     DELETE_EMPTY_ARCHIVES = False
     RUN_ID = args.run_id or str(uuid.uuid4())
     install_signal_handlers(CANCEL_TOKEN)
-    RESUME_DIR.mkdir(parents=True, exist_ok=True)
+    WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 
     if DRY_RUN: console.print("[bold yellow] DRY RUN MODE ENABLED [/bold yellow] - No actual changes will be made.")
     if args.delete_empty_archives:
@@ -3495,7 +3686,8 @@ def main():
     else:
         log(f"   Net space increased by:   {-net_bytes_saved / (1024 ** 3):.3f} GB ({-net_bytes_saved / (1024 ** 2):.2f} MB)")
 
-    log(f"Log file written to: {Path(LOG_FILE).resolve()}")
+    if LOG_FILE:
+        log(f"Log file written to: {Path(LOG_FILE).resolve()}")
     if DRY_RUN: console.print("[bold yellow]DRY RUN COMPLETE[/bold yellow] - No actual changes were made to files or databases.")
     return 0
 

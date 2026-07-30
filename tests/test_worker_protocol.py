@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from cbzxl_web import database
+from cbzxl_web import runtime_state
 from cbzxl_web.protocol import encode_event
 from cbzxl_web.worker import STRUCTURED_JOBS, command_for_job, failure_output, persist_output
 
@@ -11,6 +12,7 @@ class WorkerProtocolTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         database.DB_PATH = Path(self.temp.name) / "worker.sqlite3"
+        runtime_state.RUNTIME_DIR = Path(self.temp.name) / "runtime"
         database.initialize()
         with database.transaction() as conn:
             library = database.default_library(conn)
@@ -27,7 +29,7 @@ class WorkerProtocolTests(unittest.TestCase):
         STRUCTURED_JOBS.discard(self.job_id)
         self.temp.cleanup()
 
-    def test_page_event_updates_live_job_state_and_sample(self):
+    def test_page_event_updates_ram_state_without_database_write(self):
         persist_output(
             self.job_id,
             encode_event(
@@ -41,12 +43,17 @@ class WorkerProtocolTests(unittest.TestCase):
         )
         with database.connect() as conn:
             job = dict(conn.execute("SELECT * FROM jobs WHERE id=?", (self.job_id,)).fetchone())
-            sample = dict(conn.execute("SELECT * FROM job_progress_samples WHERE job_id=?", (self.job_id,)).fetchone())
-        self.assertEqual(job["current_archive"], "Series/Book.cbz")
-        self.assertEqual(job["current_stage"], "encoding")
-        self.assertEqual(job["current_page"], 4)
-        self.assertEqual(job["total_pages"], 20)
-        self.assertEqual(sample["current_page"], 4)
+            samples = conn.execute(
+                "SELECT COUNT(*) FROM job_progress_samples WHERE job_id=?",
+                (self.job_id,),
+            ).fetchone()[0]
+        live = runtime_state.read_live_job(self.job_id)
+        self.assertIsNone(job["current_archive"])
+        self.assertEqual(samples, 0)
+        self.assertEqual(live["current_archive"], "Series/Book.cbz")
+        self.assertEqual(live["current_stage"], "encoding")
+        self.assertEqual(live["current_page"], 4)
+        self.assertEqual(live["total_pages"], 20)
 
     def test_legacy_text_is_ignored_after_structured_protocol_starts(self):
         persist_output(

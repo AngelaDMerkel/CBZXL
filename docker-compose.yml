@@ -4,6 +4,7 @@ x-cbzxl-common: &cbzxl-common
   volumes:
     - /mnt/Array/Media/Manga:/data
     - /mnt/Array/appdata/cbzxl:/config
+    - /dev/shm/cbzxl-runtime:/runtime
   environment:
     TZ: America/New_York
     PYTHONUNBUFFERED: "1"
@@ -11,7 +12,12 @@ x-cbzxl-common: &cbzxl-common
     DB_PATH: /config/cbzxl-v3.sqlite3
     LIBRARY_PATH: /data
     SCRATCH_DIR: /dev/shm/cbzxl
-    RESUME_DIR: /config/resume
+    WORKSPACE_DIR: /dev/shm/cbzxl/workspaces
+    LOG_FILE: ""
+    RUNTIME_DIR: /runtime
+    DURABLE_CHECKPOINT_SECONDS: "300"
+    DURABLE_CHECKPOINT_ARCHIVES: "10000"
+    PAGE_DECISION_RETENTION_DAYS: "180"
     WORKER_STALL_SECONDS: "900"
     TMPDIR: /dev/shm
     TEMP: /dev/shm
@@ -21,8 +27,8 @@ x-cbzxl-common: &cbzxl-common
     - no-new-privileges:true
   cap_drop:
     - ALL
-  shm_size: 8g
-  mem_limit: 8g
+  shm_size: ${CBZXL_SHM_SIZE:-32g}
+  mem_limit: ${CBZXL_MEMORY_LIMIT:-32g}
   pids_limit: 512
   restart: unless-stopped
 

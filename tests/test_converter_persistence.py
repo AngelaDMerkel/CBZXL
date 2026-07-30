@@ -26,6 +26,9 @@ class ConverterPersistenceTests(unittest.TestCase):
             )
         cbzxl.RUN_ID = self.job_id
         cbzxl.DRY_RUN = False
+        cbzxl.PENDING_NO_CHANGE_RESULTS.clear()
+        cbzxl.PENDING_FORMAT_INVENTORIES.clear()
+        cbzxl.PENDING_ARCHIVES = 0
 
     def tearDown(self):
         self.temp.cleanup()
@@ -71,7 +74,7 @@ class ConverterPersistenceTests(unittest.TestCase):
             self.assertEqual(check.execute("SELECT bytes_saved FROM archives").fetchone()[0], 300)
             self.assertEqual(check.execute("SELECT COUNT(*) FROM archive_results").fetchone()[0], 1)
             self.assertEqual(check.execute("SELECT status FROM jobs WHERE id=?", (self.job_id,)).fetchone()[0], "succeeded")
-            self.assertEqual(check.execute("SELECT COUNT(*) FROM job_progress_samples WHERE job_id=?", (self.job_id,)).fetchone()[0], 1)
+            self.assertEqual(check.execute("SELECT COUNT(*) FROM job_progress_samples WHERE job_id=?", (self.job_id,)).fetchone()[0], 2)
 
     def test_page_decisions_persist_exact_candidate_and_reason(self):
         now = database.utc_now()
@@ -237,6 +240,16 @@ class ConverterPersistenceTests(unittest.TestCase):
         )
 
         self.assertEqual(outcome[-1], "skipped")
+        with database.connect() as check:
+            self.assertEqual(
+                check.execute(
+                    "SELECT COUNT(*) FROM archive_format_stats"
+                ).fetchone()[0],
+                0,
+            )
+        cbzxl.update_run_progress(
+            conn, 0, 1, 0, 0, 0, 0, 0, 0, force=True
+        )
         with database.connect() as check:
             rows = {
                 row["format"]: row["file_count"]
@@ -431,7 +444,7 @@ class ConverterPersistenceTests(unittest.TestCase):
             backup.writestr("ComicInfo.xml", "<ComicInfo />")
         original_backup_bytes = backup_path.read_bytes()
         current_size = archive_path.stat().st_size
-        cbzxl.RESUME_DIR = Path(self.temp.name) / "resume"
+        cbzxl.WORKSPACE_DIR = Path(self.temp.name) / "workspace"
         args = SimpleNamespace(
             input_dir=str(library_root),
             no_convert=True,
@@ -468,7 +481,7 @@ class ConverterPersistenceTests(unittest.TestCase):
             backup.writestr("pages/original.bin", b"original")
             backup.writestr("ComicInfo.xml", "<ComicInfo />")
         current_size = archive_path.stat().st_size
-        cbzxl.RESUME_DIR = Path(self.temp.name) / "resume"
+        cbzxl.WORKSPACE_DIR = Path(self.temp.name) / "workspace"
         args = SimpleNamespace(
             input_dir=str(library_root),
             no_convert=False,
@@ -506,7 +519,7 @@ class ConverterPersistenceTests(unittest.TestCase):
             archive.writestr("ComicInfo.xml", "<ComicInfo>" + "x" * 4096 + "</ComicInfo>")
         original_bytes = archive_path.read_bytes()
         original_size = len(original_bytes)
-        cbzxl.RESUME_DIR = Path(self.temp.name) / "resume"
+        cbzxl.WORKSPACE_DIR = Path(self.temp.name) / "workspace"
         args = SimpleNamespace(
             input_dir=str(library_root),
             no_convert=True,
@@ -536,7 +549,7 @@ class ConverterPersistenceTests(unittest.TestCase):
         library_root.mkdir()
         corrupt = library_root / "Broken.cbz"
         corrupt.write_bytes(b"this is not a zip archive")
-        cbzxl.RESUME_DIR = Path(self.temp.name) / "resume"
+        cbzxl.WORKSPACE_DIR = Path(self.temp.name) / "workspace"
         args = SimpleNamespace(
             input_dir=str(library_root),
             no_convert=False,
@@ -583,7 +596,7 @@ class ConverterPersistenceTests(unittest.TestCase):
         with zipfile.ZipFile(valid, "w") as archive:
             archive.writestr("ComicInfo.xml", "<ComicInfo />")
 
-        cbzxl.RESUME_DIR = Path(self.temp.name) / "resume"
+        cbzxl.WORKSPACE_DIR = Path(self.temp.name) / "workspace"
         args = SimpleNamespace(
             input_dir=str(library_root),
             no_convert=True,
@@ -603,6 +616,9 @@ class ConverterPersistenceTests(unittest.TestCase):
             cbzxl.attempt_archive(path, library_root, {}, conn, None, args)[-1]
             for path in (broken_one, broken_two, valid)
         ]
+        cbzxl.update_run_progress(
+            conn, 1, 0, 2, 0, 0, 0, 0, 0, force=True
+        )
 
         self.assertEqual(outcomes, ["failed", "failed", "processed"])
         with database.connect() as check:
@@ -633,7 +649,7 @@ class ConverterPersistenceTests(unittest.TestCase):
             archive.writestr("pages/003.webp", b"discard-related")
             archive.writestr("ComicInfo.xml", "<ComicInfo />")
 
-        cbzxl.RESUME_DIR = Path(self.temp.name) / "resume"
+        cbzxl.WORKSPACE_DIR = Path(self.temp.name) / "workspace"
         args = SimpleNamespace(
             input_dir=str(library_root),
             no_convert=True,
@@ -809,7 +825,7 @@ class ConverterPersistenceTests(unittest.TestCase):
             archive.writestr("ComicInfo.xml", "<ComicInfo />")
         original_bytes = archive_path.read_bytes()
         original_fingerprint = cbzxl.archive_fingerprint(archive_path)
-        cbzxl.RESUME_DIR = Path(self.temp.name) / "audit-resume"
+        cbzxl.WORKSPACE_DIR = Path(self.temp.name) / "audit-workspace"
         args = SimpleNamespace(
             input_dir=str(library_root),
             no_convert=True,
@@ -842,6 +858,9 @@ class ConverterPersistenceTests(unittest.TestCase):
             cbzxl.archive_fingerprint(archive_path),
             original_fingerprint,
         )
+        cbzxl.update_run_progress(
+            conn, 1, 0, 0, 0, 0, 0, 0, 0, force=True
+        )
         with database.connect() as check:
             archive = check.execute(
                 "SELECT status FROM archives WHERE path='Audited.cbz'"
@@ -856,6 +875,73 @@ class ConverterPersistenceTests(unittest.TestCase):
         self.assertEqual(archive["status"], "audited")
         self.assertEqual(tuple(attempt), ("audited", "Integrity audit"))
         conn.close()
+
+    def test_operational_history_retention_keeps_attention_evidence(self):
+        with database.transaction() as conn:
+            library = database.default_library(conn)
+            now = database.utc_now()
+            archive_ids = []
+            for path in ("Series/Clean.cbz", "Series/Attention.cbz"):
+                conn.execute(
+                    """
+                    INSERT INTO archives(
+                        library_id, path, status, created_at, updated_at
+                    ) VALUES (?, ?, 'processed', ?, ?)
+                    """,
+                    (library["id"], path, now, now),
+                )
+                archive_ids.append(
+                    conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                )
+            for index in range(200):
+                conn.execute(
+                    """
+                    INSERT INTO job_progress_samples(
+                        job_id, recorded_at, completed
+                    ) VALUES (?, ?, ?)
+                    """,
+                    (self.job_id, now, index),
+                )
+            for archive_id, path in zip(
+                archive_ids,
+                ("Series/Clean.cbz", "Series/Attention.cbz"),
+            ):
+                conn.execute(
+                    """
+                    INSERT INTO page_decisions(
+                        job_id, archive_id, path, entry_path, outcome, created_at
+                    ) VALUES (?, ?, ?, '001.jpg', 'converted', '2000-01-01T00:00:00Z')
+                    """,
+                    (self.job_id, archive_id, path),
+                )
+            database.upsert_archive_issue(
+                conn,
+                archive_id=archive_ids[1],
+                job_id=self.job_id,
+                kind="page_encode_failed",
+                stage="encoding",
+                entry_path="001.jpg",
+                message="Candidate could not be encoded",
+            )
+
+        conn = cbzxl.init_db(cbzxl.DB_FILE)
+        cbzxl.prune_operational_history(conn, self.job_id)
+        conn.commit()
+        conn.close()
+
+        with database.connect() as check:
+            sample_count = check.execute(
+                "SELECT COUNT(*) FROM job_progress_samples WHERE job_id=?",
+                (self.job_id,),
+            ).fetchone()[0]
+            decisions = [
+                row["path"]
+                for row in check.execute(
+                    "SELECT path FROM page_decisions ORDER BY path"
+                )
+            ]
+        self.assertEqual(sample_count, 180)
+        self.assertEqual(decisions, ["Series/Attention.cbz"])
 
     def test_libjxl_version_parser_accepts_current_cli_formats(self):
         self.assertEqual(

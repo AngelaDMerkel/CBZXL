@@ -6,19 +6,23 @@ CBZXL is a self-hosted CBZ-to-JPEG XL archive optimizer with a portable SQLite d
 
 - Application state lives in `/config/cbzxl-v3.sqlite3`. Earlier database files remain untouched and can be inspected and imported through the legacy importer.
 - The web API and conversion worker are separate processes.
-- Scan requests, progress, cancellation, results, reviews, schedules, and activity survive restarts.
+- Scan requests, durable checkpoints, cancellation, results, reviews, schedules, and activity survive restarts. Sub-checkpoint live progress is intentionally volatile.
 - Schedules use daily, weekly, monthly, or repeating interval choices—no cron expressions.
 - Existing `converted_archives`, `runs`, and `archive_results` tables can be imported from the previous SQLite database.
 - The legacy importer reads and explains the old schema before building the new record set; the source stays read-only.
-- Per-archive progress samples power smooth live progress, rolling throughput, ETA, momentum, and durable run statistics.
-- Engine 3 uses structured JSON events, page-level progress, content signatures, persistent resume manifests, bounded libjxl scheduling, decode verification, and fsynced atomic commits.
+- RAM-backed structured events power smooth page-level progress without writing each update to the application database. Periodic checkpoints retain rolling throughput, ETA, momentum, and durable run statistics.
+- Engine 3 uses content signatures, ephemeral RAM workspaces, bounded libjxl scheduling, decode verification, and atomic archive replacement.
 - The streamlined interface centers the active conversion, lifetime statistics, an actionable attention queue, run history, and settings.
 - Failed archives retain structured diagnostics and can be retried normally or in compatibility mode. Page-level failures can be previewed, preserved, replaced without changing their internal filename, or explicitly deleted.
 - Database exports use SQLite's online backup mechanism to produce a consistent single-file snapshot.
 
 ## Conversion engine
 
-The worker treats `threads` as a total CPU budget. It automatically divides that budget between concurrent pages and each native `cjxl` encoder, preventing the oversubscription caused by giving every encoder the entire machine. Set `RESUME_DIR` to durable storage (the Compose default is `/config/resume`) so interrupted archives can continue from verified JXL pages on the next attempt.
+The worker treats `threads` as a total CPU budget. It automatically divides that budget between concurrent pages and each native `cjxl` encoder, preventing the oversubscription caused by giving every encoder the entire machine.
+
+Extraction, candidate images, conversion decisions, and live WebUI state remain in RAM. Interrupted archives restart cleanly from their unchanged source CBZ; no resume manifest is written to durable storage. Unchanged results and format inventory are committed in a single checkpoint every five minutes by default. Set `DURABLE_CHECKPOINT_SECONDS` between `300` and `600` to choose a five-to-ten-minute interval. Modified archives, failures requiring attention, explicit user actions, and run boundaries are committed immediately because those records protect data integrity or user intent. `CBZXL_SHM_SIZE` and `CBZXL_MEMORY_LIMIT` control the Compose RAM allocation and container limit.
+
+The production server also disables routine HTTP access logging, so dashboard polling and health checks do not create a continuous Docker log stream. Startup, warning, and error logs remain available.
 
 The engine validates ZIP paths before extraction, writes each page through a partial file, checks the JXL signature, verifies the completed CBZ and its CRCs, decodes representative pages with `djxl`, syncs the replacement, and only then performs the atomic replacement.
 

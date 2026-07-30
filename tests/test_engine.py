@@ -50,7 +50,7 @@ class EngineTests(unittest.TestCase):
             target.writestr("001.jpg", b"different")
         self.assertNotEqual(archive_fingerprint(self.archive), original)
 
-    def test_resume_workspace_reuses_valid_completed_pages(self):
+    def test_ephemeral_workspace_discards_completed_pages_on_prepare(self):
         fingerprint = archive_fingerprint(self.archive)
         workspace = ResumeWorkspace(self.root / "resume", self.archive, fingerprint, options_fingerprint({"effort": 7}))
         resumed, completed = workspace.prepare(1024 * 1024, CancellationToken())
@@ -60,10 +60,12 @@ class EngineTests(unittest.TestCase):
         (workspace.files / "001.jpg").unlink()
         workspace.record_page("001.jpg", "001.jxl", output.stat().st_size)
         resumed_again, completed_again = workspace.prepare(1024 * 1024, CancellationToken())
-        self.assertTrue(resumed_again)
-        self.assertEqual(completed_again, 1)
+        self.assertFalse(resumed_again)
+        self.assertEqual(completed_again, 0)
+        self.assertTrue((workspace.files / "001.jpg").exists())
+        self.assertFalse((workspace.files / "001.jxl").exists())
 
-    def test_resume_workspace_persists_page_decision_details(self):
+    def test_ephemeral_workspace_keeps_page_decisions_in_memory_only(self):
         fingerprint = archive_fingerprint(self.archive)
         workspace = ResumeWorkspace(
             self.root / "resume-decisions",
@@ -86,6 +88,10 @@ class EngineTests(unittest.TestCase):
             reason="Verified JPEG XL candidate saved 160 bytes",
             attempts=[{"effort": 10, "verified": True}],
         )
+        decision = workspace.manifest["page_decisions"]["001.jpg"]
+        self.assertEqual(decision["candidate_size"], 840)
+        self.assertEqual(decision["effort"], 10)
+        self.assertEqual(decision["outcome"], "converted")
 
         reloaded = ResumeWorkspace(
             self.root / "resume-decisions",
@@ -97,13 +103,11 @@ class EngineTests(unittest.TestCase):
             1024 * 1024,
             CancellationToken(),
         )
-        decision = reloaded.manifest["page_decisions"]["001.jpg"]
-        self.assertTrue(resumed)
-        self.assertEqual(decision["candidate_size"], 840)
-        self.assertEqual(decision["effort"], 10)
-        self.assertEqual(decision["outcome"], "converted")
+        self.assertFalse(resumed)
+        self.assertEqual(reloaded.manifest["page_decisions"], {})
+        self.assertFalse(any((self.root / "resume-decisions").rglob("*.json")))
 
-    def test_resume_workspace_reuses_an_extension_correction(self):
+    def test_ephemeral_workspace_discards_an_extension_correction_on_prepare(self):
         fingerprint = archive_fingerprint(self.archive)
         workspace = ResumeWorkspace(
             self.root / "resume-extension",
@@ -129,8 +133,10 @@ class EngineTests(unittest.TestCase):
             CancellationToken(),
         )
 
-        self.assertTrue(resumed)
-        self.assertEqual(completed, 1)
+        self.assertFalse(resumed)
+        self.assertEqual(completed, 0)
+        self.assertTrue((workspace.files / "001.jpg").exists())
+        self.assertFalse((workspace.files / "001.webp").exists())
 
     def test_replacement_keeps_the_original_internal_filename(self):
         workspace = ResumeWorkspace(
