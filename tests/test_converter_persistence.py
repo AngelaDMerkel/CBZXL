@@ -8,6 +8,7 @@ from unittest import mock
 
 import cbzxl
 from cbzxl_web import database
+from cbzxl_web.conversion.size_policy import EXPECTED_EXTENSION_OVERHEAD
 
 
 class ConverterPersistenceTests(unittest.TestCase):
@@ -54,12 +55,24 @@ class ConverterPersistenceTests(unittest.TestCase):
                 "conversion_mode": "Original retained",
             }
         )
+        corrected = cbzxl.unchanged_archive_context(
+            {
+                "image_count": 31,
+                "converted_pages": 0,
+                "retained_pages": 31,
+                "bytes_saved": -62,
+                "conversion_mode": "N/A",
+                "size_variance_kind": EXPECTED_EXTENSION_OVERHEAD,
+            }
+        )
 
         self.assertEqual(optimized["history_label"], "Already optimized")
         self.assertEqual(optimized["history_outcome"], "already_current")
         self.assertEqual(optimized["previous_converted_pages"], 10)
         self.assertEqual(retained["history_label"], "Original retained")
         self.assertEqual(retained["history_outcome"], "retained")
+        self.assertEqual(corrected["history_label"], "Filenames corrected")
+        self.assertIn("62 bytes", corrected["history_detail"])
 
     def test_converter_updates_normalized_archive_and_result(self):
         args = SimpleNamespace(dry_run=False, no_convert=False, smart_distance=False, distance=None)
@@ -431,6 +444,75 @@ class ConverterPersistenceTests(unittest.TestCase):
                 """
             ).fetchone()
         self.assertEqual(tuple(issue), ("archive_grew", "size_check", "open"))
+        conn.close()
+
+    def test_expected_extension_overhead_stays_in_savings_without_attention(self):
+        conn = cbzxl.init_db(cbzxl.DB_FILE)
+        archive_path = Path(self.temp.name) / "Corrected.cbz"
+        archive_path.write_bytes(b"corrected archive")
+
+        cbzxl.mark_processed(
+            conn,
+            archive_path,
+            "Series/Corrected.cbz",
+            1000,
+            1062,
+            -62,
+            "WebP",
+            10,
+            0.5,
+            31,
+            31,
+            0,
+            "N/A",
+            "Avg: 1MP",
+            "corrected-fingerprint",
+            input_fingerprint="source-fingerprint",
+            size_variance_kind=EXPECTED_EXTENSION_OVERHEAD,
+        )
+        cbzxl.mark_processed(
+            conn,
+            archive_path,
+            "Series/Corrected.cbz",
+            1062,
+            1062,
+            0,
+            "WebP",
+            10,
+            0.1,
+            31,
+            0,
+            0,
+            "N/A",
+            "N/A",
+            "corrected-fingerprint",
+            input_fingerprint="corrected-fingerprint",
+        )
+
+        with database.connect() as check:
+            archive = check.execute(
+                """
+                SELECT bytes_saved, size_variance_kind
+                FROM archives WHERE path='Series/Corrected.cbz'
+                """
+            ).fetchone()
+            issue_count = check.execute(
+                """
+                SELECT COUNT(*)
+                FROM archive_issues ai
+                JOIN archives a ON a.id=ai.archive_id
+                WHERE a.path='Series/Corrected.cbz' AND ai.status IN ('open', 'queued')
+                """
+            ).fetchone()[0]
+            result = check.execute(
+                """
+                SELECT bytes_saved, size_variance_kind
+                FROM archive_results WHERE path='Series/Corrected.cbz'
+                """
+            ).fetchone()
+        self.assertEqual(tuple(archive), (-62, EXPECTED_EXTENSION_OVERHEAD))
+        self.assertEqual(issue_count, 0)
+        self.assertEqual(tuple(result), (0, EXPECTED_EXTENSION_OVERHEAD))
         conn.close()
 
     def test_restore_original_uses_verified_backup_and_keeps_archive_name(self):

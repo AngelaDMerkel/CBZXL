@@ -75,10 +75,11 @@ lossy policies are also supported.
 
 The `threads` setting is a total CPU budget, not a per-image thread count. The
 engine divides it between concurrent pages and each native `cjxl` process to
-avoid multiplying the requested concurrency. Docker's `cpus` setting is a
-separate hard quota: if the WebUI is set to 12 threads while Compose limits the
-worker to 4 CPUs, the worker still receives only four CPUs. Remove that quota or
-raise it to match the largest policy you intend to use.
+avoid multiplying the requested concurrency. `CBZXL_CPU_LIMIT` sets both the
+Compose worker quota and the maximum offered by the WebUI. Each policy can
+select any smaller budget. The worker also intersects that configured ceiling
+with its actual cgroup quota, CPU set, and process affinity, then clamps stale
+or externally submitted policies before launching the converter.
 
 ## Conversion and naming guarantees
 
@@ -87,10 +88,12 @@ raise it to match the largest policy you intend to use.
 Every eligible page is judged independently:
 
 1. Encode a JPEG XL candidate.
-2. Verify its signature and decode it with `djxl`.
-3. For lossless conversion, compare the decoded pixels with the encoder input.
-4. Keep the candidate only if it is smaller than the source page.
-5. Otherwise retain the original page byte-for-byte.
+2. Verify its signature and compare its size with the source page.
+3. Discard a non-smaller candidate without spending time decoding it.
+4. Decode every smaller candidate with `djxl`; for lossless conversion, also
+   compare the decoded pixels with the encoder input.
+5. Keep the candidate only after that verification succeeds. Otherwise retain
+   the original page byte-for-byte.
 
 Smart lossy never bypasses that order. It first attempts lossless JPEG XL. A
 lossy candidate is attempted only when the configured size or resolution
@@ -209,6 +212,13 @@ Archive-level Net Savings remains based on the current library versus each
 archive's established lifetime baseline, preventing reruns from resetting or
 double-counting the library total.
 
+If correcting a mislabeled image changes only its filename extension, the ZIP
+headers can add a few bytes because each entry name is stored twice. CBZXL
+proves that overhead from the page decisions before classifying it as expected:
+the real byte increase remains included in Net Savings and is explained in run
+history, but it does not create an Attention item. Any growth not fully
+explained by filename records continues to require review.
+
 ## Low-write runtime model
 
 Live progress is structured state, not a text log:
@@ -216,6 +226,8 @@ Live progress is structured state, not a text log:
 - extraction, candidate images, and converter workspaces live in `/dev/shm`;
 - the web and worker share live job state through the RAM-backed `/runtime`
   mount;
+- rolling throughput and ETA samples remain in that RAM-backed state and are
+  never persisted to SQLite;
 - dashboard polling does not write to SQLite;
 - Uvicorn access logging is disabled;
 - no durable per-archive resume manifest is written; an interrupted archive
@@ -260,20 +272,16 @@ docker compose up -d
 Open `http://<nas-host>:5000`.
 
 The included Compose file gives each container a 32 GB memory/shm allowance by
-default and currently applies a four-CPU quota to the worker. Both memory
-settings can be overridden:
+default and applies a four-CPU ceiling to the worker. Resource settings can be
+overridden:
 
 ```sh
-CBZXL_SHM_SIZE=48g CBZXL_MEMORY_LIMIT=48g docker compose up -d
+CBZXL_SHM_SIZE=48g CBZXL_MEMORY_LIMIT=48g CBZXL_CPU_LIMIT=12 docker compose up -d
 ```
 
-To make a 12-thread WebUI policy meaningful, change the worker quota to:
-
-```yaml
-cpus: "12.0"
-```
-
-or remove `cpus` and manage CPU limits in the NAS container interface.
+With `CBZXL_CPU_LIMIT=12`, the WebUI offers budgets up to 12 threads and Compose
+caps the worker at 12 CPUs. A policy can still choose 1, 2, 4, 6, 8, or 12.
+External NAS limits can reduce the effective worker ceiling further.
 
 ### Important paths
 
@@ -297,6 +305,7 @@ or remove `cpus` and manage CPU limits in the NAS container interface.
 | `SCRATCH_DIR` | `/dev/shm/cbzxl` | RAM conversion scratch directory |
 | `WORKSPACE_DIR` | `/dev/shm/cbzxl/workspaces` | Per-archive RAM workspaces |
 | `RUNTIME_DIR` | `/dev/shm/cbzxl-runtime` | Volatile live-progress state |
+| `CPU_LIMIT` | `4` | Shared WebUI/worker CPU ceiling; normally set through `CBZXL_CPU_LIMIT` |
 | `LOG_FILE` | empty | Optional converter text log; empty avoids durable log writes |
 | `DURABLE_CHECKPOINT_SECONDS` | `300` | Batch interval for unchanged results; minimum 300 seconds |
 | `DURABLE_CHECKPOINT_ARCHIVES` | `10000` | Archive count that can also trigger a batch checkpoint |
@@ -310,9 +319,9 @@ or remove `cpus` and manage CPU limits in the NAS container interface.
 | `ENCODER_MAX_SECONDS` | `0` | Optional per-encode timeout; zero disables it |
 | `AUXILIARY_TIMEOUT_SECONDS` | `300` | Timeout for supporting image inspection commands |
 
-Compose also recognizes `CBZXL_SHM_SIZE` and `CBZXL_MEMORY_LIMIT` for container
-resource configuration. Temporary-file variables should continue to point to
-`/dev/shm`.
+Compose also recognizes `CBZXL_SHM_SIZE`, `CBZXL_MEMORY_LIMIT`, and
+`CBZXL_CPU_LIMIT` for container resource configuration. Temporary-file
+variables should continue to point to `/dev/shm`.
 
 ## Database lifecycle
 
@@ -411,12 +420,21 @@ uploads, reviews, schedules, and conversion policies.
 
 | Path | Responsibility |
 | --- | --- |
-| `frontend/src/App.tsx` | React interface and client-side interactions |
-| `app.py` | FastAPI routes, request models, reporting, and repair orchestration |
+| `frontend/src/App.tsx` | React page composition and client-side interactions |
+| `frontend/src/lib/` | API transport, formatting, and policy presentation helpers |
+| `frontend/src/components/` | Reusable visual components |
+| `app.py` | FastAPI composition, reporting, and repair orchestration |
+| `cbzxl_web/api/` | HTTP request contracts and independently testable routers |
 | `cbzxl_web/worker.py` | Durable queue, scheduler, subprocess lifecycle, and stall detection |
 | `cbzxl.py` | Conversion-run orchestration and persistence |
 | `cbzxl_web/engine.py` | ZIP safety, recovery primitives, verification, and workspace mechanics |
+| `cbzxl_web/conversion/` | Candidate verification policy and CPU parallelism |
+| `cbzxl_web/domain/` | Conversion-policy defaults, scope, and shared invariants |
 | `cbzxl_web/database.py` | Schema, migrations, transactions, schedules, and maintenance |
+| `cbzxl_web/persistence/` | Reusable migration primitives |
+| `cbzxl_web/repositories/` | Focused SQL persistence adapters |
+| `cbzxl_web/services/` | UI-independent application rules such as Attention triage |
+| `cbzxl_web/config.py` | Environment parsing and cgroup-aware runtime capabilities |
 | `cbzxl_web/runtime_state.py` | RAM-backed live progress shared by web and worker |
 | `cbzxl_web/protocol.py` | Structured converter event protocol |
 | `cbzxl_web/legacy.py` | Read-only legacy database inspection and import |

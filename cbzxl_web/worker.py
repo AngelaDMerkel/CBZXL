@@ -10,6 +10,7 @@ import time
 from collections import deque
 from pathlib import Path
 
+from .domain.policies import normalize_policy_options
 from .database import (
     add_event,
     claim_next_job,
@@ -35,7 +36,7 @@ STRUCTURED_JOBS = set()
 
 
 def command_for_job(job, library):
-    options = json.loads(job["options_json"])
+    options = normalize_policy_options(json.loads(job["options_json"]))
     command = [sys.executable, "-u", str(SCRIPT_PATH), library["root_path"], "--run-id", job["id"], "--no-flatten"]
     flags = {
         "dry_run": "--dry-run",

@@ -1,81 +1,19 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-type Json = Record<string, any>;
-type View = "overview" | "attention" | "history" | "settings";
-type ToastValue = { kind: "success" | "error"; message: string } | null;
-
-async function api<T = Json>(path: string, options: RequestInit = {}): Promise<T> {
-  const headers = new Headers(options.headers);
-  if (options.body && typeof options.body === "string" && !headers.has("Content-Type")) {
-    headers.set("Content-Type", "application/json");
-  }
-  const response = await fetch(path, { ...options, headers });
-  if (!response.ok) {
-    let message = `Request failed (${response.status})`;
-    try {
-      const payload = await response.json();
-      if (typeof payload.detail === "string") message = payload.detail;
-    } catch { /* non-JSON error */ }
-    throw new Error(message);
-  }
-  return response.status === 204 ? ({} as T) : response.json();
-}
-
-function formatBytes(value?: number | null) {
-  const bytes = Number(value || 0);
-  const absolute = Math.abs(bytes);
-  if (absolute >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(absolute >= 10 * 1024 ** 3 ? 1 : 2)} GB`;
-  if (absolute >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
-  if (absolute >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${bytes.toLocaleString()} B`;
-}
-
-function formatGb(value?: number | null) {
-  return formatBytes(Number(value || 0) * 1024 ** 3);
-}
-
-function compactNumber(value?: number | null) {
-  const number = Number(value || 0);
-  return new Intl.NumberFormat(undefined, {
-    notation: number >= 100_000 ? "compact" : "standard",
-    maximumFractionDigits: 2,
-  }).format(number);
-}
-
-function dateTime(value?: string | null) {
-  if (!value) return "Not yet";
-  return new Date(value).toLocaleString(undefined, {
-    month: "short", day: "numeric", hour: "numeric", minute: "2-digit",
-  });
-}
-
-function duration(secondsValue?: number | null) {
-  const seconds = Math.max(0, Number(secondsValue || 0));
-  if (!seconds) return "Calculating";
-  if (seconds < 60) return `${Math.round(seconds)} sec`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
-  return `${Math.floor(seconds / 3600)}h ${Math.round((seconds % 3600) / 60)}m`;
-}
-
-function archiveName(path = "") {
-  return path.split(/[\\/]/).pop() || path;
-}
-
-function label(value = "") {
-  return value.replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
-}
-
-function Logo() {
-  return <svg viewBox="0 0 28 28" role="img" aria-label="Manga page being compressed">
-    <rect x="9" y="3" width="10" height="22" rx="1.5" fill="none" stroke="currentColor" strokeWidth="1.5" />
-    <rect x="11" y="5.5" width="6" height="6" rx=".5" fill="none" stroke="currentColor" strokeWidth="1.1" />
-    <path d="M11 14h2.4v3.6H11zm3.6 0H17v3.6h-2.4zM11 21h6M2 14h5m-2.5-2.5L7 14l-2.5 2.5M26 14h-5m2.5-2.5L21 14l2.5 2.5" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-  </svg>;
-}
-
-function Toast({ value }: { value: ToastValue }) {
-  return value ? <div className={`toast ${value.kind}`} role="status">{value.message}</div> : null;
-}
+import { Logo, Toast } from "./components/Brand";
+import { api } from "./lib/api";
+import {
+  archiveName,
+  compactNumber,
+  cpuOptions,
+  dateTime,
+  duration,
+  formatBytes,
+  formatGb,
+  label,
+} from "./lib/format";
+import { policyScope, policyStrategy, policySummary } from "./lib/policies";
+import type { Json, ToastValue, View } from "./types";
 
 function LiveConversion({ initial, refresh, notify, onDismiss }: {
   initial: Json;
@@ -149,40 +87,14 @@ function LiveConversion({ initial, refresh, notify, onDismiss }: {
   </section>;
 }
 
-function policyStrategy(options: Json = {}) {
-  if (options.integrity_audit) return "audit";
-  if (options.no_convert) return "recheck";
-  if (options.smart_distance) return "smart";
-  if (options.distance !== null && options.distance !== undefined) return "lossy";
-  return "lossless";
-}
-
-function policyScope(options: Json = {}) {
-  if (options.failed_only) return "failed";
-  if (options.recheck_all) return "library";
-  return "unprocessed";
-}
-
-function policySummary(profile: Json) {
-  const options = profile.options || {};
-  const strategy = policyStrategy(options);
-  const effort = Number(options.effort ?? 10);
-  const threads = Number(options.threads ?? 4);
-  if (strategy === "audit") return `Full CRC check + full JPEG XL decode · ${threads} threads`;
-  if (strategy === "recheck") return `Recheck only · ${threads} threads`;
-  if (strategy === "smart") {
-    return `Lossless first · d${Number(options.distance ?? 0.5)} fallback above ${Number(options.smart_mb ?? 10)} MB or ${Number(options.smart_mp ?? 5)} MP · effort ${effort}`;
-  }
-  if (strategy === "lossy") return `Lossy d${Number(options.distance)} · effort ${effort} · ${threads} threads`;
-  return `Lossless · effort ${effort} · ${threads} threads`;
-}
-
 function ManualConversion({ bootstrap, onQueued, notify }: {
   bootstrap: Json;
   onQueued: () => void;
   notify: (message: string, kind?: "success" | "error") => void;
 }) {
   const profiles = bootstrap.profiles || [];
+  const cpuLimit = Math.max(1, Number(bootstrap.capabilities?.cpu_limit || 1));
+  const availableCpuOptions = cpuOptions(cpuLimit);
   const defaultProfile = profiles.find((row: Json) => row.is_default) || profiles[0] || {};
   const [open, setOpen] = useState(false);
   const [scope, setScope] = useState<"library" | "unprocessed" | "failed">("unprocessed");
@@ -190,7 +102,7 @@ function ManualConversion({ bootstrap, onQueued, notify }: {
   const profile = profiles.find((row: Json) => row.id === profileId) || defaultProfile;
   const defaults = profile.options || {};
   const [effort, setEffort] = useState(Number(defaults.effort ?? 10));
-  const [threads, setThreads] = useState(Number(defaults.threads ?? 4));
+  const [threads, setThreads] = useState(Math.min(cpuLimit, Number(defaults.threads ?? 4)));
   const [backup, setBackup] = useState(Boolean(defaults.backup));
   const [busy, setBusy] = useState(false);
 
@@ -204,7 +116,7 @@ function ManualConversion({ bootstrap, onQueued, notify }: {
     const options = nextProfile.options || {};
     setProfileId(nextProfile.id);
     setEffort(Number(options.effort ?? 10));
-    setThreads(Number(options.threads ?? 4));
+    setThreads(Math.min(cpuLimit, Number(options.threads ?? 4)));
     setBackup(Boolean(options.backup));
   };
 
@@ -257,7 +169,7 @@ function ManualConversion({ bootstrap, onQueued, notify }: {
         </div>
         <div className="manual-fields">
           <label><span>Encoder effort · {effort}</span><input type="range" min="0" max="11" value={effort} onChange={(event) => setEffort(Number(event.target.value))} /></label>
-          <label><span>CPU budget</span><select value={threads} onChange={(event) => setThreads(Number(event.target.value))}>{[1, 2, 4, 6, 8, 12, 16].map((value) => <option key={value} value={value}>{value} threads</option>)}</select></label>
+          <label><span>CPU budget</span><select value={threads} onChange={(event) => setThreads(Number(event.target.value))}>{availableCpuOptions.map((value) => <option key={value} value={value}>{value} thread{value === 1 ? "" : "s"}</option>)}</select></label>
         </div>
         <label className="switch"><input type="checkbox" checked={backup} onChange={(event) => setBackup(event.target.checked)} /><i /><span>Back up originals</span></label>
         <footer className="manual-actions">
@@ -993,6 +905,8 @@ function Settings({ bootstrap, reload, notify }: {
   notify: (message: string, kind?: "success" | "error") => void;
 }) {
   const [schedules, setSchedules] = useState<Json[]>([]);
+  const cpuLimit = Math.max(1, Number(bootstrap.capabilities?.cpu_limit || 1));
+  const availableCpuOptions = cpuOptions(cpuLimit);
   const [newOpen, setNewOpen] = useState(false);
   const profiles = bootstrap.profiles || [];
   const defaultProfile = profiles.find((row: Json) => row.is_default) || profiles[0] || {};
@@ -1040,7 +954,7 @@ function Settings({ bootstrap, reload, notify }: {
       name: profile?.name || "",
       strategy: policyStrategy(options),
       effort: Number(options.effort ?? 10),
-      threads: Number(options.threads ?? 4),
+      threads: Math.min(cpuLimit, Number(options.threads ?? 4)),
       distance: Number(options.distance ?? 0.5),
       smart_mb: Number(options.smart_mb ?? 10),
       smart_mp: Number(options.smart_mp ?? 5),
@@ -1218,7 +1132,7 @@ function Settings({ bootstrap, reload, notify }: {
             <option value="failed">Failed</option>
           </select></label>
           <label><span>Encoder effort · {policyForm.effort ?? 10}</span><input type="range" min="0" max="11" value={policyForm.effort ?? 10} onChange={(event) => setPolicyForm({ ...policyForm, effort: Number(event.target.value) })} /></label>
-          <label><span>CPU budget</span><select value={policyForm.threads ?? 4} onChange={(event) => setPolicyForm({ ...policyForm, threads: Number(event.target.value) })}>{[1, 2, 4, 6, 8, 12, 16, 24, 32].map((value) => <option key={value} value={value}>{value} threads</option>)}</select></label>
+          <label><span>CPU budget</span><select value={policyForm.threads ?? 1} onChange={(event) => setPolicyForm({ ...policyForm, threads: Number(event.target.value) })}>{availableCpuOptions.map((value) => <option key={value} value={value}>{value} thread{value === 1 ? "" : "s"}</option>)}</select></label>
         </div>
         {["smart", "lossy"].includes(policyForm.strategy) && <div className={`policy-lossy-fields ${policyForm.strategy === "lossy" ? "direct" : ""}`}>
           <label><span>Lossy distance · {Number(policyForm.distance ?? 0.5).toFixed(1)}</span><input type="range" min="0.1" max="1" step="0.1" value={policyForm.distance ?? 0.5} onChange={(event) => setPolicyForm({ ...policyForm, distance: Number(event.target.value) })} /></label>

@@ -41,6 +41,7 @@ ENV PYTHONUNBUFFERED=1 \
     SCRATCH_DIR=/dev/shm/cbzxl \
     WORKSPACE_DIR=/dev/shm/cbzxl/workspaces \
     RUNTIME_DIR=/dev/shm/cbzxl-runtime \
+    CPU_LIMIT=4 \
     DURABLE_CHECKPOINT_SECONDS=300 \
     DURABLE_CHECKPOINT_ARCHIVES=10000 \
     PAGE_DECISION_RETENTION_DAYS=180 \

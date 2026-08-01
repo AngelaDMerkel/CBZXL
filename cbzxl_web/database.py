@@ -9,12 +9,28 @@ from pathlib import Path
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from cbzxl_web.domain.policies import (
+    BUILTIN_PROFILES,
+    DEFAULT_OPTIONS,
+    normalize_policy_options,
+)
+from cbzxl_web.conversion.size_policy import (
+    EXPECTED_EXTENSION_OVERHEAD,
+    extension_overhead_from_decisions,
+    is_expected_extension_growth,
+)
+from cbzxl_web.persistence.migrations import (
+    ensure_columns,
+    record_versions,
+    split_schema,
+    version_applied,
+)
 
 CONFIG_DIR = Path(os.getenv("CONFIG_DIR", "/config"))
 DB_PATH = Path(os.getenv("DB_PATH", str(CONFIG_DIR / "cbzxl-v3.sqlite3")))
 LIBRARY_PATH = os.getenv("LIBRARY_PATH", "/data")
 APP_TIMEZONE = os.getenv("TZ", "UTC")
-LATEST_SCHEMA_VERSION = 11
+LATEST_SCHEMA_VERSION = 12
 DATABASE_MAINTENANCE_SECONDS = max(
     86400,
     int(os.getenv("DATABASE_MAINTENANCE_SECONDS", "604800")),
@@ -156,6 +172,7 @@ CREATE TABLE IF NOT EXISTS archives (
     lossy_pages INTEGER NOT NULL DEFAULT 0,
     retained_pages INTEGER NOT NULL DEFAULT 0,
     generation INTEGER NOT NULL DEFAULT 1,
+    size_variance_kind TEXT,
     script_version TEXT,
     jxl_version TEXT,
     error_message TEXT,
@@ -190,6 +207,7 @@ CREATE TABLE IF NOT EXISTS archive_results (
     lossy_pages INTEGER NOT NULL DEFAULT 0,
     retained_pages INTEGER NOT NULL DEFAULT 0,
     generation INTEGER NOT NULL DEFAULT 1,
+    size_variance_kind TEXT,
     conversion_mode TEXT,
     megapixels_info TEXT,
     error_message TEXT,
@@ -313,71 +331,6 @@ CREATE INDEX IF NOT EXISTS idx_archive_issues_job ON archive_issues(job_id);
 CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(enabled, next_run_at);
 CREATE INDEX IF NOT EXISTS idx_library_snapshots_date ON library_stat_snapshots(library_id, recorded_at);
 """
-
-
-DEFAULT_OPTIONS = {
-    "dry_run": False,
-    "backup": False,
-    "recheck_all": False,
-    "verbose": True,
-    "no_convert": False,
-    "no_flatten": True,
-    "delete_empty": False,
-    "smart_distance": False,
-    "effort": 10,
-    "threads": 4,
-    "distance": None,
-    "smart_mb": 10.0,
-    "smart_mp": 5.0,
-    "failed_only": False,
-    "compatibility_mode": False,
-    "continue_on_page_error": False,
-    "integrity_audit": False,
-    "repair_action": None,
-    "repair_entry": None,
-    "repair_entries": [],
-    "repair_source": None,
-}
-
-BUILTIN_PROFILES = (
-    {
-        "id": "profile-balanced",
-        "name": "Balanced lossless",
-        "is_default": 1,
-        "options": DEFAULT_OPTIONS,
-    },
-    {
-        "id": "profile-smart",
-        "name": "Smart lossy fallback",
-        "is_default": 0,
-        "options": {
-            **DEFAULT_OPTIONS,
-            "smart_distance": True,
-            "distance": 0.5,
-        },
-    },
-    {
-        "id": "profile-recheck",
-        "name": "Recheck without conversion",
-        "is_default": 0,
-        "options": {
-            **DEFAULT_OPTIONS,
-            "no_convert": True,
-            "recheck_all": True,
-        },
-    },
-    {
-        "id": "profile-integrity",
-        "name": "Integrity audit",
-        "is_default": 0,
-        "options": {
-            **DEFAULT_OPTIONS,
-            "no_convert": True,
-            "recheck_all": True,
-            "integrity_audit": True,
-        },
-    },
-)
 
 
 def utc_now() -> str:
@@ -549,6 +502,92 @@ def transaction(immediate: bool = False):
         conn.close()
 
 
+def classify_existing_extension_overhead(
+    conn: sqlite3.Connection,
+    *,
+    resolved_at: str,
+) -> int:
+    """Resolve proven filename-only growth from historical page evidence."""
+    candidates = conn.execute(
+        """
+        SELECT
+            ar.id AS result_id,
+            ar.archive_id,
+            ar.job_id,
+            ar.path,
+            ar.bytes_saved AS attempt_saved,
+            ar.generation AS result_generation,
+            a.bytes_saved AS lifetime_saved,
+            a.generation AS archive_generation
+        FROM archive_results ar
+        JOIN archives a ON a.id=ar.archive_id
+        WHERE ar.status='processed'
+          AND ar.bytes_saved < 0
+          AND a.status='processed'
+          AND a.bytes_saved < 0
+          AND COALESCE(a.size_variance_kind, '')=''
+        ORDER BY ar.id
+        """
+    ).fetchall()
+    classified_archives: set[int] = set()
+    for candidate in candidates:
+        archive_id = int(candidate["archive_id"])
+        if archive_id in classified_archives:
+            continue
+        if int(candidate["result_generation"] or 1) != int(
+            candidate["archive_generation"] or 1
+        ):
+            continue
+        decisions = conn.execute(
+            """
+            SELECT entry_path, outcome, reason
+            FROM page_decisions
+            WHERE job_id=? AND path=?
+            ORDER BY entry_path
+            """,
+            (candidate["job_id"], candidate["path"]),
+        ).fetchall()
+        overhead = extension_overhead_from_decisions(decisions)
+        attempt_growth = -int(candidate["attempt_saved"] or 0)
+        lifetime_growth = -int(candidate["lifetime_saved"] or 0)
+        if not (
+            is_expected_extension_growth(attempt_growth, overhead)
+            and is_expected_extension_growth(lifetime_growth, overhead)
+        ):
+            continue
+        conn.execute(
+            """
+            UPDATE archive_results
+            SET size_variance_kind=?
+            WHERE id=?
+            """,
+            (EXPECTED_EXTENSION_OVERHEAD, candidate["result_id"]),
+        )
+        conn.execute(
+            """
+            UPDATE archives
+            SET size_variance_kind=?
+            WHERE id=?
+            """,
+            (EXPECTED_EXTENSION_OVERHEAD, archive_id),
+        )
+        conn.execute(
+            """
+            UPDATE archive_issues
+            SET status='resolved', remedy=?, resolved_at=?, updated_at=?
+            WHERE archive_id=? AND kind='archive_grew'
+            """,
+            (
+                EXPECTED_EXTENSION_OVERHEAD,
+                resolved_at,
+                resolved_at,
+                archive_id,
+            ),
+        )
+        classified_archives.add(archive_id)
+    return len(classified_archives)
+
+
 def initialize() -> None:
     current_version = existing_schema_version()
     if (
@@ -557,15 +596,9 @@ def initialize() -> None:
     ):
         backup_before_migration(current_version=current_version)
     with connect() as conn:
-        conn.executescript(SCHEMA)
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, ?)",
-            (utc_now(),),
-        )
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, ?)",
-            (utc_now(),),
-        )
+        table_schema, index_schema = split_schema(SCHEMA)
+        conn.executescript(table_schema)
+        record_versions(conn, (1, 2), utc_now())
         migrations = {
             "jobs": {
                 "current_stage": "TEXT",
@@ -573,7 +606,13 @@ def initialize() -> None:
                 "total_pages": "INTEGER NOT NULL DEFAULT 0",
                 "heartbeat_at": "TEXT",
             },
+            "job_events": {
+                "job_id": "TEXT",
+                "created_at": "TEXT",
+            },
             "job_progress_samples": {
+                "job_id": "TEXT",
+                "recorded_at": "TEXT",
                 "current_stage": "TEXT",
                 "current_page": "INTEGER NOT NULL DEFAULT 0",
                 "total_pages": "INTEGER NOT NULL DEFAULT 0",
@@ -589,41 +628,39 @@ def initialize() -> None:
         }
         migrations["archives"].update(page_outcome_columns)
         migrations["archives"]["generation"] = "INTEGER NOT NULL DEFAULT 1"
+        migrations["archives"]["size_variance_kind"] = "TEXT"
         migrations["archives"]["format_inventory_fingerprint"] = "TEXT"
         migrations["archives"]["format_inventory_at"] = "TEXT"
         migrations["archive_issues"] = {
+            "job_id": "TEXT",
             "related_entry_path": "TEXT",
         }
         migrations["archive_results"] = {
+            "job_id": "TEXT",
             **page_outcome_columns,
             "generation": "INTEGER NOT NULL DEFAULT 1",
+            "size_variance_kind": "TEXT",
         }
-        for table, additions in migrations.items():
-            existing_columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
-            for column, definition in additions.items():
-                if column not in existing_columns:
-                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        migrations["page_decisions"] = {
+            "job_id": "TEXT",
+            "archive_id": "INTEGER",
+            "path": "TEXT",
+        }
+        migrations["archive_commit_intents"] = {
+            "job_id": "TEXT",
+            "library_id": "TEXT",
+            "created_at": "TEXT",
+        }
+        ensure_columns(conn, migrations)
+        conn.executescript(index_schema)
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_results_latest_processed
             ON archive_results(path, status, id DESC, job_id)
             """
         )
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (3, ?)",
-            (utc_now(),),
-        )
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (4, ?)",
-            (utc_now(),),
-        )
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (5, ?)",
-            (utc_now(),),
-        )
-        if not conn.execute(
-            "SELECT 1 FROM schema_migrations WHERE version=6"
-        ).fetchone():
+        record_versions(conn, (3, 4, 5), utc_now())
+        if not version_applied(conn, 6):
             # Older rechecks replaced an archive's original conversion baseline
             # with the already-optimized input size. Reconstruct contiguous size
             # chains from immutable attempts; a discontinuity starts a new source
@@ -739,9 +776,7 @@ def initialize() -> None:
                         now,
                     ),
                 )
-        if not conn.execute(
-            "SELECT 1 FROM schema_migrations WHERE version=9"
-        ).fetchone():
+        if not version_applied(conn, 9):
             for profile_id in ("profile-balanced", "profile-smart", "profile-recheck"):
                 row = conn.execute(
                     "SELECT options_json FROM conversion_profiles WHERE id=?",
@@ -792,6 +827,12 @@ def initialize() -> None:
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (11, ?)",
             (now,),
         )
+        if not version_applied(conn, 12):
+            classify_existing_extension_overhead(conn, resolved_at=now)
+            conn.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (12, ?)",
+                (now,),
+            )
         conn.execute(
             """
             INSERT OR IGNORE INTO archive_issues(
@@ -816,6 +857,7 @@ def initialize() -> None:
                 OR (
                     status='processed'
                     AND bytes_saved < 0
+                    AND COALESCE(size_variance_kind, '')!='extension_overhead'
                     AND dismissed_until_rescan=0
                 )
             """
@@ -831,6 +873,7 @@ def initialize() -> None:
                   FROM archives
                   WHERE status='processed'
                     AND bytes_saved < 0
+                    AND COALESCE(size_variance_kind, '')!='extension_overhead'
                     AND dismissed_until_rescan=0
               )
             """,
@@ -930,12 +973,10 @@ def default_profile(conn: sqlite3.Connection) -> dict[str, Any]:
 
 
 def merged_options(profile: dict[str, Any] | None, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
-    options = dict(DEFAULT_OPTIONS)
+    stored = None
     if profile and profile.get("options_json"):
-        options.update(json.loads(profile["options_json"]))
-    if overrides:
-        options.update({key: value for key, value in overrides.items() if value is not None})
-    return options
+        stored = json.loads(profile["options_json"])
+    return normalize_policy_options(stored, overrides)
 
 
 def create_job(

@@ -17,9 +17,21 @@ from typing import Literal, Optional
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, model_validator
 from starlette.background import BackgroundTask
 
+from cbzxl_web.api.schemas import (
+    IssueActionPayload,
+    JobCreate,
+    LegacyImportPayload,
+    ProfilePayload,
+    ReviewPayload,
+    ScanOptions,
+    SchedulePayload,
+)
+from cbzxl_web.api.system import create_system_router
+from cbzxl_web.config import RuntimeCapabilities, clamp_cpu_budget
+from cbzxl_web.conversion.size_policy import EXPECTED_EXTENSION_OVERHEAD
+from cbzxl_web.domain.policies import apply_scope
 from cbzxl_web.database import (
     DB_PATH,
     add_event,
@@ -38,6 +50,11 @@ from cbzxl_web.database import (
     utc_now,
 )
 from cbzxl_web.runtime_state import read_live_job
+from cbzxl_web.services.attention import (
+    issue_group,
+    issue_group_filter,
+    remedies_for_issue,
+)
 from cbzxl_web.legacy import import_legacy, inspect_legacy
 from cbzxl_web.engine import (
     IMAGE_SUFFIXES,
@@ -58,116 +75,7 @@ LOGGER = logging.getLogger("cbzxl.web")
 DATABASE_STARTUP_ERROR: str | None = None
 
 app = FastAPI(title="CBZXL", version=VERSION, docs_url="/api/docs", redoc_url=None)
-
-
-class ScanOptions(BaseModel):
-    dry_run: bool = False
-    backup: bool = False
-    recheck_all: bool = False
-    verbose: bool = True
-    no_convert: bool = False
-    no_flatten: bool = True
-    delete_empty: bool = False
-    smart_distance: bool = False
-    effort: int = Field(10, ge=0, le=11)
-    threads: int = Field(4, ge=1, le=32)
-    distance: Optional[float] = Field(None, ge=0, le=15)
-    smart_mb: float = Field(10.0, ge=0.1, le=1000)
-    smart_mp: float = Field(5.0, ge=0.1, le=1000)
-    failed_only: bool = False
-    compatibility_mode: bool = False
-    continue_on_page_error: bool = False
-    integrity_audit: bool = False
-    only_path: Optional[str] = None
-    repair_action: Optional[
-        Literal[
-            "replace",
-            "delete",
-            "rebuild",
-            "preserve",
-            "salvage",
-            "salvage_partial",
-            "restore_original",
-            "restore_reconvert",
-            "repack",
-        ]
-    ] = None
-    repair_entry: Optional[str] = None
-    repair_entries: list[str] = Field(default_factory=list)
-    repair_source: Optional[str] = None
-
-    @model_validator(mode="after")
-    def enforce_filename_preservation(self):
-        self.no_flatten = True
-        self.delete_empty = False
-        return self
-
-
-class JobCreate(BaseModel):
-    library_id: Optional[str] = None
-    profile_id: Optional[str] = None
-    scope: Literal["library", "unprocessed", "failed"] = "unprocessed"
-    options: Optional[ScanOptions] = None
-
-
-class SchedulePayload(BaseModel):
-    name: str = Field("Library maintenance", min_length=1, max_length=80)
-    enabled: bool = True
-    cadence: Literal["daily", "weekly", "monthly", "interval"] = "daily"
-    interval_value: Optional[int] = Field(None, ge=1, le=365)
-    interval_unit: Optional[Literal["hours", "days"]] = None
-    weekday: Optional[int] = Field(None, ge=0, le=6)
-    day_of_month: Optional[int] = None
-    hour: int = Field(4, ge=0, le=23)
-    minute: int = Field(0, ge=0, le=59)
-    library_id: Optional[str] = None
-    profile_id: Optional[str] = None
-
-    @model_validator(mode="after")
-    def validate_cadence(self):
-        if self.cadence == "interval" and (not self.interval_value or not self.interval_unit):
-            raise ValueError("Interval schedules need a quantity and unit")
-        if self.cadence == "weekly" and self.weekday is None:
-            raise ValueError("Weekly schedules need a weekday")
-        if self.cadence == "monthly" and self.day_of_month not in {-1, *range(1, 32)}:
-            raise ValueError("Monthly schedules need a day from 1 to 31, or the last day")
-        return self
-
-
-class ReviewPayload(BaseModel):
-    action: Literal["reviewed", "reopen", "queue_recheck"]
-    note: str = Field("", max_length=500)
-
-
-class IssueActionPayload(BaseModel):
-    action: Literal[
-        "retry",
-        "dismiss",
-        "compatibility",
-        "preserve",
-        "delete",
-        "delete_archive",
-        "lossless",
-        "smart_lossy",
-        "restore_original",
-        "repack",
-        "rebuild",
-        "salvage",
-        "salvage_partial",
-        "keep_primary",
-        "keep_related",
-    ]
-
-
-class ProfilePayload(BaseModel):
-    name: str = Field(..., min_length=1, max_length=80)
-    options: ScanOptions
-    is_default: bool = False
-
-
-class LegacyImportPayload(BaseModel):
-    path: str = Field(..., min_length=1)
-    dry_run: bool = True
+app.include_router(create_system_router(connect=connect, version=VERSION))
 
 
 @app.on_event("startup")
@@ -224,6 +132,9 @@ def hydrate_job(job, samples=None):
         sample_completed = int(recent[-1].get("completed") or 0) - int(recent[0].get("completed") or 0)
         if sample_elapsed > 0 and sample_completed > 0:
             rate = sample_completed / sample_elapsed * 60
+    rolling_rate = float(job.get("rolling_rate_per_minute") or 0)
+    if rolling_rate > 0:
+        rate = rolling_rate
     job["elapsed_seconds"] = elapsed
     job["rate_per_minute"] = round(rate, 1)
     job["eta_seconds"] = round(job["remaining"] / rate * 60) if rate and job["remaining"] else None
@@ -243,6 +154,9 @@ def hydrate_profile(profile):
     if profile:
         profile["is_default"] = bool(profile.get("is_default"))
         profile["options"] = parse_json(profile.pop("options_json", None))
+        profile["options"]["threads"] = clamp_cpu_budget(
+            profile["options"].get("threads", 4)
+        )
     return profile
 
 
@@ -262,6 +176,7 @@ def bootstrap():
             "libraries": [],
             "profiles": [],
             "schedules": [],
+            "capabilities": RuntimeCapabilities.detect().as_dict(),
             "database_path": str(DB_PATH),
             "database_status": "unavailable",
             "database_error": str(exc),
@@ -271,6 +186,7 @@ def bootstrap():
         "libraries": libraries,
         "profiles": [hydrate_profile(profile) for profile in profiles],
         "schedules": [hydrate_schedule(row) for row in schedules],
+        "capabilities": RuntimeCapabilities.detect().as_dict(),
         "database_path": str(DB_PATH),
         "database_status": "ok",
         "database_error": None,
@@ -289,7 +205,9 @@ def dashboard():
                     COUNT(*) AS archive_count,
                     SUM(CASE WHEN status='processed' THEN 1 ELSE 0 END) AS optimized_count,
                     SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed_count,
-                    SUM(CASE WHEN status='processed' AND bytes_saved < 0 THEN 1 ELSE 0 END) AS grew_count,
+                    SUM(CASE WHEN status='processed' AND bytes_saved < 0
+                             AND COALESCE(size_variance_kind, '')!='extension_overhead'
+                        THEN 1 ELSE 0 END) AS grew_count,
                     COALESCE(SUM(CASE WHEN status='processed' AND bytes_saved > 0 THEN bytes_saved ELSE 0 END), 0) AS saved_bytes,
                     COALESCE(SUM(CASE WHEN status='processed' AND bytes_saved < 0 THEN -bytes_saved ELSE 0 END), 0) AS increased_bytes,
                     COALESCE(SUM(CASE WHEN status='processed' THEN bytes_saved ELSE 0 END), 0) AS net_bytes,
@@ -755,6 +673,7 @@ def archive_history_context(values, *, skipped=False):
     bytes_saved = int(history_value("bytes_saved") or 0)
     percent_saved = float(history_value("percent_saved") or 0)
     conversion_mode = str(history_value("conversion_mode", "") or "")
+    size_variance_kind = str(history_value("size_variance_kind", "") or "")
     dominant_type = str(values.get("dominant_type") or "")
     status = str(values.get("status") or "")
     if values.get("history_outcome"):
@@ -772,6 +691,16 @@ def archive_history_context(values, *, skipped=False):
         outcome = "already_current"
         label_text = "Integrity verified"
         detail = "Every ZIP entry passed CRC validation and every JPEG XL page fully decoded"
+    elif size_variance_kind == EXPECTED_EXTENSION_OVERHEAD:
+        outcome = "retained"
+        label_text = "Filenames corrected"
+        growth = max(0, -bytes_saved)
+        detail = (
+            "Image data was retained while file extensions were corrected to "
+            "match their actual formats"
+        )
+        if growth:
+            detail += f"; ZIP filename records added {growth:,} bytes"
     elif converted_pages > 0:
         outcome = "already_current" if skipped else "optimized"
         label_text = "Already optimized" if skipped else "Optimized"
@@ -834,6 +763,7 @@ def archive_history_context(values, *, skipped=False):
         "bytes_saved": bytes_saved,
         "percent_saved": percent_saved,
         "conversion_mode": conversion_mode or None,
+        "size_variance_kind": size_variance_kind or None,
         "jxl_effort": history_value("jxl_effort", None),
         "previous_processed_at": (
             (
@@ -1117,11 +1047,14 @@ def enqueue_job(payload: JobCreate):
             overrides.get("integrity_audit")
             or parse_json(profile.get("options_json")).get("integrity_audit")
         )
-        overrides["failed_only"] = payload.scope == "failed" and not integrity_audit
-        overrides["recheck_all"] = payload.scope == "library" or integrity_audit
+        overrides = apply_scope(overrides, payload.scope)
+        if integrity_audit:
+            overrides["failed_only"] = False
+            overrides["recheck_all"] = True
         if integrity_audit:
             overrides["no_convert"] = True
         options = merged_options(profile, overrides)
+        options["threads"] = clamp_cpu_budget(options.get("threads", 4))
         if integrity_audit:
             options.update(
                 {
@@ -1221,128 +1154,11 @@ def issue_row(conn, issue_id: int):
     return issue
 
 
-def remedies_for_issue(issue):
-    kind = issue.get("kind") or "archive_failed"
-    if kind == "archive_grew":
-        if issue.get("backup_available"):
-            return ["lossless", "smart_lossy", "restore_original", "repack"]
-        return ["repack", "dismiss"]
-    if kind == "crc_mismatch":
-        return ["rebuild", "preserve", "replace", "delete", "dismiss"]
-    if kind == "archive_corrupt":
-        return ["salvage", "salvage_partial", "compatibility", "retry", "dismiss"]
-    if kind == "filename_collision":
-        if issue.get("entry_path") and issue.get("related_entry_path"):
-            return ["keep_primary", "keep_related", "dismiss"]
-        return ["dismiss"]
-    if issue.get("entry_path"):
-        return ["compatibility", "preserve", "replace", "delete"]
-    if kind == "unsafe_archive_path":
-        return ["dismiss"]
-    return ["compatibility", "preserve", "retry", "dismiss"]
-
-
-ISSUE_GROUPS = {
-    "growth": {
-        "label": "Archives larger after conversion",
-        "triage": "Repair available",
-        "recommended": "Retry with a smaller result or accept the current archive",
-        "kinds": {"archive_grew"},
-    },
-    "crc": {
-        "label": "CRC-32 failures",
-        "triage": "Inspect repairability",
-        "recommended": "Inspect the failing entry, then recover, preserve, replace or explicitly delete it",
-        "kinds": {"crc_mismatch"},
-    },
-    "images": {
-        "label": "Image processing failures",
-        "triage": "Needs your decision",
-        "recommended": "Preserve, replace or explicitly delete the affected image",
-        "kinds": {
-            "page_encode_failed",
-            "page_conversion_error",
-            "image_corrupt",
-            "unsupported_image",
-        },
-    },
-    "unreadable": {
-        "label": "Unreadable archives",
-        "triage": "Needs your decision",
-        "recommended": "Inspect the source archive before retrying",
-        "kinds": {"archive_corrupt"},
-    },
-    "verification": {
-        "label": "Candidate verification failures",
-        "triage": "Retryable",
-        "recommended": "Retry with compatibility or lossless-only verification",
-        "kinds": {"verification_failed"},
-    },
-    "paths": {
-        "label": "Unsafe archive paths",
-        "triage": "Needs your decision",
-        "recommended": "Correct the source archive outside CBZXL",
-        "kinds": {"unsafe_archive_path"},
-    },
-    "collisions": {
-        "label": "Filename collisions",
-        "triage": "Needs your decision",
-        "recommended": "Compare both images and choose which one the archive should keep",
-        "kinds": {"filename_collision"},
-    },
-    "permissions": {
-        "label": "Write or permission failures",
-        "triage": "System problem",
-        "recommended": "Restore library access, then retry the affected archives",
-        "kinds": {"permission_denied"},
-    },
-    "missing": {
-        "label": "Missing source archives",
-        "triage": "System problem",
-        "recommended": "Restore or rescan the missing source path",
-        "kinds": {"file_missing"},
-    },
-    "dependency": {
-        "label": "Missing conversion dependency",
-        "triage": "System problem",
-        "recommended": "Restore the encoder or image utility before retrying",
-        "kinds": {"encoder_unavailable"},
-    },
-    "conversion": {
-        "label": "Archive conversion failures",
-        "triage": "Retryable",
-        "recommended": "Retry normally or in compatibility mode",
-        "kinds": {"archive_failed", "source_changed"},
-    },
-}
-
-
-def issue_group(issue):
-    kind = issue.get("kind") or "archive_failed"
-    for group_id, group in ISSUE_GROUPS.items():
-        if kind in group["kinds"]:
-            return {"id": group_id, **{key: value for key, value in group.items() if key != "kinds"}}
-    return {
-        "id": "other",
-        "label": "Other conversion failures",
-        "triage": "Inspect",
-        "recommended": "Inspect the diagnostic detail before choosing a remedy",
-    }
-
-
 def issue_group_where(group_id):
-    if not group_id:
-        return "", []
-    group = ISSUE_GROUPS.get(group_id)
-    if group:
-        kinds = sorted(group["kinds"])
-        placeholders = ",".join("?" for _ in kinds)
-        return f" AND ai.kind IN ({placeholders})", kinds
-    if group_id == "other":
-        known = sorted({kind for group in ISSUE_GROUPS.values() for kind in group["kinds"]})
-        placeholders = ",".join("?" for _ in known)
-        return f" AND ai.kind NOT IN ({placeholders})", known
-    raise HTTPException(404, "Failure type not found")
+    result = issue_group_filter(group_id)
+    if result is None:
+        raise HTTPException(404, "Failure type not found")
+    return result
 
 
 def queue_issue_job(conn, issue, action, overrides=None):
@@ -2259,7 +2075,11 @@ def list_archives(
         params.append(status)
     if review != "all":
         if review == "needs_review":
-            clauses.append("review_status!='reviewed' AND (status='failed' OR bytes_saved < 0)")
+            clauses.append(
+                "review_status!='reviewed' AND (status='failed' OR "
+                "(bytes_saved < 0 AND COALESCE(size_variance_kind, '')"
+                "!='extension_overhead'))"
+            )
         else:
             clauses.append("review_status=?")
             params.append(review)
@@ -2622,26 +2442,6 @@ def homepage_widget():
             "last_run_status": None,
             "version": VERSION,
         }
-
-
-@app.get("/health")
-def health():
-    try:
-        with connect() as conn:
-            conn.execute("SELECT 1").fetchone()
-        return {"status": "healthy", "database": "ok", "version": VERSION}
-    except (sqlite3.Error, OSError) as exc:
-        return {"status": "degraded", "database": "unavailable", "detail": str(exc), "version": VERSION}
-
-
-@app.get("/ready")
-def ready():
-    try:
-        with connect() as conn:
-            conn.execute("SELECT 1").fetchone()
-        return {"status": "ready", "database": "ok", "version": VERSION}
-    except (sqlite3.Error, OSError) as exc:
-        raise HTTPException(503, f"Database unavailable: {exc}") from exc
 
 
 STATIC_ROOT = FRONTEND_DIST if FRONTEND_DIST.exists() else LEGACY_STATIC

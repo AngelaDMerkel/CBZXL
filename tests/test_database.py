@@ -26,7 +26,7 @@ class DatabaseTests(unittest.TestCase):
                 row[0]
                 for row in conn.execute("SELECT name FROM conversion_profiles")
             }
-        self.assertEqual(version, 11)
+        self.assertEqual(version, 12)
         self.assertEqual(library["root_path"], database.LIBRARY_PATH)
         self.assertEqual(profile["name"], "Balanced lossless")
         self.assertEqual(
@@ -97,6 +97,46 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(row, ("old-run", "Series/Book.cbz"))
         self.assertIn("job_id", current_columns)
 
+    def test_legacy_table_missing_job_id_is_upgraded_before_indexes(self):
+        legacy_path = Path(self.temp.name) / "legacy-missing-job.sqlite3"
+        with sqlite3.connect(legacy_path) as legacy:
+            legacy.execute(
+                """
+                CREATE TABLE schema_migrations(
+                    version INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                )
+                """
+            )
+            legacy.execute(
+                """
+                CREATE TABLE page_decisions(
+                    id INTEGER PRIMARY KEY,
+                    archive_id INTEGER,
+                    path TEXT,
+                    entry_path TEXT
+                )
+                """
+            )
+            legacy.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (1, 'now')"
+            )
+
+        database.DB_PATH = legacy_path
+        database.initialize()
+
+        with database.connect() as connection:
+            columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(page_decisions)")
+            }
+            indexes = {
+                row[1]
+                for row in connection.execute("PRAGMA index_list(page_decisions)")
+            }
+        self.assertIn("job_id", columns)
+        self.assertIn("idx_page_decisions_job_path", indexes)
+
     def test_version_six_recovers_baseline_from_attempt_history(self):
         now = database.utc_now()
         with database.transaction() as conn:
@@ -145,6 +185,88 @@ class DatabaseTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(tuple(archive), (1000, 700, 300, 30))
 
+    def test_version_twelve_resolves_proven_extension_overhead(self):
+        now = database.utc_now()
+        with database.transaction() as conn:
+            library = database.default_library(conn)
+            profile = database.default_profile(conn)
+            job_id = database.create_job(
+                conn,
+                source="manual",
+                library_id=library["id"],
+                profile_id=profile["id"],
+                options=database.DEFAULT_OPTIONS,
+            )
+            conn.execute(
+                """
+                INSERT INTO archives(
+                    library_id, path, status, original_size, final_size,
+                    bytes_saved, percent_saved, generation, created_at, updated_at
+                ) VALUES (?, 'Series/Mislabeled.cbz', 'processed', 1000, 1062,
+                          -62, -6.2, 1, ?, ?)
+                """,
+                (library["id"], now, now),
+            )
+            archive_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.execute(
+                """
+                INSERT INTO archive_results(
+                    job_id, archive_id, path, original_size, final_size,
+                    bytes_saved, percent_saved, status, generation, converted_at
+                ) VALUES (?, ?, 'Series/Mislabeled.cbz', 1000, 1062,
+                          -62, -6.2, 'processed', 1, ?)
+                """,
+                (job_id, archive_id, now),
+            )
+            for index in range(1, 32):
+                conn.execute(
+                    """
+                    INSERT INTO page_decisions(
+                        job_id, archive_id, path, entry_path, outcome,
+                        reason, attempts_json, created_at
+                    ) VALUES (?, ?, 'Series/Mislabeled.cbz', ?,
+                              'extension_corrected', ?, '[]', ?)
+                    """,
+                    (
+                        job_id,
+                        archive_id,
+                        f"{index:03}.jpg",
+                        "No JPEG XL candidate was smaller; filename extension "
+                        "corrected to .webp",
+                        now,
+                    ),
+                )
+            database.upsert_archive_issue(
+                conn,
+                archive_id=archive_id,
+                job_id=job_id,
+                kind="archive_grew",
+                stage="size_check",
+                message="Archive grew by 62 bytes",
+            )
+            conn.execute("DELETE FROM schema_migrations WHERE version=12")
+
+        database.initialize()
+
+        with database.connect() as conn:
+            archive = conn.execute(
+                """
+                SELECT bytes_saved, size_variance_kind
+                FROM archives WHERE id=?
+                """,
+                (archive_id,),
+            ).fetchone()
+            issue = conn.execute(
+                "SELECT status, remedy FROM archive_issues WHERE archive_id=?",
+                (archive_id,),
+            ).fetchone()
+            version = conn.execute(
+                "SELECT MAX(version) FROM schema_migrations"
+            ).fetchone()[0]
+        self.assertEqual(tuple(archive), (-62, "extension_overhead"))
+        self.assertEqual(tuple(issue), ("resolved", "extension_overhead"))
+        self.assertEqual(version, 12)
+
     def test_human_schedule_calculation(self):
         after = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
         daily = {"cadence": "daily", "hour": 14, "minute": 30}
@@ -189,13 +311,13 @@ class DatabaseTests(unittest.TestCase):
 
     def test_schema_upgrade_creates_a_verified_rotating_backup(self):
         with database.transaction() as conn:
-            conn.execute("DELETE FROM schema_migrations WHERE version=11")
+            conn.execute("DELETE FROM schema_migrations WHERE version=12")
 
         database.initialize()
 
         backups = list(
             (database.DB_PATH.parent / "backups").glob(
-                "cbzxl.pre-v10-*.sqlite3"
+                "cbzxl.pre-v11-*.sqlite3"
             )
         )
         self.assertEqual(len(backups), 1)
@@ -209,7 +331,7 @@ class DatabaseTests(unittest.TestCase):
                 backup.execute(
                     "SELECT MAX(version) FROM schema_migrations"
                 ).fetchone()[0],
-                10,
+                11,
             )
         finally:
             backup.close()

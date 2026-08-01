@@ -1,6 +1,5 @@
 import os
 import json
-import hashlib
 import shutil
 import sqlite3
 import tempfile
@@ -23,6 +22,24 @@ from rich.console import Console
 from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn, SpinnerColumn
 from enum import Enum, auto
 
+from cbzxl_web.config import clamp_cpu_budget
+from cbzxl_web.conversion.verification import (
+    CandidateAssessment,
+    assess_candidate,
+    required_archive_decode_entries,
+)
+from cbzxl_web.conversion.source_guard import (
+    ArchiveSourceChanged,
+    archive_guard_fingerprint,
+    archive_is_stable as source_archive_is_stable,
+    capture_archive_identity,
+    require_unchanged_archive,
+)
+from cbzxl_web.conversion.size_policy import (
+    EXPECTED_EXTENSION_OVERHEAD,
+    extension_overhead_from_manifest,
+    is_expected_extension_growth,
+)
 from cbzxl_web.database import (
     initialize as initialize_database,
     resolve_archive_issue,
@@ -46,6 +63,7 @@ from cbzxl_web.engine import (
     verify_archive,
 )
 from cbzxl_web.protocol import EventEmitter
+from cbzxl_web.repositories.commit_intents import CommitIntentRepository
 
 # Default Constants (can be overwritten by args)
 DEFAULT_JXL_EFFORT = 10
@@ -113,68 +131,13 @@ PENDING_FORMAT_INVENTORIES = []
 PENDING_ARCHIVES = 0
 
 
-class ArchiveSourceChanged(RuntimeError):
-    kind = "source_changed"
-    stage = "committing"
-
-
-def capture_archive_identity(path):
-    """Return the inexpensive identity used to guard an atomic replacement."""
-    stat_result = Path(path).stat()
-    return {
-        "device": stat_result.st_dev,
-        "inode": stat_result.st_ino,
-        "size": stat_result.st_size,
-        "mtime_ns": stat_result.st_mtime_ns,
-    }
-
-
-def archive_guard_fingerprint(path):
-    """Fingerprint valid ZIP metadata, falling back to complete raw bytes."""
-    try:
-        return archive_fingerprint(path)
-    except zipfile.BadZipFile:
-        digest = hashlib.blake2b(digest_size=20)
-        with open(path, "rb") as source:
-            for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                digest.update(chunk)
-        return digest.hexdigest()
-
-
-def require_unchanged_archive(path, expected_identity, expected_fingerprint):
-    """Refuse to overwrite a source that changed after conversion began."""
-    current_identity = capture_archive_identity(path)
-    if current_identity != expected_identity:
-        raise ArchiveSourceChanged(
-            "Source archive changed during conversion; the verified candidate "
-            "was discarded"
-        )
-    try:
-        current_fingerprint = archive_guard_fingerprint(path)
-    except OSError as exc:
-        raise ArchiveSourceChanged(
-            "Source archive became unreadable during conversion; the verified "
-            "candidate was discarded"
-        ) from exc
-    if current_fingerprint != expected_fingerprint:
-        raise ArchiveSourceChanged(
-            "Source archive contents changed during conversion; the verified "
-            "candidate was discarded"
-        )
-
-
 def archive_is_stable(path, minimum_age_seconds=None, *, now=None):
-    """Return whether an archive is old enough to no longer be an active copy."""
     minimum_age = (
         ARCHIVE_STABLE_SECONDS
         if minimum_age_seconds is None
         else max(0, int(minimum_age_seconds))
     )
-    if minimum_age == 0:
-        return True
-    stat_result = Path(path).stat()
-    wall_time = time.time() if now is None else float(now)
-    return wall_time - stat_result.st_mtime >= minimum_age
+    return source_archive_is_stable(path, minimum_age, now=now)
 
 
 def emit(event_type, *, level="info", message="", **data):
@@ -444,7 +407,18 @@ def unchanged_archive_context(db_row):
     retained_pages = int(db_row.get("retained_pages") or 0)
     conversion_mode = str(db_row.get("conversion_mode") or "")
     dominant_type = str(db_row.get("dominant_type") or "")
-    if converted_pages > 0:
+    size_variance_kind = str(db_row.get("size_variance_kind") or "")
+    if size_variance_kind == EXPECTED_EXTENSION_OVERHEAD:
+        outcome = "retained"
+        label = "Filenames corrected"
+        growth = max(0, -int(db_row.get("bytes_saved") or 0))
+        detail = (
+            "Image data was retained while file extensions were corrected to "
+            "match their actual formats"
+        )
+        if growth:
+            detail += f"; ZIP filename records added {growth:,} bytes"
+    elif converted_pages > 0:
         outcome = "already_current"
         label = "Already optimized"
         detail = (
@@ -493,6 +467,7 @@ def unchanged_archive_context(db_row):
         "previous_percent_saved": float(db_row.get("percent_saved") or 0),
         "previous_conversion_mode": conversion_mode or None,
         "previous_jxl_effort": db_row.get("jxl_effort"),
+        "previous_size_variance_kind": size_variance_kind or None,
     }
 
 
@@ -846,6 +821,7 @@ def record_archive_result(
     archive_mtime_value=None,
     generation=1,
     job_id=None,
+    size_variance_kind=None,
 ):
     effective_job_id = job_id or RUN_ID
     if DRY_RUN or conn is None or not effective_job_id:
@@ -856,8 +832,9 @@ def record_archive_result(
         (job_id, archive_id, path, original_size, final_size, bytes_saved, percent_saved, status, dominant_type,
          jxl_effort, processing_duration_seconds, image_count, jpg_count, png_count,
          converted_pages, lossless_pages, lossy_pages, retained_pages, conversion_mode,
-         megapixels_info, error_message, converted_at, archive_mtime, generation)
-        VALUES (?, (SELECT id FROM archives WHERE library_id=? AND path=?), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         megapixels_info, error_message, converted_at, archive_mtime, generation,
+         size_variance_kind)
+        VALUES (?, (SELECT id FROM archives WHERE library_id=? AND path=?), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(job_id, path) DO UPDATE SET archive_id=excluded.archive_id, original_size=excluded.original_size,
           final_size=excluded.final_size, bytes_saved=excluded.bytes_saved, percent_saved=excluded.percent_saved,
           status=excluded.status, dominant_type=excluded.dominant_type, jxl_effort=excluded.jxl_effort,
@@ -868,7 +845,8 @@ def record_archive_result(
           conversion_mode=excluded.conversion_mode,
           megapixels_info=excluded.megapixels_info, error_message=excluded.error_message,
           converted_at=excluded.converted_at, archive_mtime=excluded.archive_mtime,
-          generation=excluded.generation
+          generation=excluded.generation,
+          size_variance_kind=excluded.size_variance_kind
     """, (
         effective_job_id,
         LIBRARY_ID,
@@ -895,6 +873,7 @@ def record_archive_result(
         utc_now(),
         archive_mtime_value,
         generation,
+        size_variance_kind,
     ))
 
 
@@ -1095,6 +1074,7 @@ def mark_processed(
     retained_pages=0,
     commit=True,
     result_job_id=None,
+    size_variance_kind=None,
 ):
     """Mark an archive as processed with enhanced metadata."""
     if DRY_RUN or conn is None:
@@ -1110,7 +1090,7 @@ def mark_processed(
             SELECT original_size, final_size, content_fingerprint, dominant_type,
                    image_count, jpg_count, png_count, converted_pages,
                    lossless_pages, lossy_pages, retained_pages, conversion_mode,
-                   megapixels_info, generation
+                   megapixels_info, generation, size_variance_kind
             FROM archives
             WHERE library_id=? AND path=?
             """,
@@ -1129,6 +1109,7 @@ def mark_processed(
         state_retained_pages = retained_pages
         state_conversion_mode = conversion_mode
         state_megapixels_info = megapixels_info
+        state_size_variance_kind = size_variance_kind
         if existing and existing["original_size"] is not None:
             stored_fingerprint = existing["content_fingerprint"]
             same_generation = (
@@ -1139,6 +1120,8 @@ def mark_processed(
             generation = int(existing["generation"] or 1)
             if same_generation:
                 baseline_size = int(existing["original_size"])
+                if state_size_variance_kind is None and saved_bytes >= 0:
+                    state_size_variance_kind = existing["size_variance_kind"]
                 state_dominant_type = existing["dominant_type"] or dominant_type
                 state_image_count = img_count or int(existing["image_count"] or 0)
                 state_jpg_count = num_jpg or int(existing["jpg_count"] or 0)
@@ -1181,13 +1164,16 @@ def mark_processed(
         cumulative_percent_saved = (
             cumulative_saved_bytes / baseline_size * 100 if baseline_size > 0 else 0
         )
+        if cumulative_saved_bytes >= 0:
+            state_size_variance_kind = None
         conn.execute("""
             INSERT INTO archives
             (library_id, path, original_size, final_size, bytes_saved, percent_saved, converted_at, archive_mtime, content_fingerprint, status, dominant_type, jxl_effort,
              processing_duration_seconds, image_count, jpg_count, png_count,
              converted_pages, lossless_pages, lossy_pages, retained_pages,
-             script_version, jxl_version, conversion_mode, megapixels_info, generation, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'processed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             script_version, jxl_version, conversion_mode, megapixels_info,
+             generation, size_variance_kind, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'processed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(library_id, path) DO UPDATE SET original_size=excluded.original_size, final_size=excluded.final_size,
               bytes_saved=excluded.bytes_saved, percent_saved=excluded.percent_saved, converted_at=excluded.converted_at,
               archive_mtime=excluded.archive_mtime, content_fingerprint=excluded.content_fingerprint,
@@ -1197,12 +1183,13 @@ def mark_processed(
               converted_pages=excluded.converted_pages, lossless_pages=excluded.lossless_pages,
               lossy_pages=excluded.lossy_pages, retained_pages=excluded.retained_pages,
               generation=excluded.generation,
+              size_variance_kind=excluded.size_variance_kind,
               script_version=excluded.script_version, jxl_version=excluded.jxl_version, error_message=NULL,
               conversion_mode=excluded.conversion_mode, megapixels_info=excluded.megapixels_info, updated_at=excluded.updated_at
         """, (LIBRARY_ID, path_str, baseline_size, final_size, cumulative_saved_bytes, cumulative_percent_saved, converted_at_iso, archive_mtime_value, content_fingerprint, state_dominant_type, jxl_effort_level,
               duration, state_image_count, state_jpg_count, state_png_count, state_converted_pages, state_lossless_pages, state_lossy_pages,
               state_retained_pages, SCRIPT_VERSION, JXL_VERSION, state_conversion_mode, state_megapixels_info, generation,
-              converted_at_iso, converted_at_iso))
+              state_size_variance_kind, converted_at_iso, converted_at_iso))
         archive_id = conn.execute(
             "SELECT id FROM archives WHERE library_id=? AND path=?",
             (LIBRARY_ID, path_str),
@@ -1220,7 +1207,10 @@ def mark_processed(
                 level="warning",
             )
         resolve_archive_issue(conn, archive_id)
-        if cumulative_saved_bytes < 0:
+        if (
+            cumulative_saved_bytes < 0
+            and state_size_variance_kind != EXPECTED_EXTENSION_OVERHEAD
+        ):
             growth_bytes = -cumulative_saved_bytes
             growth_percent = -cumulative_percent_saved
             latest_context = (
@@ -1272,6 +1262,7 @@ def mark_processed(
             archive_mtime_value=archive_mtime_value,
             generation=generation,
             job_id=effective_job_id,
+            size_variance_kind=state_size_variance_kind,
         )
         if commit:
             conn.commit()
@@ -1564,28 +1555,13 @@ def record_archive_commit_intent(
     """Durably describe a verified replacement before changing the CBZ."""
     if DRY_RUN or conn is None or not RUN_ID:
         return
-    conn.execute(
-        """
-        INSERT INTO archive_commit_intents(
-            library_id, job_id, path, input_fingerprint,
-            candidate_fingerprint, payload_json, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(library_id, path) DO UPDATE SET
-            job_id=excluded.job_id,
-            input_fingerprint=excluded.input_fingerprint,
-            candidate_fingerprint=excluded.candidate_fingerprint,
-            payload_json=excluded.payload_json,
-            created_at=excluded.created_at
-        """,
-        (
-            LIBRARY_ID,
-            RUN_ID,
-            path_str,
-            input_fingerprint,
-            candidate_fingerprint,
-            json.dumps(payload, sort_keys=True, separators=(",", ":")),
-            utc_now(),
-        ),
+    CommitIntentRepository(conn, LIBRARY_ID).upsert(
+        job_id=RUN_ID,
+        path=path_str,
+        input_fingerprint=input_fingerprint,
+        candidate_fingerprint=candidate_fingerprint,
+        payload=payload,
+        created_at=utc_now(),
     )
     conn.commit()
 
@@ -1593,10 +1569,7 @@ def record_archive_commit_intent(
 def clear_archive_commit_intent(conn, path_str, *, commit=True):
     if conn is None:
         return
-    conn.execute(
-        "DELETE FROM archive_commit_intents WHERE library_id=? AND path=?",
-        (LIBRARY_ID, path_str),
-    )
+    CommitIntentRepository(conn, LIBRARY_ID).delete(path_str)
     if commit:
         conn.commit()
 
@@ -1605,15 +1578,7 @@ def recover_archive_commit_intents(conn, library_root):
     """Finalize or safely discard write-ahead records left by a stopped run."""
     if conn is None:
         return {"recovered": 0, "discarded": 0, "conflicted": 0}
-    rows = conn.execute(
-        """
-        SELECT *
-        FROM archive_commit_intents
-        WHERE library_id=?
-        ORDER BY created_at, id
-        """,
-        (LIBRARY_ID,),
-    ).fetchall()
+    rows = CommitIntentRepository(conn, LIBRARY_ID).pending()
     recovered = 0
     discarded = 0
     conflicted = 0
@@ -1656,6 +1621,7 @@ def recover_archive_commit_intents(conn, library_root):
                 retained_pages=int(payload.get("retained_pages") or 0),
                 commit=False,
                 result_job_id=row["job_id"],
+                size_variance_kind=payload.get("size_variance_kind"),
             )
             decisions = payload.get("page_decisions") or {}
             if decisions:
@@ -2250,7 +2216,7 @@ def convert_single_image(img_path_obj, cli_args, workspace=None, archive_path=No
 
     try:
         last_result = None
-        had_valid_candidate = False
+        had_candidate_output = False
         verification_errors = []
         fallback_cleanup = None
         attempt_records = []
@@ -2265,10 +2231,12 @@ def convert_single_image(img_path_obj, cli_args, workspace=None, archive_path=No
                 ("standard", encoder_input_path, encoder_threads, JXL_EFFORT)
             ]
             strategy_index = 0
-            verified = False
-            verified_effort = None
-            verified_input = None
-            verified_threads = None
+            candidate_ready = False
+            candidate_verified = False
+            candidate_effort = None
+            candidate_input = None
+            candidate_threads = None
+            candidate_size = None
             while strategy_index < len(strategies):
                 strategy_name, strategy_input, strategy_threads, strategy_effort = (
                     strategies[strategy_index]
@@ -2285,55 +2253,63 @@ def convert_single_image(img_path_obj, cli_args, workspace=None, archive_path=No
                     attempt_threads=strategy_threads,
                     attempt_effort=strategy_effort,
                 )
-                valid = (
-                    last_result.returncode == 0
-                    and partial_path.exists()
-                    and get_size(partial_path) > 0
-                    and jxl_has_valid_signature(partial_path)
-                )
-                if valid:
-                    try:
-                        verify_encoded_page(
+                if last_result.returncode != 0:
+                    assessment = CandidateAssessment(
+                        False,
+                        False,
+                        (
+                            partial_path.stat().st_size
+                            if partial_path.exists()
+                            else None
+                        ),
+                        (
+                            last_result.stderr.strip()
+                            if last_result.stderr
+                            else "encoder did not produce a valid JPEG XL file"
+                        ),
+                    )
+                else:
+                    assessment = assess_candidate(
+                        partial_path,
+                        orig_size,
+                        signature_check=jxl_has_valid_signature,
+                        decode_verify=lambda: verify_encoded_page(
                             strategy_input,
                             partial_path,
                             require_pixel_match=final_distance == 0,
-                        )
-                    except VerificationError as exc:
-                        verification_errors.append(str(exc))
-                        valid = False
-                observed_size = (
-                    get_size(partial_path)
-                    if partial_path.exists() and get_size(partial_path) > 0
-                    else None
-                )
+                        ),
+                        verification_errors=(VerificationError,),
+                    )
+                if (
+                    not assessment.ready
+                    and assessment.size is not None
+                    and assessment.reason
+                    not in {
+                        "encoder produced no candidate",
+                        "encoder did not produce a valid JPEG XL file",
+                    }
+                ):
+                    verification_errors.append(assessment.reason)
+                if assessment.ready:
+                    had_candidate_output = True
                 attempt_records.append(
                     {
                         "mode": conversion_mode,
                         "distance": final_distance,
                         "effort": strategy_effort,
                         "strategy": strategy_name,
-                        "candidate_size": observed_size,
-                        "verified": bool(valid),
-                        "reason": (
-                            "verified"
-                            if valid
-                            else (
-                                verification_errors[-1]
-                                if verification_errors
-                                else (
-                                    last_result.stderr.strip()
-                                    if last_result and last_result.stderr
-                                    else "encoder did not produce a valid JPEG XL file"
-                                )
-                            )
-                        ),
+                        "candidate_size": assessment.size,
+                        "verified": assessment.verified,
+                        "reason": assessment.reason,
                     }
                 )
-                if valid:
-                    verified = True
-                    verified_effort = strategy_effort
-                    verified_input = strategy_input
-                    verified_threads = strategy_threads
+                if assessment.ready:
+                    candidate_ready = True
+                    candidate_verified = assessment.verified
+                    candidate_effort = strategy_effort
+                    candidate_input = strategy_input
+                    candidate_threads = strategy_threads
+                    candidate_size = assessment.size
                     break
                 if strategy_name == "standard":
                     normalized_input, normalized_cleanup = cjxl_input_path(
@@ -2366,10 +2342,8 @@ def convert_single_image(img_path_obj, cli_args, workspace=None, archive_path=No
                             min(strategy_effort, 7),
                         )
                     )
-            if not verified:
+            if not candidate_ready:
                 continue
-            had_valid_candidate = True
-            candidate_size = get_size(partial_path)
             smallest_candidate_size = (
                 candidate_size
                 if smallest_candidate_size is None
@@ -2378,7 +2352,7 @@ def convert_single_image(img_path_obj, cli_args, workspace=None, archive_path=No
             if (
                 final_distance == 0
                 and candidate_size >= orig_size
-                and int(verified_effort or JXL_EFFORT) < DEFAULT_JXL_EFFORT
+                and int(candidate_effort or JXL_EFFORT) < DEFAULT_JXL_EFFORT
             ):
                 if VERBOSE:
                     log(
@@ -2388,66 +2362,80 @@ def convert_single_image(img_path_obj, cli_args, workspace=None, archive_path=No
                     )
                 last_result = encode_attempt(
                     final_distance,
-                    str(verified_input),
-                    attempt_threads=verified_threads,
+                    str(candidate_input),
+                    attempt_threads=candidate_threads,
                     attempt_effort=DEFAULT_JXL_EFFORT,
                 )
-                high_effort_valid = (
-                    last_result.returncode == 0
-                    and partial_path.exists()
-                    and get_size(partial_path) > 0
-                    and jxl_has_valid_signature(partial_path)
-                )
-                high_effort_reason = "verified"
-                if high_effort_valid:
-                    try:
-                        verify_encoded_page(
-                            verified_input,
+                if last_result.returncode != 0:
+                    high_effort = CandidateAssessment(
+                        False,
+                        False,
+                        (
+                            partial_path.stat().st_size
+                            if partial_path.exists()
+                            else None
+                        ),
+                        (
+                            last_result.stderr.strip()
+                            if last_result.stderr
+                            else "encoder did not produce a valid JPEG XL file"
+                        ),
+                    )
+                else:
+                    high_effort = assess_candidate(
+                        partial_path,
+                        orig_size,
+                        signature_check=jxl_has_valid_signature,
+                        decode_verify=lambda: verify_encoded_page(
+                            candidate_input,
                             partial_path,
                             require_pixel_match=True,
-                        )
-                    except VerificationError as exc:
-                        verification_errors.append(str(exc))
-                        high_effort_reason = str(exc)
-                        high_effort_valid = False
-                elif last_result.stderr:
-                    high_effort_reason = last_result.stderr.strip()
-                else:
-                    high_effort_reason = (
-                        "encoder did not produce a valid JPEG XL file"
+                        ),
+                        verification_errors=(VerificationError,),
                     )
-                high_effort_size = (
-                    get_size(partial_path)
-                    if partial_path.exists() and get_size(partial_path) > 0
-                    else None
-                )
+                if (
+                    not high_effort.ready
+                    and high_effort.size is not None
+                    and high_effort.reason
+                    not in {
+                        "encoder produced no candidate",
+                        "encoder did not produce a valid JPEG XL file",
+                    }
+                ):
+                    verification_errors.append(high_effort.reason)
+                if high_effort.ready:
+                    had_candidate_output = True
                 attempt_records.append(
                     {
                         "mode": conversion_mode,
                         "distance": final_distance,
                         "effort": DEFAULT_JXL_EFFORT,
                         "strategy": "high-effort lossless retry",
-                        "candidate_size": high_effort_size,
-                        "verified": bool(high_effort_valid),
-                        "reason": (
-                            "verified" if high_effort_valid else high_effort_reason
-                        ),
+                        "candidate_size": high_effort.size,
+                        "verified": high_effort.verified,
+                        "reason": high_effort.reason,
                     }
                 )
-                if high_effort_size is not None:
+                if high_effort.size is not None:
                     smallest_candidate_size = min(
                         smallest_candidate_size,
-                        high_effort_size,
+                        high_effort.size,
                     )
-                if high_effort_valid:
-                    candidate_size = int(high_effort_size)
-                    verified_effort = DEFAULT_JXL_EFFORT
-            last_verified_effort = verified_effort
+                if high_effort.ready:
+                    candidate_size = high_effort.size
+                    candidate_verified = high_effort.verified
+                    candidate_effort = DEFAULT_JXL_EFFORT
+            last_verified_effort = candidate_effort
             last_verified_mode = conversion_mode
             last_verified_distance = final_distance
             if candidate_size >= orig_size:
                 if VERBOSE:
                     log(f"   ↪ {conversion_mode} did not save space for {img_path_obj.name}.")
+                continue
+            if not candidate_verified:
+                verification_errors.append(
+                    "smaller JPEG XL candidate was not decode-verified"
+                )
                 continue
 
             os.replace(partial_path, jxl_path)
@@ -2469,7 +2457,7 @@ def convert_single_image(img_path_obj, cli_args, workspace=None, archive_path=No
                 outcome="converted",
                 mode=conversion_mode,
                 distance=final_distance,
-                effort=verified_effort,
+                effort=candidate_effort,
                 reason=(
                     f"Verified JPEG XL candidate saved "
                     f"{orig_size - get_size(jxl_path):,} bytes"
@@ -2483,7 +2471,7 @@ def convert_single_image(img_path_obj, cli_args, workspace=None, archive_path=No
                 )
             return saved, megapixels, conversion_mode, final_distance, True, True, False
 
-        if had_valid_candidate:
+        if had_candidate_output:
             if corrected_path:
                 apply_extension_correction(
                     img_path_obj,
@@ -2500,7 +2488,7 @@ def convert_single_image(img_path_obj, cli_args, workspace=None, archive_path=No
                     distance=0,
                     effort=last_verified_effort,
                     reason=(
-                        "No verified JPEG XL candidate was smaller; "
+                        "No JPEG XL candidate was smaller; "
                         f"filename extension corrected to {corrected_path.suffix}"
                     ),
                     attempts=attempt_records,
@@ -2516,11 +2504,11 @@ def convert_single_image(img_path_obj, cli_args, workspace=None, archive_path=No
                 )
             retained_mode = "Smart retained original" if cli_args.smart_distance else "Retained original"
             size_reason = (
-                f"Smallest verified JPEG XL candidate was "
+                f"Smallest JPEG XL candidate was "
                 f"{smallest_candidate_size - orig_size:,} bytes larger"
                 if smallest_candidate_size is not None
                 and smallest_candidate_size > orig_size
-                else "Smallest verified JPEG XL candidate was not smaller"
+                else "Smallest JPEG XL candidate was not smaller"
             )
             record_decision(
                 source_size=orig_size,
@@ -3237,6 +3225,7 @@ def process_cbz(
 
         final_size = original_cbz_size - conversion_saved_bytes
         final_fingerprint = fingerprint
+        size_variance_kind = None
         if not DRY_RUN:
             scratch_file = tempfile.NamedTemporaryFile(prefix="cbzxl-repack-", suffix=".cbz", dir=get_scratch_dir(), delete=False)
             candidate = Path(scratch_file.name)
@@ -3266,36 +3255,13 @@ def process_cbz(
                     heartbeat=lambda: emit_heartbeat(archive=rel_path_str, stage="verifying"),
                     original_files=workspace.manifest.get("original_files", []),
                     completed_pages=workspace.manifest.get("completed_pages", {}),
-                    required_decode_entries=(
-                        [
-                            page.get("output")
-                            for page in workspace.manifest.get(
-                                "completed_pages",
-                                {},
-                            ).values()
-                            if page.get("output")
-                        ]
-                        + (
-                            [
-                                path
-                                for path in workspace.manifest.get(
-                                    "original_files",
-                                    [],
-                                )
-                                if Path(path).suffix.lower() == ".jxl"
-                            ]
-                            if repair_action in {
-                                "salvage",
-                                "salvage_partial",
-                                "restore_original",
-                                "restore_reconvert",
-                            }
-                            else [
-                                path
-                                for path in repair_entries
-                                if Path(path).suffix.lower() == ".jxl"
-                            ]
-                        )
+                    required_decode_entries=required_archive_decode_entries(
+                        original_files=workspace.manifest.get(
+                            "original_files",
+                            [],
+                        ),
+                        repair_action=repair_action,
+                        repair_entries=repair_entries,
                     ),
                 )
                 emit(
@@ -3306,6 +3272,20 @@ def process_cbz(
                     stage="committing",
                     **verification,
                 )
+                candidate_size = candidate.stat().st_size
+                extension_overhead = extension_overhead_from_manifest(
+                    workspace.manifest.get("completed_pages", {})
+                )
+                if (
+                    not repair_applied
+                    and status
+                    == ConversionStatus.PROCESSED_EXTENSION_CORRECTION
+                    and is_expected_extension_growth(
+                        candidate_size - original_cbz_size,
+                        extension_overhead,
+                    )
+                ):
+                    size_variance_kind = EXPECTED_EXTENSION_OVERHEAD
                 if (
                     (
                         repair_action
@@ -3316,7 +3296,7 @@ def process_cbz(
                             != ConversionStatus.PROCESSED_EXTENSION_CORRECTION
                         )
                     )
-                    and candidate.stat().st_size >= original_cbz_size
+                    and candidate_size >= original_cbz_size
                 ):
                     workspace.discard_conversion_decisions(
                         "the complete replacement archive was not smaller"
@@ -3360,7 +3340,6 @@ def process_cbz(
                         fingerprint,
                     )
                     candidate_fingerprint = archive_fingerprint(candidate)
-                    candidate_size = candidate.stat().st_size
                     commit_phase_started = True
                     record_archive_commit_intent(
                         conn_main,
@@ -3383,6 +3362,7 @@ def process_cbz(
                             "lossless_pages": lossless_pages,
                             "lossy_pages": lossy_pages,
                             "retained_pages": retained_pages,
+                            "size_variance_kind": size_variance_kind,
                             "page_decisions": workspace.manifest.get(
                                 "page_decisions",
                                 {},
@@ -3421,6 +3401,7 @@ def process_cbz(
             lossy_pages=lossy_pages,
             retained_pages=retained_pages,
             commit=False,
+            size_variance_kind=size_variance_kind,
         )
         persist_page_decisions(
             conn_main,
@@ -3896,8 +3877,12 @@ def main():
     SUPPRESS_SKIPPED = args.suppress_skipped or args.quiet
     BACKUP_ENABLED = args.backup
     JXL_EFFORT = args.effort
-    THREADS = args.threads
-    ENCODER_THREADS = args.encoder_threads
+    THREADS = clamp_cpu_budget(args.threads)
+    ENCODER_THREADS = (
+        clamp_cpu_budget(args.encoder_threads, limit=THREADS)
+        if args.encoder_threads is not None
+        else None
+    )
     RECHECK_ALL = (
         args.recheck_all
         or args.integrity_audit

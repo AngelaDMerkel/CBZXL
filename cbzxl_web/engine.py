@@ -15,6 +15,7 @@ import zlib
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+from cbzxl_web.conversion.parallelism import plan_parallelism
 
 PARTIAL_SUFFIX = ".cbzxl-partial"
 LOCAL_FILE_HEADER = struct.Struct("<4s5H3L2H")
@@ -841,12 +842,3 @@ def verify_archive(
         "jxl_entries": len(jxl_paths),
         "decoded_samples": len(decode_paths),
     }
-
-
-def plan_parallelism(cpu_budget, page_count, encoder_threads=None):
-    budget = max(1, int(cpu_budget or 1))
-    workers = max(1, min(int(page_count or 1), budget, 4))
-    threads = max(1, int(encoder_threads or budget // workers))
-    while workers * threads > budget and workers > 1:
-        workers -= 1
-    return workers, threads

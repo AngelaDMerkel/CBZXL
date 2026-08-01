@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from cbzxl_web import database
@@ -54,6 +55,52 @@ class WorkerProtocolTests(unittest.TestCase):
         self.assertEqual(live["current_stage"], "encoding")
         self.assertEqual(live["current_page"], 4)
         self.assertEqual(live["total_pages"], 20)
+
+    def test_archive_rate_is_calculated_only_in_ram(self):
+        started = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        persist_output(
+            self.job_id,
+            encode_event(
+                "job_started",
+                message="Conversion started",
+                archives_found=10,
+                stage="discovering",
+                at=started.isoformat().replace("+00:00", "Z"),
+            ),
+        )
+        for index in range(3):
+            archive_started = started + timedelta(seconds=index * 2)
+            persist_output(
+                self.job_id,
+                encode_event(
+                    "archive_started",
+                    archive=f"Book {index}.cbz",
+                    at=archive_started.isoformat().replace("+00:00", "Z"),
+                ),
+            )
+            persist_output(
+                self.job_id,
+                encode_event(
+                    "archive_completed",
+                    archive=f"Book {index}.cbz",
+                    bytes_saved=0,
+                    at=(archive_started + timedelta(seconds=1))
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                ),
+            )
+
+        live = runtime_state.read_live_job(self.job_id)
+        with database.connect() as conn:
+            sample_count = conn.execute(
+                "SELECT COUNT(*) FROM job_progress_samples WHERE job_id=?",
+                (self.job_id,),
+            ).fetchone()[0]
+
+        self.assertEqual(live["processed"], 3)
+        self.assertEqual(live["rolling_rate_per_minute"], 30.0)
+        self.assertEqual(live["recent_archive_seconds"], 1.0)
+        self.assertEqual(sample_count, 0)
 
     def test_legacy_text_is_ignored_after_structured_protocol_starts(self):
         persist_output(

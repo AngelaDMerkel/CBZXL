@@ -65,6 +65,7 @@ class SmartPolicyTests(unittest.TestCase):
             result = cbzxl.convert_single_image(source, args)
 
         self.assertEqual(efforts, [7, 10])
+        self.assertEqual(cbzxl.verify_encoded_page.call_count, 1)
         self.assertTrue(result[5])
         self.assertEqual(source.with_suffix(".jxl").stat().st_size, 300)
 
@@ -164,6 +165,7 @@ class SmartPolicyTests(unittest.TestCase):
         ):
             result = cbzxl.convert_single_image(source, self.args(smart_mb=0.00001, smart_mp=100))
         self.assertEqual(distances, [0, 0.5])
+        self.assertEqual(cbzxl.verify_encoded_page.call_count, 0)
         self.assertTrue(result[4])
         self.assertFalse(result[5])
         self.assertTrue(source.exists())
@@ -193,6 +195,7 @@ class SmartPolicyTests(unittest.TestCase):
 
         self.assertTrue(result[4])
         self.assertFalse(result[5])
+        self.assertEqual(cbzxl.verify_encoded_page.call_count, 0)
         self.assertTrue(source.exists())
         self.assertFalse(source.with_suffix(".jxl").exists())
 

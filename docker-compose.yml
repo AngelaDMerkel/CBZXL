@@ -15,6 +15,7 @@ x-cbzxl-common: &cbzxl-common
     WORKSPACE_DIR: /dev/shm/cbzxl/workspaces
     LOG_FILE: ""
     RUNTIME_DIR: /runtime
+    CPU_LIMIT: ${CBZXL_CPU_LIMIT:-4}
     DURABLE_CHECKPOINT_SECONDS: "300"
     DURABLE_CHECKPOINT_ARCHIVES: "10000"
     PAGE_DECISION_RETENTION_DAYS: "180"
@@ -53,4 +54,4 @@ services:
     <<: *cbzxl-common
     container_name: CBZXL-Worker
     command: ["python", "-m", "cbzxl_web.worker"]
-    cpus: "4.0"
+    cpus: ${CBZXL_CPU_LIMIT:-4}

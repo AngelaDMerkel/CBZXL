@@ -342,16 +342,23 @@ class ApiTests(unittest.TestCase):
                 INSERT INTO archive_results(
                     job_id, path, status, image_count, converted_pages,
                     lossless_pages, retained_pages, bytes_saved, percent_saved,
-                    conversion_mode, converted_at
+                    conversion_mode, size_variance_kind, converted_at
                 ) VALUES
                     (?, 'New.cbz', 'processed', 5, 5, 5, 0, 2048, 12,
-                     'Lossless', ?),
+                     'Lossless', NULL, ?),
                     (?, 'Larger.cbz', 'processed', 4, 0, 0, 4, 0, 0,
-                     'Original retained', ?),
+                     'Original retained', NULL, ?),
+                    (?, 'Corrected.cbz', 'processed', 3, 0, 0, 3, -6, -0.1,
+                     'Extension correction', 'extension_overhead', ?),
                     (?, 'Broken.cbz', 'failed', 0, 0, 0, 0, 0, 0,
-                     'N/A', ?)
+                     'N/A', NULL, ?)
                 """,
-                (job["id"], now, job["id"], now, job["id"], now),
+                (
+                    job["id"], now,
+                    job["id"], now,
+                    job["id"], now,
+                    job["id"], now,
+                ),
             )
 
         response = self.client.get(f"/api/jobs/{job['id']}/history")
@@ -363,15 +370,16 @@ class ApiTests(unittest.TestCase):
             {
                 "optimized": 1,
                 "already_current": 1,
-                "retained": 2,
+                "retained": 3,
                 "failed": 1,
-                "all": 5,
+                "all": 6,
             },
         )
         labels = {row["path"]: row["label"] for row in payload["history_entries"]}
         self.assertEqual(labels["Already.cbz"], "Already optimized")
         self.assertEqual(labels["Retained.cbz"], "Original retained")
         self.assertEqual(labels["New.cbz"], "Optimized")
+        self.assertEqual(labels["Corrected.cbz"], "Filenames corrected")
         self.assertEqual(labels["Broken.cbz"], "Conversion failed")
 
     def test_issue_retry_is_context_aware_and_path_scoped(self):
@@ -423,6 +431,31 @@ class ApiTests(unittest.TestCase):
         dashboard = self.client.get("/api/dashboard").json()
         self.assertEqual(dashboard["review"]["total"], 1)
         self.assertEqual(dashboard["review"]["grew"], 1)
+
+    def test_expected_filename_overhead_remains_in_net_savings_without_attention(self):
+        with database.transaction() as conn:
+            library = database.default_library(conn)
+            now = database.utc_now()
+            conn.execute(
+                """
+                INSERT INTO archives(
+                    library_id, path, status, original_size, final_size,
+                    bytes_saved, percent_saved, size_variance_kind,
+                    created_at, updated_at
+                ) VALUES (?, 'Series/Corrected.cbz', 'processed', ?, ?, ?, -1,
+                          'extension_overhead', ?, ?)
+                """,
+                (library["id"], 100 * 1024**3, 101 * 1024**3, -(1024**3), now, now),
+            )
+
+        dashboard = self.client.get("/api/dashboard").json()
+        review = self.client.get("/api/archives?review=needs_review").json()
+
+        self.assertEqual(dashboard["totals"]["grew_count"], 0)
+        self.assertEqual(dashboard["totals"]["increased_gb"], 1)
+        self.assertEqual(dashboard["totals"]["net_gb"], -1)
+        self.assertEqual(dashboard["review"]["total"], 0)
+        self.assertEqual(review["total"], 0)
 
     def test_archive_growth_hides_backup_remedies_when_original_is_unavailable(self):
         issue_id = self.create_growth_issue()
