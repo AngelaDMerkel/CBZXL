@@ -68,7 +68,7 @@ from cbzxl_web.repositories.commit_intents import CommitIntentRepository
 # Default Constants (can be overwritten by args)
 DEFAULT_JXL_EFFORT = 10
 DEFAULT_THREADS = 10
-SCRIPT_VERSION = "4.5.4"
+SCRIPT_VERSION = "4.5.5"
 
 # Constants for use only in the Docker Container.
 CONFIG_DIR = os.getenv("CONFIG_DIR", "/config")
@@ -1955,7 +1955,8 @@ def verify_encoded_page(source_path, jxl_path, *, require_pixel_match):
     )
     decoded_path = None
     try:
-        decoded = None
+        decoded_signature = None
+        last_decode_error = "No decoder result"
         for decode_suffix in decode_suffixes:
             handle, decoded_name = tempfile.mkstemp(
                 prefix="cbzxl-verify-page-",
@@ -1977,25 +1978,29 @@ def verify_encoded_page(source_path, jxl_path, *, require_pixel_match):
                 max_seconds=SUBPROCESS_TIMEOUT,
                 discard_stdout=True,
             )
-            if (
-                decoded.returncode == 0
-                and decoded_path.is_file()
-                and get_size(decoded_path) > 0
-            ):
-                break
-            decoded_path.unlink(missing_ok=True)
-        if (
-            decoded is None
-            or decoded.returncode != 0
-            or decoded_path is None
-            or not decoded_path.is_file()
-            or get_size(decoded_path) == 0
-        ):
+            if decoded.returncode != 0:
+                last_decode_error = decoded.stderr.strip() or "Decoder exited unsuccessfully"
+                decoded_path.unlink(missing_ok=True)
+                decoded_path = None
+                continue
+            if not decoded_path.is_file() or get_size(decoded_path) == 0:
+                last_decode_error = "Decoder did not create a non-empty output file"
+                decoded_path.unlink(missing_ok=True)
+                decoded_path = None
+                continue
+            try:
+                decoded_signature = image_pixel_signature(decoded_path)
+            except VerificationError as error:
+                last_decode_error = str(error)
+                decoded_path.unlink(missing_ok=True)
+                decoded_path = None
+                continue
+            break
+        if decoded_signature is None:
             raise VerificationError(
                 f"JPEG XL decode check failed for {Path(jxl_path).name}: "
-                f"{decoded.stderr.strip() if decoded else 'No decoder result'}"
+                f"{last_decode_error}"
             )
-        decoded_signature = image_pixel_signature(decoded_path)
         source_signature = image_pixel_signature(source_path)
         if " ".join(source_signature.split()[:3]) != " ".join(
             decoded_signature.split()[:3]

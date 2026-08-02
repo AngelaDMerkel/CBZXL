@@ -231,6 +231,43 @@ class SmartPolicyTests(unittest.TestCase):
                     require_pixel_match=True,
                 )
 
+    def test_lossless_jpeg_verification_retries_png_when_jpeg_signature_fails(self):
+        source = self.root / "source.jpg"
+        source.write_bytes(b"source")
+        candidate = self.root / "candidate.jxl"
+        candidate.write_bytes(JXL_SIGNATURE)
+        decoded_suffixes = []
+
+        def decode(command, *_args, **_kwargs):
+            decoded_path = Path(command[2])
+            decoded_suffixes.append(decoded_path.suffix)
+            decoded_path.write_bytes(b"decoded")
+            return CommandResult(0, "", "")
+
+        def signature(path):
+            path = Path(path)
+            if path != source and path.suffix == ".jpg":
+                raise cbzxl.VerificationError("JPEG decoder unavailable")
+            return "100 100 srgba matching-hash"
+
+        with (
+            patch.object(cbzxl, "run_cancellable", side_effect=decode),
+            patch.object(cbzxl, "image_pixel_signature", side_effect=signature),
+            patch.object(
+                cbzxl,
+                "verify_encoded_page",
+                side_effect=self.real_verify_page,
+            ),
+        ):
+            result = cbzxl.verify_encoded_page(
+                source,
+                candidate,
+                require_pixel_match=True,
+            )
+
+        self.assertEqual(result, "100 100 srgba matching-hash")
+        self.assertEqual(decoded_suffixes, [".jpg", ".png"])
+
     def test_failed_encoder_uses_normalized_single_thread_fallback(self):
         source = self.root / "fallback.jpg"
         source.write_bytes(b"jpeg" * 100)
