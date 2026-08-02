@@ -682,10 +682,13 @@ class EphemeralWorkspace:
             self._write_manifest()
 
     def discard_conversion_decisions(self, reason):
-        """Describe pages whose candidates were discarded with the archive."""
+        """Describe page changes that were discarded with the candidate archive."""
         with self._lock:
             for decision in self.manifest.get("page_decisions", {}).values():
-                if decision.get("outcome") != "converted":
+                if decision.get("outcome") not in {
+                    "converted",
+                    "extension_corrected",
+                }:
                     continue
                 decision["outcome"] = "retained"
                 decision["final_size"] = decision.get("source_size")

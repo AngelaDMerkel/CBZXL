@@ -35,6 +35,49 @@ class ConverterPersistenceTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    @staticmethod
+    def stage_extension_correction(temp_dir, _args, workspace, _archive_path):
+        source = temp_dir / "pages/001.jpg"
+        target = source.with_suffix(".webp")
+        source_size = source.stat().st_size
+        source.replace(target)
+        workspace.record_page(
+            "pages/001.jpg",
+            "pages/001.webp",
+            target.stat().st_size,
+            "Extension corrected",
+            operation="extension_corrected",
+            detected_extension=".webp",
+        )
+        workspace.record_decision(
+            "pages/001.jpg",
+            source_format="image/webp",
+            source_size=source_size,
+            candidate_size=None,
+            final_size=target.stat().st_size,
+            outcome="extension_corrected",
+            mode="Extension corrected",
+            distance=0,
+            effort=None,
+            reason="Filename extension corrected to .webp",
+            attempts=[],
+        )
+        return (
+            cbzxl.ConversionStatus.PROCESSED_EXTENSION_CORRECTION,
+            0,
+            "",
+            "WebP",
+            1,
+            1,
+            0,
+            "N/A",
+            "N/A",
+            0,
+            0,
+            0,
+            1,
+        )
+
     def test_unchanged_archive_context_distinguishes_prior_conversion_from_retention(self):
         optimized = cbzxl.unchanged_archive_context(
             {
@@ -625,6 +668,115 @@ class ConverterPersistenceTests(unittest.TestCase):
         self.assertLessEqual(archive_path.stat().st_size, original_size)
         if archive_path.stat().st_size == original_size:
             self.assertEqual(archive_path.read_bytes(), original_bytes)
+        conn.close()
+
+    def test_extension_correction_rejects_growth_beyond_filename_overhead(self):
+        library_root = (Path(self.temp.name) / "library").resolve()
+        library_root.mkdir()
+        archive_path = library_root / "Mislabeled.cbz"
+        with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("pages/001.jpg", b"compressible-webp" * 4096)
+        original_bytes = archive_path.read_bytes()
+        original_size = len(original_bytes)
+        cbzxl.SCRATCH_DIR = Path(self.temp.name) / "scratch"
+        cbzxl.WORKSPACE_DIR = Path(self.temp.name) / "workspace"
+        args = SimpleNamespace(
+            input_dir=str(library_root),
+            no_convert=False,
+            smart_distance=False,
+            distance=None,
+            smart_mb=10.0,
+            smart_mp=5.0,
+            compatibility_mode=False,
+            continue_on_page_error=False,
+            repair_action=None,
+            repair_entry=None,
+            repair_entries=[],
+            repair_source=None,
+        )
+
+        conn = cbzxl.init_db(cbzxl.DB_FILE)
+        with mock.patch.object(
+            cbzxl,
+            "convert_images",
+            side_effect=self.stage_extension_correction,
+        ):
+            outcome = cbzxl.process_cbz(archive_path, conn, None, args)
+
+        self.assertEqual(outcome, (0, False, False, "processed"))
+        self.assertEqual(archive_path.stat().st_size, original_size)
+        self.assertEqual(archive_path.read_bytes(), original_bytes)
+        with database.connect() as check:
+            result = check.execute(
+                """
+                SELECT original_size, final_size, bytes_saved
+                FROM archive_results WHERE path='Mislabeled.cbz'
+                """
+            ).fetchone()
+            decision = check.execute(
+                """
+                SELECT outcome, final_size, reason
+                FROM page_decisions WHERE path='Mislabeled.cbz'
+                """
+            ).fetchone()
+        self.assertEqual(tuple(result), (original_size, original_size, 0))
+        self.assertEqual(decision["outcome"], "retained")
+        self.assertIn("complete replacement archive was not smaller", decision["reason"])
+        conn.close()
+
+    def test_extension_correction_allows_only_proven_filename_overhead(self):
+        library_root = (Path(self.temp.name) / "allowed-library").resolve()
+        library_root.mkdir()
+        archive_path = library_root / "Mislabeled.cbz"
+        with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_STORED) as archive:
+            archive.writestr("pages/001.jpg", b"webp-content")
+        original_size = archive_path.stat().st_size
+        cbzxl.SCRATCH_DIR = Path(self.temp.name) / "allowed-scratch"
+        cbzxl.WORKSPACE_DIR = Path(self.temp.name) / "allowed-workspace"
+        args = SimpleNamespace(
+            input_dir=str(library_root),
+            no_convert=False,
+            smart_distance=False,
+            distance=None,
+            smart_mb=10.0,
+            smart_mp=5.0,
+            compatibility_mode=False,
+            continue_on_page_error=False,
+            repair_action=None,
+            repair_entry=None,
+            repair_entries=[],
+            repair_source=None,
+        )
+
+        conn = cbzxl.init_db(cbzxl.DB_FILE)
+        with mock.patch.object(
+            cbzxl,
+            "convert_images",
+            side_effect=self.stage_extension_correction,
+        ):
+            outcome = cbzxl.process_cbz(archive_path, conn, None, args)
+
+        self.assertEqual(outcome, (-2, False, False, "processed"))
+        self.assertEqual(archive_path.stat().st_size, original_size + 2)
+        with zipfile.ZipFile(archive_path) as corrected:
+            self.assertEqual(corrected.namelist(), ["pages/001.webp"])
+        with database.connect() as check:
+            archive = check.execute(
+                """
+                SELECT bytes_saved, size_variance_kind
+                FROM archives WHERE path='Mislabeled.cbz'
+                """
+            ).fetchone()
+            issue_count = check.execute(
+                """
+                SELECT COUNT(*)
+                FROM archive_issues ai
+                JOIN archives a ON a.id=ai.archive_id
+                WHERE a.path='Mislabeled.cbz' AND ai.status IN ('open', 'queued')
+                """
+            ).fetchone()[0]
+        self.assertEqual(tuple(archive), (-2, EXPECTED_EXTENSION_OVERHEAD))
+        self.assertEqual(issue_count, 0)
         conn.close()
 
     def test_corrupt_archive_is_recorded_without_terminating_the_run(self):

@@ -68,7 +68,7 @@ from cbzxl_web.repositories.commit_intents import CommitIntentRepository
 # Default Constants (can be overwritten by args)
 DEFAULT_JXL_EFFORT = 10
 DEFAULT_THREADS = 10
-SCRIPT_VERSION = "4.5.3"
+SCRIPT_VERSION = "4.5.4"
 
 # Constants for use only in the Docker Container.
 CONFIG_DIR = os.getenv("CONFIG_DIR", "/config")
@@ -3276,24 +3276,31 @@ def process_cbz(
                 extension_overhead = extension_overhead_from_manifest(
                     workspace.manifest.get("completed_pages", {})
                 )
-                if (
+                is_extension_correction = (
                     not repair_applied
                     and status
                     == ConversionStatus.PROCESSED_EXTENSION_CORRECTION
+                )
+                expected_extension_growth = (
+                    is_extension_correction
                     and is_expected_extension_growth(
                         candidate_size - original_cbz_size,
                         extension_overhead,
                     )
-                ):
+                )
+                if expected_extension_growth:
                     size_variance_kind = EXPECTED_EXTENSION_OVERHEAD
+                extension_size_allowed = is_extension_correction and (
+                    candidate_size <= original_cbz_size
+                    or expected_extension_growth
+                )
                 if (
                     (
                         repair_action
                         in {"restore_original", "restore_reconvert", "repack"}
                         or (
                             not repair_applied
-                            and status
-                            != ConversionStatus.PROCESSED_EXTENSION_CORRECTION
+                            and not extension_size_allowed
                         )
                     )
                     and candidate_size >= original_cbz_size

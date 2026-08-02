@@ -100,7 +100,9 @@ Smart lossy never bypasses that order. It first attempts lossless JPEG XL. A
 lossy candidate is attempted only when the configured size or resolution
 threshold is met and lossless did not save space; it must also be smaller to be
 kept. A final archive-level guard rejects an ordinary conversion if container
-overhead would still make the complete CBZ larger.
+overhead would still make the complete CBZ larger. Filename corrections may add
+only their precisely calculated ZIP entry-name overhead; any excess growth
+causes CBZXL to retain the original archive.
 
 The production image contains libjxl 0.12.0. Encoding defaults to effort 10;
 effort 11 is available as expert mode. If a lower configured effort produces a

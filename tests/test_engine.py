@@ -138,6 +138,30 @@ class EngineTests(unittest.TestCase):
         self.assertTrue((workspace.files / "001.jpg").exists())
         self.assertFalse((workspace.files / "001.webp").exists())
 
+    def test_discarded_archive_marks_extension_correction_as_retained(self):
+        fingerprint = archive_fingerprint(self.archive)
+        workspace = ResumeWorkspace(
+            self.root / "discard-extension",
+            self.archive,
+            fingerprint,
+            options_fingerprint({"extension": "correct"}),
+        )
+        workspace.prepare(1024 * 1024, CancellationToken())
+        workspace.record_decision(
+            "001.jpg",
+            source_size=100,
+            final_size=100,
+            outcome="extension_corrected",
+            reason="Filename extension corrected to .webp",
+        )
+
+        workspace.discard_conversion_decisions("archive candidate was larger")
+
+        decision = workspace.manifest["page_decisions"]["001.jpg"]
+        self.assertEqual(decision["outcome"], "retained")
+        self.assertEqual(decision["final_size"], 100)
+        self.assertIn("archive candidate was larger", decision["reason"])
+
     def test_replacement_keeps_the_original_internal_filename(self):
         workspace = ResumeWorkspace(
             self.root / "resume-replace",

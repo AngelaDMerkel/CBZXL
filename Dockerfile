@@ -19,7 +19,7 @@ RUN /opt/libjxl/tools/cjxl --version 2>&1 | grep -F "v${LIBJXL_VERSION}" \
     && /opt/libjxl/tools/djxl --version 2>&1 | grep -F "v${LIBJXL_VERSION}"
 
 FROM python:3.13-alpine
-LABEL name="cbzxl-web" version="4.5.3"
+LABEL name="cbzxl-web" version="4.5.4"
 
 RUN apk add --no-cache tzdata imagemagick file
 COPY --from=libjxl /opt/libjxl/tools/cjxl /usr/local/bin/cjxl
