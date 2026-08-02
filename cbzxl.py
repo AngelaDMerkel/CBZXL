@@ -68,7 +68,7 @@ from cbzxl_web.repositories.commit_intents import CommitIntentRepository
 # Default Constants (can be overwritten by args)
 DEFAULT_JXL_EFFORT = 10
 DEFAULT_THREADS = 10
-SCRIPT_VERSION = "4.5.0"
+SCRIPT_VERSION = "4.5.3"
 
 # Constants for use only in the Docker Container.
 CONFIG_DIR = os.getenv("CONFIG_DIR", "/config")

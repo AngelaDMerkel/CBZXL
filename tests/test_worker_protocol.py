@@ -2,11 +2,18 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 from cbzxl_web import database
 from cbzxl_web import runtime_state
 from cbzxl_web.protocol import encode_event
-from cbzxl_web.worker import STRUCTURED_JOBS, command_for_job, failure_output, persist_output
+from cbzxl_web.worker import (
+    STRUCTURED_JOBS,
+    command_for_job,
+    failure_output,
+    notify_finished_job,
+    persist_output,
+)
 
 
 class WorkerProtocolTests(unittest.TestCase):
@@ -202,6 +209,62 @@ class WorkerProtocolTests(unittest.TestCase):
         self.assertNotIn("ordinary progress", detail)
         self.assertTrue(detail.startswith("Traceback"))
         self.assertIn("zipfile.BadZipFile", detail)
+
+    def test_ntfy_delivery_is_recorded_without_changing_job_status(self):
+        with database.transaction() as conn:
+            conn.execute(
+                "UPDATE jobs SET status='succeeded' WHERE id=?", (self.job_id,)
+            )
+            job = dict(
+                conn.execute(
+                    "SELECT * FROM jobs WHERE id=?", (self.job_id,)
+                ).fetchone()
+            )
+        with mock.patch(
+            "cbzxl_web.worker.publish_job_notification", return_value=True
+        ):
+            self.assertTrue(notify_finished_job(job, {"name": "Library"}))
+
+        with database.connect() as conn:
+            status = conn.execute(
+                "SELECT status FROM jobs WHERE id=?", (self.job_id,)
+            ).fetchone()[0]
+            event = conn.execute(
+                "SELECT event_type FROM job_events WHERE job_id=? ORDER BY id DESC",
+                (self.job_id,),
+            ).fetchone()[0]
+        self.assertEqual(status, "succeeded")
+        self.assertEqual(event, "notification_sent")
+
+    def test_ntfy_failure_is_non_fatal_and_recorded(self):
+        with database.transaction() as conn:
+            conn.execute(
+                "UPDATE jobs SET status='succeeded' WHERE id=?", (self.job_id,)
+            )
+            job = dict(
+                conn.execute(
+                    "SELECT * FROM jobs WHERE id=?", (self.job_id,)
+                ).fetchone()
+            )
+        with (
+            mock.patch(
+                "cbzxl_web.worker.publish_job_notification",
+                side_effect=TimeoutError("timed out"),
+            ),
+            mock.patch("builtins.print"),
+        ):
+            self.assertFalse(notify_finished_job(job, {"name": "Library"}))
+
+        with database.connect() as conn:
+            status = conn.execute(
+                "SELECT status FROM jobs WHERE id=?", (self.job_id,)
+            ).fetchone()[0]
+            event = conn.execute(
+                "SELECT event_type FROM job_events WHERE job_id=? ORDER BY id DESC",
+                (self.job_id,),
+            ).fetchone()[0]
+        self.assertEqual(status, "succeeded")
+        self.assertEqual(event, "notification_failed")
 
 
 if __name__ == "__main__":

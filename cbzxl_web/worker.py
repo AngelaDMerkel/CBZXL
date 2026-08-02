@@ -23,6 +23,7 @@ from .database import (
     transaction,
     utc_now,
 )
+from .notifications import publish_job_notification
 from .protocol import PROTOCOL_PREFIX, parse_event
 from .runtime_state import clear_live_job, publish_event
 
@@ -33,6 +34,36 @@ POLL_SECONDS = float(os.getenv("WORKER_POLL_SECONDS", "2"))
 STALL_SECONDS = int(os.getenv("WORKER_STALL_SECONDS", "900"))
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 STRUCTURED_JOBS = set()
+
+
+def _record_notification_event(job_id, level, event_type, message):
+    try:
+        with transaction() as conn:
+            add_event(conn, job_id, level, event_type, message)
+    except Exception as exc:
+        print(
+            f"Could not record ntfy delivery status: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def notify_finished_job(job, library=None):
+    """Publish a terminal job without allowing notification errors to stop work."""
+    try:
+        sent = publish_job_notification(job, library)
+    except Exception as exc:
+        message = f"ntfy notification failed: {exc}"
+        print(message, file=sys.stderr, flush=True)
+        _record_notification_event(
+            job["id"], "warning", "notification_failed", message
+        )
+        return False
+    if sent:
+        _record_notification_event(
+            job["id"], "success", "notification_sent", "ntfy notification sent"
+        )
+    return sent
 
 
 def command_for_job(job, library):
@@ -203,6 +234,8 @@ def run_job(job):
         with transaction() as conn:
             conn.execute("UPDATE jobs SET status='failed', finished_at=?, error_message=? WHERE id=?", (utc_now(), "Library configuration is missing", job["id"]))
             add_event(conn, job["id"], "error", "failed", "Library configuration is missing")
+            finished_job = row_dict(conn.execute("SELECT * FROM jobs WHERE id=?", (job["id"],)).fetchone())
+        notify_finished_job(finished_job)
         return
 
     options = json.loads(job["options_json"])
@@ -314,8 +347,10 @@ def run_job(job):
                 message,
                 data={"return_code": return_code, "output": detail} if return_code else None,
             )
+        finished_job = row_dict(conn.execute("SELECT * FROM jobs WHERE id=?", (job["id"],)).fetchone())
     clear_live_job(job["id"])
     STRUCTURED_JOBS.discard(job["id"])
+    notify_finished_job(finished_job, library)
 
 
 def main():

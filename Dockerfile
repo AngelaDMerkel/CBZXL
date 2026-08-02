@@ -19,7 +19,7 @@ RUN /opt/libjxl/tools/cjxl --version 2>&1 | grep -F "v${LIBJXL_VERSION}" \
     && /opt/libjxl/tools/djxl --version 2>&1 | grep -F "v${LIBJXL_VERSION}"
 
 FROM python:3.13-alpine
-LABEL name="cbzxl-web" version="4.5.0"
+LABEL name="cbzxl-web" version="4.5.3"
 
 RUN apk add --no-cache tzdata imagemagick file
 COPY --from=libjxl /opt/libjxl/tools/cjxl /usr/local/bin/cjxl
@@ -41,7 +41,6 @@ ENV PYTHONUNBUFFERED=1 \
     SCRATCH_DIR=/dev/shm/cbzxl \
     WORKSPACE_DIR=/dev/shm/cbzxl/workspaces \
     RUNTIME_DIR=/dev/shm/cbzxl-runtime \
-    CPU_LIMIT=4 \
     DURABLE_CHECKPOINT_SECONDS=300 \
     DURABLE_CHECKPOINT_ARCHIVES=10000 \
     PAGE_DECISION_RETENTION_DAYS=180 \

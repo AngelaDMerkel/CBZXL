@@ -2,3 +2,4 @@
 **/*.pyc
 .pnpm-store/
 frontend/node_modules/
+stack.env

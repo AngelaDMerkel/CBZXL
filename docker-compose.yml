@@ -1,50 +1,65 @@
 x-cbzxl-common: &cbzxl-common
-  image: angeladmerkel/cbzxl-web:latest
+  image: angeladmerkel/cbzxl-web:4.5.3
   platform: linux/amd64
+  pull_policy: always
+
   volumes:
     - /mnt/Array/Media/Manga:/data
     - /mnt/Array/appdata/cbzxl:/config
     - /dev/shm/cbzxl-runtime:/runtime
-  environment:
+
+  environment: &cbzxl-environment
     TZ: America/New_York
     PYTHONUNBUFFERED: "1"
+
     CONFIG_DIR: /config
     DB_PATH: /config/cbzxl-v3.sqlite3
     LIBRARY_PATH: /data
+
     SCRATCH_DIR: /dev/shm/cbzxl
     WORKSPACE_DIR: /dev/shm/cbzxl/workspaces
-    LOG_FILE: ""
     RUNTIME_DIR: /runtime
-    CPU_LIMIT: ${CBZXL_CPU_LIMIT:-4}
-    DURABLE_CHECKPOINT_SECONDS: "300"
-    DURABLE_CHECKPOINT_ARCHIVES: "10000"
-    PAGE_DECISION_RETENTION_DAYS: "180"
-    ARCHIVE_STABLE_SECONDS: "90"
-    AUTO_RETRY_ATTEMPTS: "1"
-    DATABASE_MAINTENANCE_SECONDS: "604800"
-    MIGRATION_BACKUP_KEEP: "3"
-    WORKER_STALL_SECONDS: "900"
+
     TMPDIR: /dev/shm
     TEMP: /dev/shm
     TMP: /dev/shm
+
+    LOG_FILE: ""
+    CPU_LIMIT: ${CBZXL_CPU_LIMIT:-8}
+
+    DURABLE_CHECKPOINT_SECONDS: "600"
+    DURABLE_CHECKPOINT_ARCHIVES: "10000"
+    PAGE_DECISION_RETENTION_DAYS: "180"
+
+    WORKER_STALL_SECONDS: "900"
     MAX_ARCHIVE_UNCOMPRESSED_MB: "8192"
+
+  shm_size: 32g
+  mem_limit: 32g
+  pids_limit: 512
+
   security_opt:
     - no-new-privileges:true
+
   cap_drop:
     - ALL
-  shm_size: ${CBZXL_SHM_SIZE:-32g}
-  mem_limit: ${CBZXL_MEMORY_LIMIT:-32g}
-  pids_limit: 512
+
   restart: unless-stopped
 
 services:
   cbzxl-web:
     <<: *cbzxl-common
     container_name: CBZXL-Web
+
     ports:
       - "5000:5000"
+
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health', timeout=5)"]
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health', timeout=5)"
       interval: 30s
       timeout: 10s
       retries: 3
@@ -53,5 +68,13 @@ services:
   cbzxl-worker:
     <<: *cbzxl-common
     container_name: CBZXL-Worker
-    command: ["python", "-m", "cbzxl_web.worker"]
-    cpus: ${CBZXL_CPU_LIMIT:-4}
+    command:
+      - python
+      - -m
+      - cbzxl_web.worker
+    environment:
+      <<: *cbzxl-environment
+      NTFY_URL: ${CBZXL_NTFY_URL:-}
+      NTFY_TOKEN: ${CBZXL_NTFY_TOKEN:-}
+      NTFY_TIMEOUT_SECONDS: ${CBZXL_NTFY_TIMEOUT_SECONDS:-10}
+    cpus: ${CBZXL_CPU_LIMIT:-8}

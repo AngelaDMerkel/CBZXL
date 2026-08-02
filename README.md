@@ -49,7 +49,8 @@ Manual conversion defaults to **Unprocessed** and offers three scopes:
 
 Scheduled runs use the scope saved in their assigned conversion policy. The
 worker persists the queue, claims one job at a time, detects stalled converter
-processes, and launches due daily, weekly, monthly, or interval schedules.
+processes, launches due daily, weekly, monthly, or interval schedules, and can
+publish terminal run summaries to an ntfy topic.
 
 An unreadable or unconvertible archive is recorded for Attention and processing
 continues. A run reaches its terminal state only after every archive in scope
@@ -283,6 +284,26 @@ With `CBZXL_CPU_LIMIT=12`, the WebUI offers budgets up to 12 threads and Compose
 caps the worker at 12 CPUs. A policy can still choose 1, 2, 4, 6, 8, or 12.
 External NAS limits can reduce the effective worker ceiling further.
 
+### ntfy notifications
+
+Set `CBZXL_NTFY_URL` to the full publish URL for a topic on your ntfy server.
+If the topic requires authentication, create a dedicated ntfy access token and
+set `CBZXL_NTFY_TOKEN`. For example, put these values in `stack.env` beside
+`docker-compose.yml`:
+
+```dotenv
+CBZXL_NTFY_URL=https://ntfy.example.com/cbzxl
+CBZXL_NTFY_TOKEN=tk_replace_with_a_dedicated_token
+```
+
+Restart both containers with
+`docker compose --env-file stack.env up -d`. The worker sends one summary when
+a scan succeeds, partially succeeds, fails, or is cancelled. Notification
+delivery is best-effort and cannot change the result of a conversion job. The
+token is optional for topics that allow anonymous publishing, and it is passed
+only to the worker container. `stack.env` is ignored by Git to prevent a real
+token from being committed.
+
 ### Important paths
 
 | Container path | Purpose | Persistence |
@@ -315,13 +336,18 @@ External NAS limits can reduce the effective worker ceiling further.
 | `DATABASE_MAINTENANCE_SECONDS` | `604800` | SQLite maintenance interval; minimum one day |
 | `MIGRATION_BACKUP_KEEP` | `3` | Number of verified pre-migration backups retained |
 | `WORKER_STALL_SECONDS` | `900` | Time without converter heartbeat before worker intervention |
+| `NTFY_URL` | empty | Full ntfy topic publish URL; normally set through `CBZXL_NTFY_URL` |
+| `NTFY_TOKEN` | empty | Optional ntfy bearer token; normally set through `CBZXL_NTFY_TOKEN` |
+| `NTFY_TIMEOUT_SECONDS` | `10` | ntfy publish timeout, clamped to 0.1–30 seconds |
 | `MAX_ARCHIVE_UNCOMPRESSED_MB` | `8192` | Extraction safety ceiling |
 | `ENCODER_MAX_SECONDS` | `0` | Optional per-encode timeout; zero disables it |
 | `AUXILIARY_TIMEOUT_SECONDS` | `300` | Timeout for supporting image inspection commands |
 
 Compose also recognizes `CBZXL_SHM_SIZE`, `CBZXL_MEMORY_LIMIT`, and
-`CBZXL_CPU_LIMIT` for container resource configuration. Temporary-file
-variables should continue to point to `/dev/shm`.
+`CBZXL_CPU_LIMIT` for container resource configuration. ntfy configuration is
+passed as `CBZXL_NTFY_URL`, `CBZXL_NTFY_TOKEN`, and
+`CBZXL_NTFY_TIMEOUT_SECONDS`. Temporary-file variables should continue to point
+to `/dev/shm`.
 
 ## Database lifecycle
 

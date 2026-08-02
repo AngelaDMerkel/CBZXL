@@ -70,7 +70,7 @@ ROOT = Path(__file__).parent
 FRONTEND_DIST = ROOT / "frontend" / "dist"
 LEGACY_STATIC = ROOT / "static"
 
-VERSION = "4.5.0"
+VERSION = "4.5.3"
 LOGGER = logging.getLogger("cbzxl.web")
 DATABASE_STARTUP_ERROR: str | None = None
 
