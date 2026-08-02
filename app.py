@@ -50,6 +50,11 @@ from cbzxl_web.database import (
     utc_now,
 )
 from cbzxl_web.runtime_state import read_live_job
+from cbzxl_web.runtime_dependencies import (
+    RuntimeDependencyError,
+    conversion_runtime_error,
+    validate_conversion_runtime,
+)
 from cbzxl_web.services.attention import (
     issue_group,
     issue_group_filter,
@@ -70,17 +75,30 @@ ROOT = Path(__file__).parent
 FRONTEND_DIST = ROOT / "frontend" / "dist"
 LEGACY_STATIC = ROOT / "static"
 
-VERSION = "4.5.5"
+VERSION = "4.5.6"
 LOGGER = logging.getLogger("cbzxl.web")
 DATABASE_STARTUP_ERROR: str | None = None
+RUNTIME_STARTUP_ERROR: str | None = None
 
 app = FastAPI(title="CBZXL", version=VERSION, docs_url="/api/docs", redoc_url=None)
-app.include_router(create_system_router(connect=connect, version=VERSION))
+app.include_router(
+    create_system_router(
+        connect=connect,
+        version=VERSION,
+        dependency_check=conversion_runtime_error,
+    )
+)
 
 
 @app.on_event("startup")
 def startup():
-    global DATABASE_STARTUP_ERROR
+    global DATABASE_STARTUP_ERROR, RUNTIME_STARTUP_ERROR
+    try:
+        validate_conversion_runtime()
+        RUNTIME_STARTUP_ERROR = None
+    except RuntimeDependencyError as exc:
+        RUNTIME_STARTUP_ERROR = str(exc)
+        LOGGER.critical("Conversion runtime validation failed: %s", exc)
     try:
         initialize()
         DATABASE_STARTUP_ERROR = None
@@ -163,6 +181,7 @@ def hydrate_profile(profile):
 @app.get("/api/bootstrap")
 def bootstrap():
     global DATABASE_STARTUP_ERROR
+    runtime_error = conversion_runtime_error()
     try:
         initialize()
         with connect() as conn:
@@ -180,6 +199,10 @@ def bootstrap():
             "database_path": str(DB_PATH),
             "database_status": "unavailable",
             "database_error": str(exc),
+            "conversion_runtime_status": (
+                "unavailable" if runtime_error else "ok"
+            ),
+            "conversion_runtime_error": runtime_error,
             "timezone": os.getenv("TZ", "UTC"),
         }
     return {
@@ -190,6 +213,8 @@ def bootstrap():
         "database_path": str(DB_PATH),
         "database_status": "ok",
         "database_error": None,
+        "conversion_runtime_status": "unavailable" if runtime_error else "ok",
+        "conversion_runtime_error": runtime_error,
         "timezone": os.getenv("TZ", "UTC"),
     }
 
@@ -1034,6 +1059,12 @@ def get_page_decisions(
 
 @app.post("/api/jobs", status_code=201)
 def enqueue_job(payload: JobCreate):
+    runtime_error = conversion_runtime_error()
+    if runtime_error:
+        raise HTTPException(
+            503,
+            f"Conversion runtime unavailable: {runtime_error}",
+        )
     initialize()
     with transaction(immediate=True) as conn:
         library = row_dict(conn.execute("SELECT * FROM libraries WHERE id=?", (payload.library_id,)).fetchone()) if payload.library_id else default_library(conn)

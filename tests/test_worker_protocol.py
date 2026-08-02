@@ -13,7 +13,9 @@ from cbzxl_web.worker import (
     failure_output,
     notify_finished_job,
     persist_output,
+    main as worker_main,
 )
+from cbzxl_web.runtime_dependencies import RuntimeDependencyError
 
 
 class WorkerProtocolTests(unittest.TestCase):
@@ -137,6 +139,17 @@ class WorkerProtocolTests(unittest.TestCase):
         )
         self.assertEqual(command.count("--no-flatten"), 1)
         self.assertNotIn("--delete-empty-archives", command)
+
+    def test_worker_refuses_to_start_with_a_broken_conversion_runtime(self):
+        with (
+            mock.patch(
+                "cbzxl_web.worker.validate_conversion_runtime",
+                side_effect=RuntimeDependencyError("JPEG decoder unavailable"),
+            ),
+            mock.patch("builtins.print"),
+            self.assertRaisesRegex(SystemExit, "78"),
+        ):
+            worker_main()
 
     def test_worker_rechecks_every_archive_for_entire_library_scope(self):
         command = command_for_job(

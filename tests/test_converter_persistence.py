@@ -815,9 +815,14 @@ class ConverterPersistenceTests(unittest.TestCase):
                 WHERE a.path='Broken.cbz'
                 """
             ).fetchone()
+            job_error = check.execute(
+                "SELECT error_message FROM jobs WHERE id=?",
+                (self.job_id,),
+            ).fetchone()[0]
         self.assertEqual(archive["status"], "failed")
         self.assertIn("zip", archive["error_message"].lower())
         self.assertEqual(tuple(issue), ("archive_corrupt", "extracting"))
+        self.assertIn("zip", job_error.lower())
         conn.close()
 
     def test_scope_attempts_valid_archive_after_multiple_unreadable_archives(self):

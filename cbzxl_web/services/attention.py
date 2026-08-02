@@ -38,10 +38,12 @@ ISSUE_GROUPS = {
         "kinds": {"archive_corrupt"},
     },
     "verification": {
-        "label": "Candidate verification failures",
-        "triage": "Retryable",
-        "recommended": "Retry with compatibility or lossless-only verification",
-        "kinds": {"verification_failed"},
+        "label": "Lossless verification failures",
+        "triage": "Conversion failed",
+        "recommended": (
+            "Restore the conversion runtime, then retry; the original was preserved"
+        ),
+        "kinds": {"verification_failed", "page_verification_failed"},
     },
     "paths": {
         "label": "Unsafe archive paths",
@@ -147,4 +149,3 @@ def issue_group_filter(group_id: str | None) -> tuple[str, list[str]] | None:
         placeholders = ",".join("?" for _ in known)
         return f" AND ai.kind NOT IN ({placeholders})", known
     return None
-

@@ -65,7 +65,20 @@ class NotificationsTests(unittest.TestCase):
         self.assertEqual(title, "CBZXL scan failed")
         self.assertEqual(priority, "max")
         self.assertEqual(tag, "x")
-        self.assertIn("Error: encoder exited unexpectedly", message)
+        self.assertIn("Failure: encoder exited unexpectedly", message)
+
+    def test_partial_message_includes_conversion_failure_detail(self):
+        title, message, priority, tag = job_notification(
+            {
+                **self.job,
+                "error_message": "Lossless JPEG XL verification failed for 001.jpg",
+            }
+        )
+        self.assertEqual(title, "CBZXL scan needs attention")
+        self.assertEqual(priority, "high")
+        self.assertEqual(tag, "warning")
+        self.assertIn("failed 1", message)
+        self.assertIn("Lossless JPEG XL verification failed", message)
 
 
 if __name__ == "__main__":

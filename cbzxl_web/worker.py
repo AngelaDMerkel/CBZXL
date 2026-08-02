@@ -26,6 +26,7 @@ from .database import (
 from .notifications import publish_job_notification
 from .protocol import PROTOCOL_PREFIX, parse_event
 from .runtime_state import clear_live_job, publish_event
+from .runtime_dependencies import RuntimeDependencyError, validate_conversion_runtime
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -354,6 +355,15 @@ def run_job(job):
 
 
 def main():
+    try:
+        validate_conversion_runtime()
+    except RuntimeDependencyError as exc:
+        print(
+            f"FATAL: CBZXL conversion runtime validation failed: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise SystemExit(78) from exc
     initialize()
     recover_interrupted_jobs()
     next_maintenance_check = time.monotonic() + 3600

@@ -93,6 +93,7 @@ function ManualConversion({ bootstrap, onQueued, notify }: {
   notify: (message: string, kind?: "success" | "error") => void;
 }) {
   const profiles = bootstrap.profiles || [];
+  const runtimeUnavailable = bootstrap.conversion_runtime_status === "unavailable";
   const cpuLimit = Math.max(1, Number(bootstrap.capabilities?.cpu_limit || 1));
   const availableCpuOptions = cpuOptions(cpuLimit);
   const defaultProfile = profiles.find((row: Json) => row.is_default) || profiles[0] || {};
@@ -150,7 +151,7 @@ function ManualConversion({ bootstrap, onQueued, notify }: {
   };
 
   return <section className={`manual-conversion breathing ${open ? "open" : ""}`}>
-    {!open ? <button className="manual-launch" type="button" onClick={() => setOpen(true)}>Begin Manual Conversion</button> :
+    {!open ? <button className="manual-launch" type="button" disabled={runtimeUnavailable} onClick={() => setOpen(true)}>{runtimeUnavailable ? "Conversion Runtime Unavailable" : "Begin Manual Conversion"}</button> :
       <form className="manual-form" onSubmit={submit}>
         <div className="choice-stack">
           <div className="choice-nav" role="group" aria-label="Conversion scope">
@@ -1196,6 +1197,7 @@ export default function App() {
   const attention = Number(dashboard.review?.total || 0);
   const active = dashboard.active_jobs?.length > 0;
   const unavailable = bootstrap.database_status === "unavailable";
+  const runtimeUnavailable = bootstrap.conversion_runtime_status === "unavailable";
   const nav = useMemo(() => [
     { id: "overview" as View, label: "Overview" },
     { id: "attention" as View, label: "Attention", count: attention },
@@ -1206,10 +1208,11 @@ export default function App() {
     <header className="app-header">
       <button className="brand" onClick={() => navigate("overview")}><span><Logo /></span><strong>CBZXL</strong></button>
       <nav aria-label="Primary navigation">{nav.map((item) => <button key={item.id} className={view === item.id ? "active" : ""} onClick={() => navigate(item.id)}>{item.label}{item.count ? <b>{item.count.toLocaleString()}</b> : null}</button>)}</nav>
-      <span className={`service-state ${unavailable ? "error" : active ? "busy" : ""}`}><i />{unavailable ? "Database unavailable" : active ? "Converting" : "Ready"}</span>
+      <span className={`service-state ${unavailable || runtimeUnavailable ? "error" : active ? "busy" : ""}`}><i />{unavailable ? "Database unavailable" : runtimeUnavailable ? "Conversion unavailable" : active ? "Converting" : "Ready"}</span>
     </header>
     <main className="app-content">
       {unavailable && <section className="database-alert" role="alert"><strong>The web interface is online, but the database could not be opened.</strong><code>{bootstrap.database_error}</code></section>}
+      {!unavailable && runtimeUnavailable && <section className="database-alert" role="alert"><strong>Lossless conversion is unavailable. New conversion jobs are blocked.</strong><code>{bootstrap.conversion_runtime_error}</code></section>}
       {!unavailable && view === "overview" && <Overview dashboard={dashboard} bootstrap={bootstrap} refresh={loadDashboard} notify={notify} />}
       {!unavailable && view === "attention" && <Attention refreshDashboard={loadDashboard} notify={notify} />}
       {!unavailable && view === "history" && <History notify={notify} />}

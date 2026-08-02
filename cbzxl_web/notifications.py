@@ -66,8 +66,8 @@ def job_notification(
         lines.append(f"Net space saved: {_format_size(net_bytes)}.")
     else:
         lines.append(f"Net space increased: {_format_size(net_bytes)}.")
-    if status in {"failed", "interrupted"} and job.get("error_message"):
-        lines.append(f"Error: {str(job['error_message']).strip()[:500]}")
+    if status in {"partial", "failed", "interrupted"} and job.get("error_message"):
+        lines.append(f"Failure: {str(job['error_message']).strip()[:500]}")
     return title, "\n".join(lines), priority, tag
 
 

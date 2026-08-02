@@ -34,7 +34,9 @@ The interface is organized into four focused pages:
 The web process remains available in a degraded state if database startup
 fails, rather than making the interface disappear with the worker. `/health`
 reports the degraded state and `/ready` returns HTTP 503 until SQLite is
-available.
+available. The same readiness contract covers the conversion runtime: CBZXL
+blocks new jobs and marks both services unhealthy if any supported input cannot
+complete an end-to-end lossless JPEG XL verification.
 
 ### Manual and scheduled runs
 
@@ -93,8 +95,10 @@ Every eligible page is judged independently:
 3. Discard a non-smaller candidate without spending time decoding it.
 4. Decode every smaller candidate with `djxl`; for lossless conversion, also
    compare the decoded pixels with the encoder input.
-5. Keep the candidate only after that verification succeeds. Otherwise retain
-   the original page byte-for-byte.
+5. Keep the candidate only after that verification succeeds. If a smaller
+   candidate cannot be verified, retain the source archive byte-for-byte but
+   fail the archive and surface the diagnostic through Attention, run history,
+   and ntfy. A verified non-smaller candidate remains a normal retention.
 
 Smart lossy never bypasses that order. It first attempts lossless JPEG XL. A
 lossy candidate is attempted only when the configured size or resolution
@@ -174,8 +178,9 @@ Available recovery paths include:
 - **Archives larger than their lifetime baseline** — retry lossless, try the
   conservative Smart Lossy policy, repack, restore an available original
   `.cbz.bak`, or accept the archive unchanged.
-- **Candidate verification failures** — use compatibility or lossless-only
-  verification without risking the original.
+- **Lossless verification failures** — restore the conversion runtime and
+  retry; CBZXL preserves the original, marks the archive failed, and includes
+  the decoder diagnostic in the terminal ntfy summary.
 - **System failures** — surface missing files, permissions, unavailable
   encoders, unsafe paths, and source files modified during conversion with
   specific diagnostic context.
@@ -438,8 +443,8 @@ Useful read-only endpoints include:
 | `/api/archives` | Indexed archive records |
 | `/api/integrations/homepage` | Homepage widget payload |
 | `/api/database/export` | Consistent SQLite download |
-| `/health` | Liveness and database status |
-| `/ready` | Readiness; HTTP 503 when the database is unavailable |
+| `/health` | Liveness plus database and conversion-runtime status |
+| `/ready` | Readiness; HTTP 503 when the database or lossless conversion runtime is unavailable |
 
 The WebUI also uses mutation endpoints for jobs, issue remedies, replacement
 uploads, reviews, schedules, and conversion policies.
@@ -495,5 +500,7 @@ docker compose config
 ```
 
 The production Dockerfile builds the React application, verifies the pinned
-libjxl binary, and packages it with FastAPI and the Python worker in a
-`linux/amd64` image.
+libjxl binary, and refuses to produce an image unless JPEG, PNG, TIFF, BMP, and
+WebP each complete a lossless encode, decode, and canonical pixel-signature
+comparison. It packages the verified runtime with FastAPI and the Python worker
+in a `linux/amd64` image.

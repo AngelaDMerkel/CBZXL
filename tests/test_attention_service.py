@@ -37,6 +37,12 @@ class AttentionServiceTests(unittest.TestCase):
         self.assertTrue(parameters)
         self.assertIsNone(issue_group_filter("missing-group"))
 
+    def test_page_verification_failure_is_a_lossless_conversion_failure(self):
+        group = issue_group({"kind": "page_verification_failed"})
+        self.assertEqual(group["id"], "verification")
+        self.assertEqual(group["triage"], "Conversion failed")
+        self.assertIn("original was preserved", group["recommended"])
+
 
 if __name__ == "__main__":
     unittest.main()

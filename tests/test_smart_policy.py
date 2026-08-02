@@ -231,6 +231,24 @@ class SmartPolicyTests(unittest.TestCase):
                     require_pixel_match=True,
                 )
 
+    def test_pixel_signature_uses_canonical_rgba_not_storage_metadata(self):
+        source = self.root / "palette.png"
+        source.write_bytes(b"source")
+        with patch.object(
+            cbzxl,
+            "run_cancellable",
+            return_value=CommandResult(
+                0,
+                "16 16 rgba matching-hash",
+                "",
+            ),
+        ) as command:
+            result = cbzxl.image_pixel_signature(source)
+
+        self.assertEqual(result, "16 16 rgba matching-hash")
+        arguments = command.call_args.args[0]
+        self.assertEqual(arguments[arguments.index("-format") + 1], "%w %h rgba %#")
+
     def test_lossless_jpeg_verification_retries_png_when_jpeg_signature_fails(self):
         source = self.root / "source.jpg"
         source.write_bytes(b"source")
@@ -267,6 +285,61 @@ class SmartPolicyTests(unittest.TestCase):
 
         self.assertEqual(result, "100 100 srgba matching-hash")
         self.assertEqual(decoded_suffixes, [".jpg", ".png"])
+
+    def test_smaller_unverified_candidate_fails_instead_of_becoming_retained(self):
+        source = self.root / "page.jpg"
+        source.write_bytes(b"jpeg" * 100)
+        normalized = self.root / ".page.jpg.cbzxl-input.png"
+        normalized.write_bytes(b"normalized")
+        decisions = {}
+        workspace = SimpleNamespace(
+            files=self.root,
+            record_decision=lambda entry, **decision: decisions.update(
+                {entry: decision}
+            ),
+        )
+
+        def encode(command, *_args, **_kwargs):
+            input_path = Path(command[-2])
+            candidate_size = 100 if input_path == source else 500
+            Path(command[-1]).write_bytes(
+                JXL_SIGNATURE + b"x" * (candidate_size - len(JXL_SIGNATURE))
+            )
+            return CommandResult(0, "", "")
+
+        args = SimpleNamespace(
+            distance=None,
+            smart_distance=False,
+            smart_mb=10,
+            smart_mp=5,
+            compatibility_mode=False,
+        )
+        cbzxl.verify_encoded_page.side_effect = cbzxl.VerificationError(
+            "JPEG decoder unavailable"
+        )
+        with (
+            patch.object(cbzxl, "get_mime_type", return_value="image/jpeg"),
+            patch.object(cbzxl.subprocess, "run", return_value=self.identify),
+            patch.object(
+                cbzxl,
+                "cjxl_input_path",
+                side_effect=[(source, None), (normalized, normalized)],
+            ),
+            patch.object(cbzxl, "run_cancellable", side_effect=encode),
+        ):
+            with self.assertRaisesRegex(
+                cbzxl.PageConversionError,
+                "Lossless JPEG XL verification failed",
+            ) as raised:
+                cbzxl.convert_single_image(source, args, workspace)
+
+        self.assertEqual(raised.exception.kind, "page_verification_failed")
+        self.assertEqual(raised.exception.stage, "verifying")
+        self.assertEqual(decisions["page.jpg"]["outcome"], "failed")
+        self.assertEqual(decisions["page.jpg"]["candidate_size"], 100)
+        self.assertIn("300 bytes smaller", decisions["page.jpg"]["reason"])
+        self.assertTrue(source.exists())
+        self.assertFalse(source.with_suffix(".jxl").exists())
 
     def test_failed_encoder_uses_normalized_single_thread_fallback(self):
         source = self.root / "fallback.jpg"

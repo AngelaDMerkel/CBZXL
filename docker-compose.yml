@@ -1,5 +1,5 @@
 x-cbzxl-common: &cbzxl-common
-  image: angeladmerkel/cbzxl-web:4.5.5
+  image: angeladmerkel/cbzxl-web:4.5.6
   platform: linux/amd64
   pull_policy: always
 
@@ -59,7 +59,7 @@ services:
         - CMD
         - python
         - -c
-        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health', timeout=5)"
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/ready', timeout=5)"
       interval: 30s
       timeout: 10s
       retries: 3
@@ -78,3 +78,14 @@ services:
       NTFY_TOKEN: ${CBZXL_NTFY_TOKEN:-}
       NTFY_TIMEOUT_SECONDS: ${CBZXL_NTFY_TIMEOUT_SECONDS:-10}
     cpus: ${CBZXL_CPU_LIMIT:-8}
+
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -m
+        - cbzxl_web.runtime_dependencies
+      interval: 5m
+      timeout: 60s
+      retries: 2
+      start_period: 30s

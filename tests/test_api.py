@@ -108,6 +108,27 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(job.status_code, 201)
         self.assertEqual(self.client.get("/api/dashboard").json()["active_jobs"][0]["status"], "queued")
 
+    def test_broken_conversion_runtime_is_visible_and_blocks_new_jobs(self):
+        with mock.patch.object(
+            web_app,
+            "conversion_runtime_error",
+            return_value="JPEG decoder unavailable",
+        ):
+            bootstrap = self.client.get("/api/bootstrap")
+            queued = self.client.post("/api/jobs", json={})
+
+        self.assertEqual(bootstrap.status_code, 200)
+        self.assertEqual(
+            bootstrap.json()["conversion_runtime_status"],
+            "unavailable",
+        )
+        self.assertIn(
+            "JPEG decoder unavailable",
+            bootstrap.json()["conversion_runtime_error"],
+        )
+        self.assertEqual(queued.status_code, 503)
+        self.assertIn("JPEG decoder unavailable", queued.json()["detail"])
+
     def test_integrity_audit_profile_forces_read_only_entire_library_scope(self):
         bootstrap = self.client.get("/api/bootstrap").json()
         audit = next(

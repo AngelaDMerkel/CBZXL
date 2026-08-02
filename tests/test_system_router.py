@@ -41,6 +41,37 @@ class SystemRouterTests(unittest.TestCase):
         self.assertEqual(client.get("/health").json()["status"], "degraded")
         self.assertEqual(client.get("/ready").status_code, 503)
 
+    def test_conversion_runtime_failure_is_visible_and_blocks_readiness(self):
+        @contextmanager
+        def connect():
+            connection = sqlite3.connect(":memory:")
+            try:
+                yield connection
+            finally:
+                connection.close()
+
+        app = FastAPI()
+        app.include_router(
+            create_system_router(
+                connect=connect,
+                version="test",
+                dependency_check=lambda: "JPEG decoder unavailable",
+            )
+        )
+        client = TestClient(app)
+
+        health = client.get("/health")
+        self.assertEqual(health.status_code, 200)
+        self.assertEqual(health.json()["status"], "degraded")
+        self.assertEqual(health.json()["conversion_runtime"], "unavailable")
+        self.assertIn(
+            "JPEG decoder unavailable",
+            health.json()["details"]["conversion_runtime"],
+        )
+        readiness = client.get("/ready")
+        self.assertEqual(readiness.status_code, 503)
+        self.assertIn("JPEG decoder unavailable", readiness.json()["detail"])
+
 
 if __name__ == "__main__":
     unittest.main()

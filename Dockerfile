@@ -19,19 +19,27 @@ RUN /opt/libjxl/tools/cjxl --version 2>&1 | grep -F "v${LIBJXL_VERSION}" \
     && /opt/libjxl/tools/djxl --version 2>&1 | grep -F "v${LIBJXL_VERSION}"
 
 FROM python:3.13-alpine
-LABEL name="cbzxl-web" version="4.5.5"
+LABEL name="cbzxl-web" version="4.5.6"
 
-RUN apk add --no-cache tzdata imagemagick imagemagick-jpeg file
+RUN apk add --no-cache \
+    tzdata \
+    imagemagick \
+    imagemagick-jpeg \
+    imagemagick-tiff \
+    imagemagick-webp \
+    file
 COPY --from=libjxl /opt/libjxl/tools/cjxl /usr/local/bin/cjxl
 COPY --from=libjxl /opt/libjxl/tools/djxl /usr/local/bin/djxl
 
 WORKDIR /app
 RUN mkdir -p /data /config /dev/shm/cbzxl /dev/shm/cbzxl-runtime
 
-COPY requirements.txt cbzxl.py app.py /app/
+COPY requirements.txt /app/
+RUN pip install --no-cache-dir -r requirements.txt
+COPY cbzxl.py app.py /app/
 COPY cbzxl_web /app/cbzxl_web
 COPY --from=frontend /build/dist /app/frontend/dist
-RUN pip install --no-cache-dir -r requirements.txt
+RUN python -m cbzxl_web.runtime_dependencies
 
 ENV PYTHONUNBUFFERED=1 \
     CONFIG_DIR=/config \

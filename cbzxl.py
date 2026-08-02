@@ -64,11 +64,12 @@ from cbzxl_web.engine import (
 )
 from cbzxl_web.protocol import EventEmitter
 from cbzxl_web.repositories.commit_intents import CommitIntentRepository
+from cbzxl_web.runtime_dependencies import validate_conversion_runtime
 
 # Default Constants (can be overwritten by args)
 DEFAULT_JXL_EFFORT = 10
 DEFAULT_THREADS = 10
-SCRIPT_VERSION = "4.5.5"
+SCRIPT_VERSION = "4.5.6"
 
 # Constants for use only in the Docker Container.
 CONFIG_DIR = os.getenv("CONFIG_DIR", "/config")
@@ -626,7 +627,20 @@ def prune_operational_history(conn, job_id):
     )
 
 
-def finish_run(conn, status, processed, skipped, failed, flattened, deleted, saved_bytes, increased_bytes, net_bytes):
+def finish_run(
+    conn,
+    status,
+    processed,
+    skipped,
+    failed,
+    flattened,
+    deleted,
+    saved_bytes,
+    increased_bytes,
+    net_bytes,
+    *,
+    error_message=None,
+):
     normalized_status = "partial" if status == "finished_with_errors" else "succeeded" if status == "finished" else status
     event_type = "job_completed" if normalized_status in {"succeeded", "partial"} else "job_cancelled" if normalized_status == "cancelled" else "job_failed"
     emit(
@@ -667,7 +681,11 @@ def finish_run(conn, status, processed, skipped, failed, flattened, deleted, sav
             deleted = ?,
             bytes_saved = ?,
             bytes_increased = ?,
-            net_bytes_saved = ?
+            net_bytes_saved = ?,
+            error_message = CASE
+                WHEN ? = 'succeeded' THEN NULL
+                ELSE COALESCE(?, error_message)
+            END
         WHERE id = ?
     """, (
         utc_now(),
@@ -680,6 +698,8 @@ def finish_run(conn, status, processed, skipped, failed, flattened, deleted, sav
         saved_bytes,
         increased_bytes,
         net_bytes,
+        normalized_status,
+        error_message,
         RUN_ID,
     ))
     record_library_snapshot(conn, RUN_ID)
@@ -1355,6 +1375,15 @@ def mark_failed(
             archive_mtime_value=archive_mtime_value,
             generation=int(archive["generation"] or 1),
         )
+        if RUN_ID:
+            conn.execute(
+                """
+                UPDATE jobs
+                SET error_message=COALESCE(error_message, ?)
+                WHERE id=?
+                """,
+                (error_msg, RUN_ID),
+            )
         if commit:
             conn.commit()
     except sqlite3.DatabaseError as e:
@@ -1932,7 +1961,7 @@ def image_pixel_signature(path_obj):
             "-colorspace",
             "sRGB",
             "-format",
-            "%w %h %[channels] %#",
+            "%w %h rgba %#",
             "info:",
         ],
         CANCEL_TOKEN,
@@ -2223,6 +2252,7 @@ def convert_single_image(img_path_obj, cli_args, workspace=None, archive_path=No
         last_result = None
         had_candidate_output = False
         verification_errors = []
+        smaller_candidate_failures = []
         fallback_cleanup = None
         attempt_records = []
         smallest_candidate_size = None
@@ -2284,6 +2314,25 @@ def convert_single_image(img_path_obj, cli_args, workspace=None, archive_path=No
                             require_pixel_match=final_distance == 0,
                         ),
                         verification_errors=(VerificationError,),
+                    )
+                if assessment.size is not None:
+                    smallest_candidate_size = (
+                        assessment.size
+                        if smallest_candidate_size is None
+                        else min(smallest_candidate_size, assessment.size)
+                    )
+                if (
+                    assessment.size is not None
+                    and assessment.size < orig_size
+                    and not assessment.verified
+                ):
+                    smaller_candidate_failures.append(
+                        {
+                            "mode": conversion_mode,
+                            "strategy": strategy_name,
+                            "candidate_size": assessment.size,
+                            "reason": assessment.reason,
+                        }
                     )
                 if (
                     not assessment.ready
@@ -2349,11 +2398,6 @@ def convert_single_image(img_path_obj, cli_args, workspace=None, archive_path=No
                     )
             if not candidate_ready:
                 continue
-            smallest_candidate_size = (
-                candidate_size
-                if smallest_candidate_size is None
-                else min(smallest_candidate_size, candidate_size)
-            )
             if (
                 final_distance == 0
                 and candidate_size >= orig_size
@@ -2398,6 +2442,25 @@ def convert_single_image(img_path_obj, cli_args, workspace=None, archive_path=No
                         ),
                         verification_errors=(VerificationError,),
                     )
+                if high_effort.size is not None:
+                    smallest_candidate_size = (
+                        high_effort.size
+                        if smallest_candidate_size is None
+                        else min(smallest_candidate_size, high_effort.size)
+                    )
+                if (
+                    high_effort.size is not None
+                    and high_effort.size < orig_size
+                    and not high_effort.verified
+                ):
+                    smaller_candidate_failures.append(
+                        {
+                            "mode": conversion_mode,
+                            "strategy": "high-effort lossless retry",
+                            "candidate_size": high_effort.size,
+                            "reason": high_effort.reason,
+                        }
+                    )
                 if (
                     not high_effort.ready
                     and high_effort.size is not None
@@ -2421,11 +2484,6 @@ def convert_single_image(img_path_obj, cli_args, workspace=None, archive_path=No
                         "reason": high_effort.reason,
                     }
                 )
-                if high_effort.size is not None:
-                    smallest_candidate_size = min(
-                        smallest_candidate_size,
-                        high_effort.size,
-                    )
                 if high_effort.ready:
                     candidate_size = high_effort.size
                     candidate_verified = high_effort.verified
@@ -2475,6 +2533,41 @@ def convert_single_image(img_path_obj, cli_args, workspace=None, archive_path=No
                     f"({conversion_mode}, {orig_size / 1024:.2f} KB → {get_size(jxl_path) / 1024:.2f} KB)"
                 )
             return saved, megapixels, conversion_mode, final_distance, True, True, False
+
+        if smaller_candidate_failures:
+            failed_candidate = min(
+                smaller_candidate_failures,
+                key=lambda failure: int(failure["candidate_size"]),
+            )
+            potential_savings = orig_size - int(failed_candidate["candidate_size"])
+            failure_detail = (
+                f"A JPEG XL candidate that was {potential_savings:,} bytes smaller "
+                f"could not be verified during {failed_candidate['strategy']}: "
+                f"{failed_candidate['reason']}"
+            )
+            log(
+                f"[red]❌ Lossless verification failed for "
+                f"{img_path_obj.name}: {failure_detail}",
+                level="error",
+            )
+            record_decision(
+                source_size=orig_size,
+                candidate_size=int(failed_candidate["candidate_size"]),
+                final_size=orig_size,
+                outcome="failed",
+                mode=str(failed_candidate["mode"]),
+                distance=last_verified_distance,
+                effort=last_verified_effort,
+                reason=failure_detail,
+                attempts=attempt_records,
+            )
+            raise PageConversionError(
+                f"Lossless JPEG XL verification failed for {entry_path}",
+                entry_path=entry_path,
+                kind="page_verification_failed",
+                stage="verifying",
+                detail=failure_detail,
+            )
 
         if had_candidate_output:
             if corrected_path:
@@ -3619,6 +3712,7 @@ def writable_directory_check(path, label):
 
 
 def run_preflight(input_dir, archive_paths, *, integrity_audit=False):
+    validate_conversion_runtime()
     required_tools = (
         ("djxl",)
         if integrity_audit
@@ -3951,7 +4045,19 @@ def main():
     except (OSError, RuntimeError) as exc:
         log(f"[red]❌ CRITICAL: {exc}", level="error")
         start_run(conn, args, 0)
-        finish_run(conn, "failed", 0, 0, 0, 0, 0, 0, 0, 0)
+        finish_run(
+            conn,
+            "failed",
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            error_message=str(exc),
+        )
         return 1
     try:
         processed_paths = load_processed_archive_rows(conn)
