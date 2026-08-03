@@ -19,7 +19,7 @@ RUN /opt/libjxl/tools/cjxl --version 2>&1 | grep -F "v${LIBJXL_VERSION}" \
     && /opt/libjxl/tools/djxl --version 2>&1 | grep -F "v${LIBJXL_VERSION}"
 
 FROM python:3.13-alpine
-LABEL name="cbzxl-web" version="4.5.6"
+LABEL name="cbzxl-web" version="4.5.7"
 
 RUN apk add --no-cache \
     tzdata \

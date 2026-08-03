@@ -23,7 +23,10 @@ ISSUE_GROUPS = {
     "images": {
         "label": "Image processing failures",
         "triage": "Needs your decision",
-        "recommended": "Preserve, replace or explicitly delete the affected image",
+        "recommended": (
+            "Attempt safe pixel recovery, preserve, replace or explicitly delete "
+            "the affected image"
+        ),
         "kinds": {
             "page_encode_failed",
             "page_conversion_error",
@@ -106,8 +109,10 @@ def remedies_for_issue(issue: Mapping[str, Any]) -> list[str]:
         if issue.get("entry_path") and issue.get("related_entry_path"):
             return ["keep_primary", "keep_related", "dismiss"]
         return ["dismiss"]
+    if kind in {"image_corrupt", "unsupported_image", "page_conversion_error"}:
+        return ["recover", "preserve", "replace", "delete"]
     if issue.get("entry_path"):
-        return ["compatibility", "preserve", "replace", "delete"]
+        return ["compatibility", "recover", "preserve", "replace", "delete"]
     if kind == "unsafe_archive_path":
         return ["dismiss"]
     return ["compatibility", "preserve", "retry", "dismiss"]

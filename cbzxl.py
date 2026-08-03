@@ -69,7 +69,7 @@ from cbzxl_web.runtime_dependencies import validate_conversion_runtime
 # Default Constants (can be overwritten by args)
 DEFAULT_JXL_EFFORT = 10
 DEFAULT_THREADS = 10
-SCRIPT_VERSION = "4.5.6"
+SCRIPT_VERSION = "4.5.7"
 
 # Constants for use only in the Docker Container.
 CONFIG_DIR = os.getenv("CONFIG_DIR", "/config")
@@ -104,6 +104,19 @@ CANCEL_TOKEN = CancellationToken()
 EVENTS = EventEmitter(sys.stdout)
 HEARTBEAT_LOCK = threading.Lock()
 PILLOW_RECOVERY_LOCK = threading.Lock()
+CORRUPT_IMAGE_MESSAGE = "Likely corrupt, truncated or malformed"
+CORRUPT_IMAGE_ERROR_MARKERS = (
+    "corrupt",
+    "decode failed",
+    "decoder rejected",
+    "getting pixel data failed",
+    "improper image header",
+    "insufficient image data",
+    "not a jpeg",
+    "not a png",
+    "premature end",
+    "truncated",
+)
 LAST_HEARTBEAT = 0.0
 MINIMUM_JXL_VERSION = (0, 12, 0)
 DURABLE_CHECKPOINT_SECONDS = max(
@@ -1448,6 +1461,7 @@ def should_auto_retry_archive(error, cli_args, attempt):
         "restore_original",
         "restore_reconvert",
         "repack",
+        "recover_image",
     }:
         return False
     if isinstance(
@@ -1851,9 +1865,13 @@ def apply_extension_correction(img_path_obj, corrected_path, mime, workspace=Non
 
 
 def recover_image_with_pillow(img_path_obj, normalized_path):
-    """Recover the decodable pixels of a damaged image into a canonical PNG."""
+    """Recover decodable pixels into a metadata-free canonical sRGB PNG.
+
+    Damaged ICC/EXIF metadata must not be copied into the recovery candidate:
+    doing so merely reproduces the encoder failure that required normalization.
+    """
     try:
-        from PIL import Image, ImageFile, UnidentifiedImageError
+        from PIL import Image, ImageFile, ImageOps, UnidentifiedImageError
     except ImportError:
         return False, "Pillow recovery support is unavailable"
 
@@ -1872,17 +1890,16 @@ def recover_image_with_pillow(img_path_obj, normalized_path):
                     if int(getattr(image, "n_frames", 1) or 1) != 1:
                         return False, "Animated images are not flattened automatically"
                     image.load()
-                    recovered = image.copy()
-                    icc_profile = image.info.get("icc_profile")
+                    recovered = ImageOps.exif_transpose(image).copy()
             finally:
                 ImageFile.LOAD_TRUNCATED_IMAGES = previous_setting
 
-        if recovered.mode in {"CMYK", "YCbCr", "LAB", "HSV", "F"}:
+        if recovered.mode == "P" or "transparency" in recovered.info:
+            recovered = recovered.convert("RGBA")
+        elif recovered.mode in {"CMYK", "YCbCr", "LAB", "HSV", "F"}:
             recovered = recovered.convert("RGB")
-        save_options = {"format": "PNG"}
-        if icc_profile:
-            save_options["icc_profile"] = icc_profile
-        recovered.save(partial_path, **save_options)
+        recovered.info.clear()
+        recovered.save(partial_path, format="PNG")
         if not partial_path.is_file() or get_size(partial_path) == 0:
             return False, "Tolerant decoder produced no image data"
         os.replace(partial_path, normalized_path)
@@ -1894,6 +1911,11 @@ def recover_image_with_pillow(img_path_obj, normalized_path):
         return False, str(exc)
     finally:
         partial_path.unlink(missing_ok=True)
+
+
+def is_likely_corrupt_image_detail(detail):
+    lowered = str(detail or "").lower()
+    return any(marker in lowered for marker in CORRUPT_IMAGE_ERROR_MARKERS)
 
 
 def cjxl_input_path(img_path_obj, mime, colorspace, force_normalize=False):
@@ -1913,9 +1935,14 @@ def cjxl_input_path(img_path_obj, mime, colorspace, force_normalize=False):
         return img_path_obj, None
 
     normalized_path = img_path_obj.with_name(f".{img_path_obj.name}.cbzxl-input.png")
-    command = ["magick", str(img_path_obj)]
-    if mime == "image/jpeg" and colorspace == "CMYK":
-        command.extend(["-colorspace", "sRGB"])
+    command = [
+        "magick",
+        str(img_path_obj),
+        "-auto-orient",
+        "-colorspace",
+        "sRGB",
+        "-strip",
+    ]
     command.append(str(normalized_path))
     try:
         result = subprocess.run(
@@ -1929,26 +1956,63 @@ def cjxl_input_path(img_path_obj, mime, colorspace, force_normalize=False):
         log(f"[red]❌ Failed to prepare {img_path_obj.name} for JXL conversion: {e}", level="error")
         return img_path_obj, None
 
-    if result.returncode != 0 or not normalized_path.exists() or get_size(normalized_path) == 0:
+    normalized_valid = normalized_path.exists() and get_size(normalized_path) > 0
+    if normalized_valid:
+        try:
+            validation = subprocess.run(
+                ["magick", str(normalized_path), "null:"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=SUBPROCESS_TIMEOUT,
+            )
+            normalized_valid = validation.returncode == 0
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            normalized_valid = False
+    if not normalized_valid:
         normalized_path.unlink(missing_ok=True)
-        recovered, recovery_detail = recover_image_with_pillow(
-            img_path_obj,
-            normalized_path,
-        )
-        if not recovered:
-            log(f"[red]❌ Failed to prepare {img_path_obj.name} for JXL conversion.", level="error")
-            if result.stderr:
-                log(f"[red]   magick stderr: {result.stderr.strip()}", level="error")
-            if recovery_detail:
-                log(f"[red]   tolerant decoder: {recovery_detail}", level="error")
-            normalized_path.unlink(missing_ok=True)
-            return img_path_obj, None
+        log(f"[red]❌ Failed to strictly normalize {img_path_obj.name}.", level="error")
+        if result.stderr:
+            log(f"[red]   magick stderr: {result.stderr.strip()}", level="error")
+        return img_path_obj, None
+    elif result.returncode != 0:
         log(
-            f"   ↻ {recovery_detail} from {img_path_obj.name}.",
+            f"   ↻ Normalized {img_path_obj.name} despite recoverable decoder warnings.",
             level="warning",
         )
 
     return normalized_path, normalized_path
+
+
+def recover_image_for_repair(workspace, entry_path):
+    """Stage a user-requested tolerant image recovery in the workspace only."""
+    canonical, target = workspace.entry_target(entry_path)
+    recovered_path = target.with_name(f".{target.name}.cbzxl-recovered.png")
+    recovered_path.unlink(missing_ok=True)
+    try:
+        recovered, detail = recover_image_with_pillow(target, recovered_path)
+        if not recovered:
+            raise PageConversionError(
+                f"{CORRUPT_IMAGE_MESSAGE}: {canonical}",
+                entry_path=canonical,
+                kind="image_corrupt",
+                stage="recovering",
+                detail=f"Automatic pixel recovery failed: {detail}",
+            )
+        try:
+            verify_source_image(recovered_path)
+        except VerificationError as error:
+            raise PageConversionError(
+                f"{CORRUPT_IMAGE_MESSAGE}: {canonical}",
+                entry_path=canonical,
+                kind="image_corrupt",
+                stage="recovering",
+                detail=f"Recovered pixels did not pass strict decoding: {error}",
+            ) from error
+        workspace.recover_entry(canonical, recovered_path)
+        return detail
+    finally:
+        recovered_path.unlink(missing_ok=True)
 
 
 def image_pixel_signature(path_obj):
@@ -2126,6 +2190,30 @@ def convert_single_image(img_path_obj, cli_args, workspace=None, archive_path=No
                 attempts=[],
             )
             return 0, 0.0, "Extension corrected", 0, True, False, True
+        if img_path_obj.suffix.lower() in IMAGE_FORMAT_LABELS:
+            expected_format = IMAGE_FORMAT_LABELS[img_path_obj.suffix.lower()]
+            detail = (
+                f"Detected content type {mime or 'unknown'} could not be decoded "
+                f"as {expected_format}"
+            )
+            record_decision(
+                source_size=get_size(img_path_obj),
+                candidate_size=None,
+                final_size=get_size(img_path_obj),
+                outcome="failed",
+                mode="N/A",
+                distance=None,
+                effort=None,
+                reason=detail,
+                attempts=[],
+            )
+            raise PageConversionError(
+                f"{CORRUPT_IMAGE_MESSAGE}: {entry_path}",
+                entry_path=entry_path,
+                kind="image_corrupt",
+                stage="decoding",
+                detail=detail,
+            )
         record_decision(
             source_size=get_size(img_path_obj),
             candidate_size=None,
@@ -2309,7 +2397,7 @@ def convert_single_image(img_path_obj, cli_args, workspace=None, archive_path=No
                         orig_size,
                         signature_check=jxl_has_valid_signature,
                         decode_verify=lambda: verify_encoded_page(
-                            strategy_input,
+                            img_path_obj,
                             partial_path,
                             require_pixel_match=final_distance == 0,
                         ),
@@ -2436,7 +2524,7 @@ def convert_single_image(img_path_obj, cli_args, workspace=None, archive_path=No
                         orig_size,
                         signature_check=jxl_has_valid_signature,
                         decode_verify=lambda: verify_encoded_page(
-                            candidate_input,
+                            img_path_obj,
                             partial_path,
                             require_pixel_match=True,
                         ),
@@ -2620,16 +2708,26 @@ def convert_single_image(img_path_obj, cli_args, workspace=None, archive_path=No
                 attempts=attempt_records,
             )
             return 0, megapixels, retained_mode, 0, True, False, False
-        log(f"[red]❌ Failed to convert with cjxl: {img_path_obj.name}", level="error")
-        if last_result and last_result.stderr:
-            log(f"[red]   cjxl stderr: {last_result.stderr.strip()}", level="error")
-        if verification_errors:
-            log(f"[red]   Verification: {verification_errors[-1]}", level="error")
         failure_details = []
         if last_result and last_result.stderr:
             failure_details.append(last_result.stderr.strip())
         if verification_errors:
             failure_details.append(verification_errors[-1])
+        combined_detail = "\n".join(
+            detail for detail in failure_details if detail
+        )
+        likely_corrupt = is_likely_corrupt_image_detail(combined_detail)
+        if likely_corrupt:
+            log(
+                f"[red]❌ {CORRUPT_IMAGE_MESSAGE}: {img_path_obj.name}",
+                level="error",
+            )
+        else:
+            log(f"[red]❌ Failed to convert with cjxl: {img_path_obj.name}", level="error")
+        if last_result and last_result.stderr:
+            log(f"[red]   cjxl stderr: {last_result.stderr.strip()}", level="error")
+        if verification_errors:
+            log(f"[red]   Verification: {verification_errors[-1]}", level="error")
         record_decision(
             source_size=orig_size,
             candidate_size=smallest_candidate_size,
@@ -2639,17 +2737,21 @@ def convert_single_image(img_path_obj, cli_args, workspace=None, archive_path=No
             distance=last_verified_distance,
             effort=last_verified_effort,
             reason=(
-                "\n".join(detail for detail in failure_details if detail)
+                combined_detail
                 or "JPEG XL encoding failed"
             ),
             attempts=attempt_records,
         )
         raise PageConversionError(
-            f"JPEG XL encoding failed for {entry_path}",
+            (
+                f"{CORRUPT_IMAGE_MESSAGE}: {entry_path}"
+                if likely_corrupt
+                else f"JPEG XL encoding failed for {entry_path}"
+            ),
             entry_path=entry_path,
-            kind="page_encode_failed",
-            stage="encoding",
-            detail="\n".join(detail for detail in failure_details if detail) or None,
+            kind="image_corrupt" if likely_corrupt else "page_encode_failed",
+            stage="decoding" if likely_corrupt else "encoding",
+            detail=combined_detail or None,
         )
     except ConversionCancelled:
         raise
@@ -3205,6 +3307,7 @@ def process_cbz(
             "restore_original",
             "restore_reconvert",
             "repack",
+            "recover_image",
         }:
             expected_repair = {
                 "action": repair_action,
@@ -3218,6 +3321,15 @@ def process_cbz(
                     workspace.replace_entry(repair_entry, getattr(cli_args, "repair_source", None))
                 elif repair_action == "delete":
                     workspace.delete_entry(repair_entry)
+                elif repair_action == "recover_image":
+                    recovery_detail = recover_image_for_repair(
+                        workspace,
+                        repair_entry,
+                    )
+                    log(
+                        f"   ♻ Recovered {repair_entry}: {recovery_detail}.",
+                        level="warning",
+                    )
                 else:
                     workspace.mark_repair(
                         repair_action,
@@ -3944,6 +4056,7 @@ def main():
             "restore_original",
             "restore_reconvert",
             "repack",
+            "recover_image",
         ),
         help=argparse.SUPPRESS,
     )

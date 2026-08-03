@@ -377,7 +377,7 @@ class SmartPolicyTests(unittest.TestCase):
         self.assertEqual(calls[2][calls[2].index("--num_threads=1")], "--num_threads=1")
         self.assertTrue(result[5])
 
-    def test_normalized_recovery_is_the_lossless_verification_source(self):
+    def test_normalized_input_is_verified_against_original_source_pixels(self):
         source = self.root / "truncated.png"
         source.write_bytes(b"png" * 100)
         normalized = self.root / ".truncated.png.cbzxl-input.png"
@@ -409,7 +409,7 @@ class SmartPolicyTests(unittest.TestCase):
             )
 
         verification_source = cbzxl.verify_encoded_page.call_args.args[0]
-        self.assertEqual(Path(verification_source), normalized)
+        self.assertEqual(Path(verification_source), source)
         self.assertTrue(result[5])
 
     def test_mislabeled_webp_is_treated_as_convertible_content(self):
@@ -531,6 +531,123 @@ class SmartPolicyTests(unittest.TestCase):
         with Image.open(recovered) as image:
             image.load()
             self.assertEqual(image.size, (128, 128))
+
+    def test_tolerant_recovery_drops_invalid_icc_metadata(self):
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow is not installed in the host test environment")
+
+        source = self.root / "profile.png"
+        Image.new("RGB", (8, 8), "red").save(
+            source,
+            icc_profile=b"not-a-valid-icc-profile",
+        )
+        recovered = self.root / "recovered.png"
+
+        successful, detail = cbzxl.recover_image_with_pillow(source, recovered)
+
+        self.assertTrue(successful, detail)
+        with Image.open(recovered) as image:
+            image.load()
+            self.assertNotIn("icc_profile", image.info)
+
+    def test_normalization_converts_to_srgb_and_strips_metadata(self):
+        source = self.root / "profile.jpg"
+        source.write_bytes(b"jpeg")
+        commands = []
+
+        def run(command, *_args, **_kwargs):
+            commands.append(command)
+            if command[-1] != "null:":
+                Path(command[-1]).write_bytes(b"normalized-png")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch.object(cbzxl.subprocess, "run", side_effect=run):
+            normalized, cleanup = cbzxl.cjxl_input_path(
+                source,
+                "image/jpeg",
+                "sRGB",
+                True,
+            )
+
+        self.assertEqual(Path(normalized), Path(cleanup))
+        self.assertIn("-colorspace", commands[0])
+        self.assertIn("sRGB", commands[0])
+        self.assertIn("-auto-orient", commands[0])
+        self.assertIn("-strip", commands[0])
+
+    def test_malformed_image_gets_specific_failure_and_recovery_kind(self):
+        source = self.root / "broken.jpg"
+        source.write_bytes(b"not an image")
+
+        with patch.object(
+            cbzxl,
+            "get_mime_type",
+            return_value="application/octet-stream",
+        ):
+            with self.assertRaisesRegex(
+                cbzxl.PageConversionError,
+                "Likely corrupt, truncated or malformed",
+            ) as raised:
+                cbzxl.convert_single_image(
+                    source,
+                    self.args(smart_mb=100, smart_mp=100),
+                )
+
+        self.assertEqual(raised.exception.kind, "image_corrupt")
+        self.assertEqual(raised.exception.stage, "decoding")
+        self.assertTrue(source.exists())
+
+    def test_explicit_recovery_stages_only_strictly_decodable_pixels(self):
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow is not installed in the host test environment")
+
+        complete = self.root / "complete.png"
+        target = self.root / "broken.png"
+        Image.new("RGB", (128, 128), "navy").save(complete)
+        payload = complete.read_bytes()
+        target.write_bytes(payload[: max(128, len(payload) - 32)])
+
+        class Workspace:
+            recovered = False
+
+            def entry_target(self, entry_path):
+                return entry_path, target
+
+            def recover_entry(self, _entry_path, recovered_path):
+                Path(recovered_path).replace(target)
+                self.recovered = True
+
+        workspace = Workspace()
+        detail = cbzxl.recover_image_for_repair(workspace, "broken.png")
+
+        self.assertTrue(workspace.recovered)
+        self.assertIn("Recovered 128x128", detail)
+        cbzxl.verify_source_image(target)
+
+    def test_failed_explicit_recovery_leaves_workspace_source_unchanged(self):
+        target = self.root / "broken.jpg"
+        original = b"not remotely an image"
+        target.write_bytes(original)
+
+        class Workspace:
+            def entry_target(self, entry_path):
+                return entry_path, target
+
+            def recover_entry(self, _entry_path, _recovered_path):
+                raise AssertionError("failed recovery must not replace the source")
+
+        with self.assertRaisesRegex(
+            cbzxl.PageConversionError,
+            "Likely corrupt, truncated or malformed",
+        ) as raised:
+            cbzxl.recover_image_for_repair(Workspace(), "broken.jpg")
+
+        self.assertEqual(raised.exception.kind, "image_corrupt")
+        self.assertEqual(target.read_bytes(), original)
 
 
 if __name__ == "__main__":

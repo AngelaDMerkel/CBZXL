@@ -437,6 +437,27 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(options["repair_action"], "delete")
         self.assertEqual(options["repair_entry"], "pages/003.jpg")
 
+    def test_issue_recovery_is_targeted_transactional_and_uses_compatibility(self):
+        issue_id = self.create_issue()
+
+        response = self.client.post(
+            f"/api/issues/{issue_id}/action",
+            json={"action": "recover"},
+        )
+
+        self.assertEqual(response.status_code, 201)
+        with database.connect() as conn:
+            options = json.loads(
+                conn.execute(
+                    "SELECT options_json FROM jobs WHERE id=?",
+                    (response.json()["job_id"],),
+                ).fetchone()[0]
+            )
+        self.assertEqual(options["only_path"], "Series/Book.cbz")
+        self.assertEqual(options["repair_action"], "recover_image")
+        self.assertEqual(options["repair_entry"], "pages/003.jpg")
+        self.assertTrue(options["compatibility_mode"])
+
     def test_archive_growth_is_a_standard_attention_group_with_safe_remedies(self):
         self.create_growth_issue(with_backup=True)
 

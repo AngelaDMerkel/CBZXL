@@ -572,6 +572,11 @@ function issueContext(issue: Json) {
     text: "Compare both pages and choose the one the archive should keep. CBZXL will remove only the other entry, correct the retained extension when necessary, and verify the rebuilt archive before replacing it.",
     recommended: "Choose one image to keep",
   };
+  if (isLikelyCorruptImage(issue)) return {
+    title: "Likely corrupt, truncated or malformed",
+    text: "CBZXL could not strictly decode this source image. Recovery can attempt to preserve every decodable pixel in a clean metadata-free image; the original archive remains untouched if recovery or verification fails.",
+    recommended: "Attempt image recovery",
+  };
   if (issue.entry_path) return {
     title: "This image could not be processed",
     text: "The archive remains intact. You can keep, replace, or explicitly delete this page.",
@@ -589,6 +594,20 @@ function issueContext(issue: Json) {
   };
 }
 
+function isLikelyCorruptImage(issue: Json) {
+  return issue.kind === "image_corrupt" || (
+    issue.kind === "page_conversion_error" &&
+    String(issue.message || "").startsWith("JPEG XL encoding failed") &&
+    (!issue.detail || issue.detail === issue.message)
+  );
+}
+
+function issueDisplayMessage(issue: Json) {
+  return isLikelyCorruptImage(issue)
+    ? "Likely corrupt, truncated or malformed"
+    : issue.message;
+}
+
 function IssuePreview({ issue, related = false }: { issue: Json; related?: boolean }) {
   const [failed, setFailed] = useState(false);
   const previewUrl = related ? issue.related_preview_url : issue.preview_url;
@@ -599,6 +618,7 @@ function IssuePreview({ issue, related = false }: { issue: Json; related?: boole
 
 const remedyLabels: Record<string, string> = {
   compatibility: "Compatibility retry",
+  recover: "Attempt image recovery",
   preserve: "Keep page, convert rest",
   replace: "Replace image",
   delete: "Delete image",
@@ -661,6 +681,7 @@ function Attention({ refreshDashboard, notify }: {
   };
 
   const act = async (issue: Json, action: string) => {
+    if (action === "recover" && !window.confirm(`Attempt tolerant pixel recovery for ${issue.entry_path}? The original archive will remain unchanged unless the recovered image and rebuilt archive both verify successfully.`)) return;
     if (action === "delete" && !window.confirm(`Delete ${issue.entry_path} from ${archiveName(issue.path)}? The archive name will not change.`)) return;
     if (action === "delete_archive" && !window.confirm(`Permanently delete ${archiveName(issue.path)} from the library? This cannot be undone.`)) return;
     if (action === "salvage_partial" && !window.confirm(`Rebuild ${archiveName(issue.path)} using only entries that were recovered and fully verified? The truncated archive tail will be omitted.`)) return;
@@ -749,7 +770,7 @@ function Attention({ refreshDashboard, notify }: {
             );
             return <div className={`issue ${expanded ? "expanded" : ""}`} key={issue.id}>
               <div className="issue-summary">
-                <div><strong>{archiveName(issue.path)}</strong><span className="error-copy">{issue.message}</span>{issue.entry_path && <code>{issue.entry_path}</code>}</div>
+                <div><strong>{archiveName(issue.path)}</strong><span className="error-copy">{issueDisplayMessage(issue)}</span>{issue.entry_path && <code>{issue.entry_path}</code>}</div>
                 <time>{dateTime(issue.updated_at)}</time>
                 <div className="issue-actions">
                   {!collision && <button className="button primary" disabled={busy === issue.id || issue.status === "queued"} onClick={() => act(issue, "retry")}>{issue.status === "queued" ? "Queued" : "Retry"}</button>}
@@ -799,7 +820,7 @@ function Attention({ refreshDashboard, notify }: {
                   {!collision && <div className="remedy-grid">
                     {remedies.map((remedy: string) => remedy === "replace" ?
                       <button className="button secondary block" key={remedy} disabled={busy === issue.id} onClick={() => fileInputs.current[issue.id]?.click()}>{remedyLabels[remedy]}</button> :
-                      <button className={`button block ${["compatibility", "lossless", "smart_lossy", "rebuild", "salvage", "salvage_partial"].includes(remedy) ? "primary" : remedy === "delete" ? "danger" : "secondary"}`} key={remedy} disabled={busy === issue.id} onClick={() => act(issue, remedy)}>{remedyLabels[remedy] || label(remedy)}</button>)}
+                      <button className={`button block ${["compatibility", "recover", "lossless", "smart_lossy", "rebuild", "salvage", "salvage_partial"].includes(remedy) ? "primary" : remedy === "delete" ? "danger" : "secondary"}`} key={remedy} disabled={busy === issue.id} onClick={() => act(issue, remedy)}>{remedyLabels[remedy] || label(remedy)}</button>)}
                   </div>}
                 </div>
               </div>}

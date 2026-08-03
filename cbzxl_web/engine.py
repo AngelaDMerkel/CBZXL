@@ -730,6 +730,10 @@ class EphemeralWorkspace:
             raise ValueError("Repair entry escapes the conversion workspace")
         return canonical, target
 
+    def entry_target(self, entry_path):
+        """Resolve a safe original archive entry inside this workspace."""
+        return self._entry_target(entry_path)
+
     def replace_entry(self, entry_path, replacement_path):
         canonical, target = self._entry_target(entry_path)
         replacement = Path(replacement_path or "").resolve()
@@ -741,6 +745,17 @@ class EphemeralWorkspace:
         os.replace(temporary, target)
         self.manifest.setdefault("completed_pages", {}).pop(canonical, None)
         self.manifest["repair"] = {"action": "replace", "entry": canonical}
+        self._write_manifest()
+
+    def recover_entry(self, entry_path, recovered_path):
+        """Atomically stage a locally verified recovered image payload."""
+        canonical, target = self._entry_target(entry_path)
+        recovered = Path(recovered_path)
+        if not recovered.is_file() or recovered.stat().st_size <= 0:
+            raise FileNotFoundError(f"Recovered image is unavailable: {recovered}")
+        os.replace(recovered, target)
+        self.manifest.setdefault("completed_pages", {}).pop(canonical, None)
+        self.manifest["repair"] = {"action": "recover_image", "entry": canonical}
         self._write_manifest()
 
     def delete_entry(self, entry_path):

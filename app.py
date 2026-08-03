@@ -75,7 +75,7 @@ ROOT = Path(__file__).parent
 FRONTEND_DIST = ROOT / "frontend" / "dist"
 LEGACY_STATIC = ROOT / "static"
 
-VERSION = "4.5.6"
+VERSION = "4.5.7"
 LOGGER = logging.getLogger("cbzxl.web")
 DATABASE_STARTUP_ERROR: str | None = None
 RUNTIME_STARTUP_ERROR: str | None = None
@@ -1452,6 +1452,16 @@ def act_on_issue(issue_id: int, payload: IssueActionPayload):
         overrides = {}
         if payload.action == "compatibility":
             overrides["compatibility_mode"] = True
+        elif payload.action == "recover":
+            if not issue.get("entry_path"):
+                raise HTTPException(409, "This issue is not tied to an individual image")
+            overrides.update(
+                {
+                    "repair_action": "recover_image",
+                    "repair_entry": issue["entry_path"],
+                    "compatibility_mode": True,
+                }
+            )
         elif payload.action == "preserve":
             overrides.update({
                 "continue_on_page_error": True,

@@ -94,7 +94,8 @@ Every eligible page is judged independently:
 2. Verify its signature and compare its size with the source page.
 3. Discard a non-smaller candidate without spending time decoding it.
 4. Decode every smaller candidate with `djxl`; for lossless conversion, also
-   compare the decoded pixels with the encoder input.
+   compare its canonical sRGB pixels with the original source image, including
+   when a metadata-free normalization input was required.
 5. Keep the candidate only after that verification succeeds. If a smaller
    candidate cannot be verified, retain the source archive byte-for-byte but
    fail the archive and surface the diagnostic through Attention, run history,
@@ -170,9 +171,12 @@ Available recovery paths include:
   salvage the complete archive when every entry verifies; or, with explicit
   confirmation, rebuild only the fully recovered entries before a truncated
   tail.
-- **Image processing failures** — preview the page when possible, retry in
-  compatibility mode, preserve it while converting the rest, upload a
-  replacement, or explicitly delete the page.
+- **Image processing failures** — malformed ICC/EXIF metadata is normalized
+  into canonical sRGB pixels automatically. Sources that are likely corrupt,
+  truncated, or malformed offer an explicit tolerant pixel-recovery action;
+  the recovered image must strictly decode and the rebuilt archive must verify
+  before replacement. The page can instead be preserved, replaced, or
+  explicitly deleted.
 - **Filename collisions** — compare both conflicting images and choose which
   one the verified rebuild should retain.
 - **Archives larger than their lifetime baseline** — retry lossless, try the

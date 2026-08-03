@@ -1,5 +1,5 @@
 x-cbzxl-common: &cbzxl-common
-  image: angeladmerkel/cbzxl-web:4.5.6
+  image: angeladmerkel/cbzxl-web:4.5.7
   platform: linux/amd64
   pull_policy: always
 

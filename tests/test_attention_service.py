@@ -43,6 +43,15 @@ class AttentionServiceTests(unittest.TestCase):
         self.assertEqual(group["triage"], "Conversion failed")
         self.assertIn("original was preserved", group["recommended"])
 
+    def test_corrupt_image_offers_explicit_recovery_first(self):
+        remedies = remedies_for_issue(
+            {"kind": "image_corrupt", "entry_path": "001.jpg"}
+        )
+        self.assertEqual(
+            remedies,
+            ["recover", "preserve", "replace", "delete"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

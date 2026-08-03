@@ -34,6 +34,7 @@ class ScanOptions(BaseModel):
         "restore_original",
         "restore_reconvert",
         "repack",
+        "recover_image",
     ] | None = None
     repair_entry: str | None = None
     repair_entries: list[str] = Field(default_factory=list)
@@ -108,6 +109,7 @@ class IssueActionPayload(BaseModel):
         "salvage_partial",
         "keep_primary",
         "keep_related",
+        "recover",
     ]
 
 
@@ -120,4 +122,3 @@ class ProfilePayload(BaseModel):
 class LegacyImportPayload(BaseModel):
     path: str = Field(..., min_length=1)
     dry_run: bool = True
-
