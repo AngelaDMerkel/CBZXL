@@ -308,6 +308,21 @@ class ApiTests(unittest.TestCase):
         self.assertIn("eta_seconds", hydrated)
         self.assertIn("smooth_percent", hydrated)
 
+        compact = self.client.get(f"/api/jobs/{job['id']}/live").json()
+        self.assertEqual(compact["job"]["id"], job["id"])
+        self.assertEqual(set(compact), {"job"})
+
+    def test_issue_summary_returns_groups_without_hydrating_rows(self):
+        self.create_issue(kind="page_encode_failed")
+
+        summary = self.client.get("/api/issues/summary")
+
+        self.assertEqual(summary.status_code, 200)
+        payload = summary.json()
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual(payload["rows"], [])
+        self.assertEqual(payload["groups"][0]["count"], 1)
+
     def test_job_history_explains_optimized_retained_and_failed_outcomes(self):
         job = self.client.post("/api/jobs", json={}).json()
         now = database.utc_now()

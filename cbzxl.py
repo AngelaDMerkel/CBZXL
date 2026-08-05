@@ -14,6 +14,7 @@ import stat
 import sys
 import time
 import uuid
+import zlib
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
@@ -42,6 +43,7 @@ from cbzxl_web.conversion.size_policy import (
 )
 from cbzxl_web.database import (
     initialize as initialize_database,
+    refresh_dashboard_metrics,
     resolve_archive_issue,
     upsert_archive_issue,
     utc_now,
@@ -69,7 +71,7 @@ from cbzxl_web.runtime_dependencies import validate_conversion_runtime
 # Default Constants (can be overwritten by args)
 DEFAULT_JXL_EFFORT = 10
 DEFAULT_THREADS = 10
-SCRIPT_VERSION = "4.5.7"
+SCRIPT_VERSION = "4.5.8"
 
 # Constants for use only in the Docker Container.
 CONFIG_DIR = os.getenv("CONFIG_DIR", "/config")
@@ -134,6 +136,10 @@ PAGE_DECISION_RETENTION_DAYS = max(
 ARCHIVE_STABLE_SECONDS = max(
     0,
     int(os.getenv("ARCHIVE_STABLE_SECONDS", "90")),
+)
+FINGERPRINT_AUDIT_DAYS = max(
+    1,
+    int(os.getenv("FINGERPRINT_AUDIT_DAYS", "30")),
 )
 AUTO_RETRY_ATTEMPTS = min(
     1,
@@ -410,6 +416,29 @@ def archive_is_current(cbz_path_obj, db_row, fingerprint=None):
     if processed_timestamp is None:
         return False
     return current_mtime <= processed_timestamp + 1
+
+
+def archive_stat_matches(cbz_path_obj, db_row):
+    """Use stable filesystem metadata to avoid reopening an unchanged ZIP."""
+    try:
+        current = Path(cbz_path_obj).stat()
+        stored_size = db_row.get("final_size")
+        stored_mtime = db_row.get("archive_mtime")
+        if stored_size is None or stored_mtime is None:
+            return False
+        return (
+            current.st_size == int(stored_size)
+            and abs(current.st_mtime - float(stored_mtime)) < 0.001
+        )
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def archive_due_for_fingerprint_audit(relative_path, *, now=None):
+    """Spread periodic ZIP-content audits evenly across normal scans."""
+    day = int((time.time() if now is None else now) // 86400)
+    bucket = zlib.crc32(str(relative_path).encode("utf-8")) % FINGERPRINT_AUDIT_DAYS
+    return bucket == day % FINGERPRINT_AUDIT_DAYS
 
 
 def unchanged_archive_context(db_row):
@@ -716,6 +745,12 @@ def finish_run(
         RUN_ID,
     ))
     record_library_snapshot(conn, RUN_ID)
+    job_library = conn.execute(
+        "SELECT library_id FROM jobs WHERE id=?",
+        (RUN_ID,),
+    ).fetchone()
+    if job_library:
+        refresh_dashboard_metrics(conn, job_library["library_id"])
     prune_operational_history(conn, RUN_ID)
     conn.commit()
 
@@ -1783,6 +1818,27 @@ def safe_extract_archive(zip_ref, destination):
 
 def get_mime_type(path_obj):
     try:
+        with open(path_obj, "rb") as source:
+            header = source.read(16)
+        if header.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if header.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if header.startswith((b"II*\x00", b"MM\x00*")):
+            return "image/tiff"
+        if header.startswith(b"BM"):
+            return "image/bmp"
+        if header.startswith((b"GIF87a", b"GIF89a")):
+            return "image/gif"
+        if (
+            len(header) >= 12
+            and header.startswith(b"RIFF")
+            and header[8:12] == b"WEBP"
+        ):
+            return "image/webp"
+    except OSError:
+        pass
+    try:
         result = subprocess.run(["file", "--mime-type", "-b", str(path_obj)],
                                 capture_output=True, text=True, check=True, timeout=30)
         return result.stdout.strip()
@@ -2234,34 +2290,43 @@ def convert_single_image(img_path_obj, cli_args, workspace=None, archive_path=No
 
     megapixels = 0.0
     colorspace = ""
+    dimension_error = None
     try:
-        id_result = subprocess.run(
-            ["identify", "-format", "%w %h %[colorspace]", img_path_str],
-            capture_output=True, text=True, check=True, timeout=30
-        )
-        width_value, height_value, *colorspace_value = id_result.stdout.strip().split()
-        width, height = int(width_value), int(height_value)
-        colorspace = " ".join(colorspace_value)
-        megapixels = (width * height) / 1_000_000
-    except (
-        subprocess.CalledProcessError,
-        FileNotFoundError,
-        subprocess.TimeoutExpired,
-        ValueError,
-    ) as e:
-        try:
-            from PIL import Image
+        from PIL import Image
 
-            with Image.open(img_path_obj) as image:
-                width, height = image.size
-                colorspace = image.mode
-                megapixels = (width * height) / 1_000_000
-            log(
-                f"   ↻ Read {img_path_obj.name} dimensions with the tolerant decoder.",
-                level="warning",
+        with Image.open(img_path_obj) as image:
+            width, height = image.size
+            colorspace = image.mode
+            megapixels = (width * height) / 1_000_000
+    except (ImportError, OSError, ValueError) as pillow_error:
+        dimension_error = pillow_error
+        try:
+            id_result = subprocess.run(
+                ["identify", "-format", "%w %h %[colorspace]", img_path_str],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30,
             )
-        except (ImportError, OSError, ValueError):
-            log(f"[yellow]⚠️ Could not get image dimensions for {img_path_obj.name}: {e}", level="error")
+            width_value, height_value, *colorspace_value = (
+                id_result.stdout.strip().split()
+            )
+            width, height = int(width_value), int(height_value)
+            colorspace = " ".join(colorspace_value)
+            megapixels = (width * height) / 1_000_000
+        except (
+            subprocess.CalledProcessError,
+            FileNotFoundError,
+            subprocess.TimeoutExpired,
+            ValueError,
+        ) as identify_error:
+            dimension_error = identify_error
+    if megapixels <= 0 and dimension_error is not None:
+        log(
+            f"[yellow]⚠️ Could not get image dimensions for "
+            f"{img_path_obj.name}: {dimension_error}",
+            level="error",
+        )
 
     is_large_file = orig_size > (cli_args.smart_mb * 1024 * 1024)
     is_high_res = megapixels > cli_args.smart_mp
@@ -3740,10 +3805,17 @@ def attempt_archive(cbz_path, resolved_input_dir, processed_paths, conn, fail_co
             )
             return 0, False, False, "skipped"
         processed_row = processed_paths.get(rel_path_for_db)
-        try:
-            fingerprint = archive_fingerprint(cbz_path)
-        except (OSError, zipfile.BadZipFile):
-            fingerprint = None
+        if (
+            processed_row
+            and archive_stat_matches(cbz_path, processed_row)
+            and not archive_due_for_fingerprint_audit(rel_path_for_db)
+        ):
+            fingerprint = processed_row.get("content_fingerprint")
+        else:
+            try:
+                fingerprint = archive_fingerprint(cbz_path)
+            except (OSError, zipfile.BadZipFile):
+                fingerprint = None
         if (
             processed_row
             and archive_is_current(cbz_path, processed_row, fingerprint)
@@ -4006,21 +4078,53 @@ def reconcile_library(conn, library_root, discovered_paths):
     return {"moved": moved, "missing": len(missing_ids)}
 
 
-def load_processed_archive_rows(conn):
+def load_processed_archive_rows(conn, relative_paths=None):
     if conn is None:
         return {}
+    parameters = [LIBRARY_ID]
+    path_clause = ""
+    if relative_paths is not None:
+        normalized_paths = sorted(set(relative_paths))
+        if not normalized_paths:
+            return {}
+        placeholders = ",".join("?" for _ in normalized_paths)
+        path_clause = f" AND path IN ({placeholders})"
+        parameters.extend(normalized_paths)
     cursor = conn.execute(
-        """
+        f"""
         SELECT path, converted_at, archive_mtime, content_fingerprint,
+               final_size,
                image_count, converted_pages, lossless_pages, lossy_pages,
                retained_pages, conversion_mode, dominant_type, bytes_saved,
                percent_saved, jxl_effort, format_inventory_fingerprint
         FROM archives
-        WHERE library_id=? AND status='processed'
+        WHERE library_id=? AND status='processed'{path_clause}
         """,
-        (LIBRARY_ID,),
+        parameters,
     )
     return {row["path"]: dict(row) for row in cursor}
+
+
+def resolve_scoped_archive(library_root, relative_path):
+    """Resolve an API/DB path inside the library without walking the tree."""
+    normalized = str(relative_path or "").replace("\\", "/")
+    portable = PurePosixPath(normalized)
+    if (
+        not normalized
+        or portable.is_absolute()
+        or ".." in portable.parts
+        or portable.suffix.lower() != ".cbz"
+    ):
+        raise RuntimeError(f"Invalid scoped CBZ path: {relative_path}")
+    root = Path(library_root).resolve()
+    candidate = (root / Path(*portable.parts)).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Scoped CBZ path is outside the library: {relative_path}"
+        ) from exc
+    return candidate
 
 
 def main():
@@ -4131,9 +4235,76 @@ def main():
     
     processed_paths = {}
     resolved_input_dir = Path(args.input_dir).resolve()
-    cbz_files_path_obj_list = list(resolved_input_dir.rglob('*.cbz'))
-    discovered_cbz_files = list(cbz_files_path_obj_list)
+    cbz_files_path_obj_list = []
+    full_library_discovery = not (args.only_path or args.reprocess_failed)
+    scoped_missing_count = 0
     try:
+        if args.only_path:
+            requested_path = resolve_scoped_archive(
+                resolved_input_dir,
+                args.only_path,
+            )
+            if not requested_path.is_file():
+                raise RuntimeError(
+                    f"Scoped archive does not exist: {args.only_path}"
+                )
+            cbz_files_path_obj_list = [requested_path]
+        elif args.reprocess_failed:
+            failed_paths = [
+                row[0]
+                for row in conn.execute(
+                    """
+                    SELECT DISTINCT a.path
+                    FROM archives a
+                    LEFT JOIN archive_issues ai
+                      ON ai.archive_id=a.id AND ai.status IN ('open', 'queued')
+                    WHERE a.library_id=?
+                      AND (a.status='failed' OR ai.id IS NOT NULL)
+                    """,
+                    (LIBRARY_ID,),
+                )
+            ]
+            resolved_failed_paths = [
+                (relative, resolve_scoped_archive(resolved_input_dir, relative))
+                for relative in failed_paths
+            ]
+            cbz_files_path_obj_list = [
+                path for _relative, path in resolved_failed_paths if path.is_file()
+            ]
+            missing_failed_paths = [
+                relative
+                for relative, path in resolved_failed_paths
+                if not path.is_file()
+            ]
+            if missing_failed_paths:
+                placeholders = ",".join("?" for _ in missing_failed_paths)
+                now = utc_now()
+                conn.execute(
+                    f"""
+                    UPDATE archive_issues
+                    SET status='resolved', resolved_at=?, updated_at=?
+                    WHERE archive_id IN (
+                        SELECT id FROM archives
+                        WHERE library_id=? AND path IN ({placeholders})
+                    ) AND status IN ('open', 'queued')
+                    """,
+                    (now, now, LIBRARY_ID, *missing_failed_paths),
+                )
+                updated = conn.execute(
+                    f"""
+                    UPDATE archives
+                    SET status='missing',
+                        error_message='Archive is no longer present in the library',
+                        review_status='reviewed', updated_at=?
+                    WHERE library_id=? AND path IN ({placeholders})
+                    """,
+                    (now, LIBRARY_ID, *missing_failed_paths),
+                )
+                scoped_missing_count = updated.rowcount
+                conn.commit()
+        else:
+            cbz_files_path_obj_list = list(resolved_input_dir.rglob('*.cbz'))
+        discovered_cbz_files = list(cbz_files_path_obj_list)
         preflight = run_preflight(
             resolved_input_dir,
             discovered_cbz_files,
@@ -4143,10 +4314,10 @@ def main():
             conn,
             resolved_input_dir,
         )
-        reconciliation = reconcile_library(
-            conn,
-            resolved_input_dir,
-            discovered_cbz_files,
+        reconciliation = (
+            reconcile_library(conn, resolved_input_dir, discovered_cbz_files)
+            if full_library_discovery
+            else {"moved": 0, "missing": scoped_missing_count}
         )
         log(
             "Preflight passed: "
@@ -4173,7 +4344,11 @@ def main():
         )
         return 1
     try:
-        processed_paths = load_processed_archive_rows(conn)
+        processed_paths = (
+            {}
+            if RECHECK_ALL
+            else load_processed_archive_rows(conn)
+        )
         if VERBOSE and processed_paths:
             log(
                 f"Found {len(processed_paths)} successfully processed "
@@ -4184,30 +4359,6 @@ def main():
             f"[red]Could not pre-load paths from DB: {exc}",
             level="error",
         )
-    if args.reprocess_failed:
-        failed_paths = {
-            row[0]
-            for row in conn.execute(
-                """
-                SELECT DISTINCT a.path
-                FROM archives a
-                LEFT JOIN archive_issues ai
-                  ON ai.archive_id=a.id AND ai.status IN ('open', 'queued')
-                WHERE a.library_id=? AND (a.status='failed' OR ai.id IS NOT NULL)
-                """,
-                (LIBRARY_ID,),
-            )
-        }
-        cbz_files_path_obj_list = [
-            path for path in cbz_files_path_obj_list
-            if os.path.relpath(path, resolved_input_dir).replace(os.sep, "/") in failed_paths
-        ]
-    if args.only_path:
-        requested = Path(args.only_path).as_posix()
-        cbz_files_path_obj_list = [
-            path for path in cbz_files_path_obj_list
-            if os.path.relpath(path, resolved_input_dir).replace(os.sep, "/") == requested
-        ]
     total_files = len(cbz_files_path_obj_list)
 
     if total_files == 0:

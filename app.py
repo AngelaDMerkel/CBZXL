@@ -6,12 +6,13 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import threading
+import time
 import uuid
 import zipfile
 import xml.etree.ElementTree as ElementTree
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from statistics import median
 from typing import Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -41,6 +42,7 @@ from cbzxl_web.database import (
     default_library,
     default_profile,
     initialize,
+    load_dashboard_metrics,
     merged_options,
     parse_datetime,
     row_dict,
@@ -75,10 +77,13 @@ ROOT = Path(__file__).parent
 FRONTEND_DIST = ROOT / "frontend" / "dist"
 LEGACY_STATIC = ROOT / "static"
 
-VERSION = "4.5.7"
+VERSION = "4.5.8"
 LOGGER = logging.getLogger("cbzxl.web")
 DATABASE_STARTUP_ERROR: str | None = None
 RUNTIME_STARTUP_ERROR: str | None = None
+STATISTICS_CACHE_SECONDS = 300
+_STATISTICS_CACHE_LOCK = threading.Lock()
+_STATISTICS_CACHE: dict[str, object] = {}
 
 app = FastAPI(title="CBZXL", version=VERSION, docs_url="/api/docs", redoc_url=None)
 app.include_router(
@@ -223,31 +228,12 @@ def bootstrap():
 def dashboard():
     initialize()
     with connect() as conn:
-        totals = row_dict(
-            conn.execute(
-                """
-                SELECT
-                    COUNT(*) AS archive_count,
-                    SUM(CASE WHEN status='processed' THEN 1 ELSE 0 END) AS optimized_count,
-                    SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed_count,
-                    SUM(CASE WHEN status='processed' AND bytes_saved < 0
-                             AND COALESCE(size_variance_kind, '')!='extension_overhead'
-                        THEN 1 ELSE 0 END) AS grew_count,
-                    COALESCE(SUM(CASE WHEN status='processed' AND bytes_saved > 0 THEN bytes_saved ELSE 0 END), 0) AS saved_bytes,
-                    COALESCE(SUM(CASE WHEN status='processed' AND bytes_saved < 0 THEN -bytes_saved ELSE 0 END), 0) AS increased_bytes,
-                    COALESCE(SUM(CASE WHEN status='processed' THEN bytes_saved ELSE 0 END), 0) AS net_bytes,
-                    COALESCE(SUM(CASE WHEN status='processed' THEN image_count ELSE 0 END), 0) AS page_count,
-                    COALESCE(AVG(CASE WHEN status='processed' AND original_size > 0 THEN percent_saved END), 0) AS average_percent_saved,
-                    COALESCE(AVG(CASE WHEN status='processed' THEN processing_duration_seconds END), 0) AS average_duration_seconds
-                FROM archives
-                """
-            ).fetchone()
-        )
         active = rows_dict(
             conn.execute(
                 "SELECT * FROM jobs WHERE status IN ('queued', 'running', 'stopping') ORDER BY queued_at"
             ).fetchall()
         )
+        totals = load_dashboard_metrics(conn, refresh_dirty=not active)
         recent = rows_dict(
             conn.execute(
                 "SELECT * FROM jobs ORDER BY queued_at DESC LIMIT 8"
@@ -275,8 +261,16 @@ def dashboard():
             "increased_gb": gb(totals.get("increased_bytes")),
             "net_gb": gb(totals.get("net_bytes")),
             "page_count": totals.get("page_count") or 0,
-            "average_percent_saved": round(totals.get("average_percent_saved") or 0, 1),
-            "average_duration_seconds": round(totals.get("average_duration_seconds") or 0, 1),
+            "average_percent_saved": round(
+                (totals.get("percent_saved_sum") or 0)
+                / (totals.get("percent_sample_count") or 1),
+                1,
+            ),
+            "average_duration_seconds": round(
+                (totals.get("duration_sum") or 0)
+                / (totals.get("duration_sample_count") or 1),
+                1,
+            ),
         },
         "review": {
             "total": review.get("total") or 0,
@@ -293,42 +287,36 @@ def detailed_statistics():
     """Lifetime reporting loaded only when the Overview disclosure is opened."""
     initialize()
     with connect() as conn:
-        totals = row_dict(
+        totals = load_dashboard_metrics(conn, refresh_dirty=True)
+        totals["average_percent_saved"] = (
+            (totals.get("percent_saved_sum") or 0)
+            / (totals.get("percent_sample_count") or 1)
+        )
+        database_file = conn.execute("PRAGMA database_list").fetchone()[2]
+        cache_version = row_dict(
             conn.execute(
                 """
                 SELECT
-                    COUNT(*) AS archive_count,
-                    SUM(CASE WHEN status='processed' THEN 1 ELSE 0 END) AS optimized_count,
-                    SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed_count,
-                    COALESCE(SUM(original_size), 0) AS source_bytes,
-                    COALESCE(SUM(COALESCE(final_size, original_size)), 0) AS current_bytes,
-                    COALESCE(SUM(CASE WHEN status='processed' THEN image_count ELSE 0 END), 0) AS page_count,
-                    COALESCE(SUM(CASE
-                        WHEN status='processed' AND converted_pages > 0 THEN converted_pages
-                        WHEN status='processed' AND bytes_saved > 0 THEN image_count
-                        ELSE 0 END), 0) AS converted_pages,
-                    COALESCE(SUM(CASE
-                        WHEN status='processed' AND lossless_pages > 0 THEN lossless_pages
-                        WHEN status='processed' AND bytes_saved > 0
-                             AND LOWER(COALESCE(conversion_mode, '')) LIKE '%lossless%'
-                        THEN image_count ELSE 0 END), 0) AS lossless_pages,
-                    COALESCE(SUM(CASE
-                        WHEN status='processed' AND lossy_pages > 0 THEN lossy_pages
-                        WHEN status='processed' AND bytes_saved > 0
-                             AND LOWER(COALESCE(conversion_mode, '')) LIKE '%lossy%'
-                        THEN image_count ELSE 0 END), 0) AS lossy_pages,
-                    COALESCE(SUM(CASE
-                        WHEN status='processed' AND retained_pages > 0 THEN retained_pages
-                        WHEN status='processed' AND bytes_saved = 0 THEN image_count
-                        ELSE 0 END), 0) AS retained_pages,
-                    COALESCE(AVG(CASE
-                        WHEN status='processed' AND original_size > 0 THEN percent_saved END), 0
-                    ) AS average_percent_saved,
-                    COALESCE(SUM(CASE WHEN status='processed' THEN bytes_saved ELSE 0 END), 0) AS net_bytes
-                FROM archives
+                    (SELECT MAX(updated_at) FROM archive_issues) AS issue_at,
+                    (SELECT MAX(COALESCE(finished_at, queued_at) || id) FROM jobs) AS job_at,
+                    (SELECT MAX(updated_at) FROM archive_format_stats) AS inventory_at
                 """
             ).fetchone()
         )
+        cache_key = (
+            database_file,
+            totals.get("updated_at"),
+            cache_version.get("issue_at"),
+            cache_version.get("job_at"),
+            cache_version.get("inventory_at"),
+        )
+        with _STATISTICS_CACHE_LOCK:
+            cached_at = float(_STATISTICS_CACHE.get("cached_at") or 0)
+            if (
+                _STATISTICS_CACHE.get("key") == cache_key
+                and time.monotonic() - cached_at < STATISTICS_CACHE_SECONDS
+            ):
+                return _STATISTICS_CACHE["payload"]
         format_rows = rows_dict(
             conn.execute(
                 """
@@ -376,38 +364,115 @@ def detailed_statistics():
                 """
             ).fetchone()
         )
-        saving_values = [
-            float(row[0])
-            for row in conn.execute(
-                """
-                SELECT percent_saved FROM archives
-                WHERE status='processed' AND percent_saved IS NOT NULL
-                ORDER BY percent_saved
-                """
-            ).fetchall()
-        ]
-        duration_values = [
-            float(row[0])
-            for row in conn.execute(
-                """
-                SELECT processing_duration_seconds FROM archives
-                WHERE status='processed' AND processing_duration_seconds IS NOT NULL
-                  AND processing_duration_seconds >= 0
-                ORDER BY processing_duration_seconds
-                """
-            ).fetchall()
-        ]
-        policy_rows = rows_dict(
+        distributions = row_dict(
             conn.execute(
                 """
                 SELECT
-                    COALESCE(p.name, 'Deleted policy') AS policy,
-                    ar.status,
-                    ar.processing_duration_seconds,
-                    ar.percent_saved
-                FROM archive_results ar
-                JOIN jobs j ON j.id=ar.job_id
-                LEFT JOIN conversion_profiles p ON p.id=j.profile_id
+                    SUM(CASE WHEN percent_saved < 0 THEN 1 ELSE 0 END) AS saving_lt_0,
+                    SUM(CASE WHEN percent_saved >= 0 AND percent_saved < 10 THEN 1 ELSE 0 END) AS saving_0_10,
+                    SUM(CASE WHEN percent_saved >= 10 AND percent_saved < 20 THEN 1 ELSE 0 END) AS saving_10_20,
+                    SUM(CASE WHEN percent_saved >= 20 AND percent_saved < 30 THEN 1 ELSE 0 END) AS saving_20_30,
+                    SUM(CASE WHEN percent_saved >= 30 AND percent_saved < 40 THEN 1 ELSE 0 END) AS saving_30_40,
+                    SUM(CASE WHEN percent_saved >= 40 AND percent_saved < 50 THEN 1 ELSE 0 END) AS saving_40_50,
+                    SUM(CASE WHEN percent_saved >= 50 THEN 1 ELSE 0 END) AS saving_50_plus,
+                    AVG(percent_saved) AS saving_average,
+                    SUM(CASE WHEN processing_duration_seconds < 30 THEN 1 ELSE 0 END) AS duration_lt_30,
+                    SUM(CASE WHEN processing_duration_seconds >= 30 AND processing_duration_seconds < 60 THEN 1 ELSE 0 END) AS duration_30_60,
+                    SUM(CASE WHEN processing_duration_seconds >= 60 AND processing_duration_seconds < 120 THEN 1 ELSE 0 END) AS duration_60_120,
+                    SUM(CASE WHEN processing_duration_seconds >= 120 AND processing_duration_seconds < 300 THEN 1 ELSE 0 END) AS duration_120_300,
+                    SUM(CASE WHEN processing_duration_seconds >= 300 AND processing_duration_seconds < 600 THEN 1 ELSE 0 END) AS duration_300_600,
+                    SUM(CASE WHEN processing_duration_seconds >= 600 THEN 1 ELSE 0 END) AS duration_600_plus
+                FROM archives
+                WHERE status='processed'
+                """
+            ).fetchone()
+        )
+        quantiles = row_dict(
+            conn.execute(
+                """
+                WITH savings AS MATERIALIZED (
+                    SELECT
+                        percent_saved AS value,
+                        ROW_NUMBER() OVER (ORDER BY percent_saved) AS position,
+                        COUNT(*) OVER () AS value_count
+                    FROM archives
+                    WHERE status='processed' AND percent_saved IS NOT NULL
+                ),
+                durations AS MATERIALIZED (
+                    SELECT
+                        processing_duration_seconds AS value,
+                        ROW_NUMBER() OVER (ORDER BY processing_duration_seconds) AS position,
+                        COUNT(*) OVER () AS value_count
+                    FROM archives
+                    WHERE status='processed'
+                      AND processing_duration_seconds IS NOT NULL
+                      AND processing_duration_seconds >= 0
+                )
+                SELECT
+                    (SELECT AVG(value) FROM savings
+                     WHERE position IN ((value_count + 1) / 2, (value_count + 2) / 2)) AS saving_median,
+                    (SELECT value FROM savings
+                     WHERE position=CAST(ROUND((value_count - 1) * 0.25) AS INTEGER) + 1) AS saving_p25,
+                    (SELECT value FROM savings
+                     WHERE position=CAST(ROUND((value_count - 1) * 0.75) AS INTEGER) + 1) AS saving_p75,
+                    (SELECT AVG(value) FROM durations
+                     WHERE position IN ((value_count + 1) / 2, (value_count + 2) / 2)) AS duration_median,
+                    (SELECT value FROM durations
+                     WHERE position=CAST(ROUND((value_count - 1) * 0.9) AS INTEGER) + 1) AS duration_p90
+                """
+            ).fetchone()
+        )
+        policy_efficiency = rows_dict(
+            conn.execute(
+                """
+                WITH base AS MATERIALIZED (
+                    SELECT
+                        COALESCE(p.name, 'Deleted policy') AS policy,
+                        ar.status,
+                        ar.processing_duration_seconds AS duration,
+                        ar.percent_saved
+                    FROM archive_results ar
+                    JOIN jobs j ON j.id=ar.job_id
+                    LEFT JOIN conversion_profiles p ON p.id=j.profile_id
+                ),
+                aggregates AS (
+                    SELECT
+                        policy,
+                        COUNT(*) AS attempted,
+                        SUM(CASE WHEN status='processed' THEN 1 ELSE 0 END) AS processed,
+                        AVG(CASE WHEN status='processed' THEN percent_saved END) AS average_percent_saved
+                    FROM base
+                    GROUP BY policy
+                ),
+                ranked AS (
+                    SELECT
+                        policy,
+                        duration,
+                        ROW_NUMBER() OVER (PARTITION BY policy ORDER BY duration) AS position,
+                        COUNT(*) OVER (PARTITION BY policy) AS value_count
+                    FROM base
+                    WHERE status='processed' AND duration IS NOT NULL
+                ),
+                medians AS (
+                    SELECT policy, AVG(duration) AS median_seconds
+                    FROM ranked
+                    WHERE position IN ((value_count + 1) / 2, (value_count + 2) / 2)
+                    GROUP BY policy
+                )
+                SELECT
+                    aggregates.policy AS name,
+                    aggregates.attempted,
+                    ROUND(COALESCE(medians.median_seconds, 0), 1) AS median_seconds,
+                    ROUND(COALESCE(aggregates.average_percent_saved, 0), 1) AS average_percent_saved,
+                    ROUND(
+                        CASE WHEN aggregates.attempted > 0
+                        THEN aggregates.processed * 100.0 / aggregates.attempted
+                        ELSE 0 END,
+                        1
+                    ) AS success_percent
+                FROM aggregates
+                LEFT JOIN medians ON medians.policy=aggregates.policy
+                ORDER BY aggregates.attempted DESC, aggregates.policy
                 """
             ).fetchall()
         )
@@ -423,10 +488,15 @@ def detailed_statistics():
                     AVG(CASE WHEN ar.status='processed' THEN ar.percent_saved END) AS attempt_average_percent_saved,
                     s.net_bytes AS snapshot_net_bytes,
                     s.average_percent_saved AS snapshot_average_percent_saved
-                FROM jobs j
+                FROM (
+                    SELECT *
+                    FROM jobs
+                    WHERE status NOT IN ('queued', 'running', 'stopping')
+                    ORDER BY COALESCE(finished_at, queued_at) DESC, id DESC
+                    LIMIT 180
+                ) j
                 LEFT JOIN archive_results ar ON ar.job_id=j.id
                 LEFT JOIN library_stat_snapshots s ON s.job_id=j.id
-                WHERE j.status NOT IN ('queued', 'running', 'stopping')
                 GROUP BY j.id
                 ORDER BY COALESCE(j.finished_at, j.queued_at), j.id
                 """
@@ -468,67 +538,23 @@ def detailed_statistics():
     retained_pages = int(totals.get("retained_pages") or 0)
     skipped_pages = max(0, page_count - converted_pages - retained_pages)
 
-    def histogram(values, definitions):
-        return [
-            {
-                "label": label_text,
-                "count": sum(1 for value in values if lower(value) and upper(value)),
-            }
-            for label_text, lower, upper in definitions
-        ]
-
-    savings_distribution = histogram(
-        saving_values,
-        [
-            ("<0%", lambda value: value < 0, lambda _value: True),
-            ("0–10%", lambda value: value >= 0, lambda value: value < 10),
-            ("10–20%", lambda value: value >= 10, lambda value: value < 20),
-            ("20–30%", lambda value: value >= 20, lambda value: value < 30),
-            ("30–40%", lambda value: value >= 30, lambda value: value < 40),
-            ("40–50%", lambda value: value >= 40, lambda value: value < 50),
-            ("50%+", lambda value: value >= 50, lambda _value: True),
-        ],
-    )
-    duration_distribution = histogram(
-        duration_values,
-        [
-            ("<30s", lambda value: value < 30, lambda _value: True),
-            ("30–60s", lambda value: value >= 30, lambda value: value < 60),
-            ("1–2m", lambda value: value >= 60, lambda value: value < 120),
-            ("2–5m", lambda value: value >= 120, lambda value: value < 300),
-            ("5–10m", lambda value: value >= 300, lambda value: value < 600),
-            ("10m+", lambda value: value >= 600, lambda _value: True),
-        ],
-    )
-
-    policies = {}
-    for row in policy_rows:
-        bucket = policies.setdefault(
-            row["policy"],
-            {"attempted": 0, "processed": 0, "durations": [], "savings": []},
-        )
-        bucket["attempted"] += 1
-        if row.get("status") == "processed":
-            bucket["processed"] += 1
-            if row.get("processing_duration_seconds") is not None:
-                bucket["durations"].append(float(row["processing_duration_seconds"]))
-            if row.get("percent_saved") is not None:
-                bucket["savings"].append(float(row["percent_saved"]))
-    policy_efficiency = []
-    for name, values in policies.items():
-        attempted = values["attempted"]
-        policy_efficiency.append(
-            {
-                "name": name,
-                "median_seconds": round(median(values["durations"]), 1) if values["durations"] else 0,
-                "average_percent_saved": round(
-                    sum(values["savings"]) / len(values["savings"]), 1
-                ) if values["savings"] else 0,
-                "success_percent": round(values["processed"] / attempted * 100, 1) if attempted else 0,
-                "attempted": attempted,
-            }
-        )
-    policy_efficiency.sort(key=lambda item: (-item["attempted"], item["name"]))
+    savings_distribution = [
+        {"label": "<0%", "count": int(distributions.get("saving_lt_0") or 0)},
+        {"label": "0–10%", "count": int(distributions.get("saving_0_10") or 0)},
+        {"label": "10–20%", "count": int(distributions.get("saving_10_20") or 0)},
+        {"label": "20–30%", "count": int(distributions.get("saving_20_30") or 0)},
+        {"label": "30–40%", "count": int(distributions.get("saving_30_40") or 0)},
+        {"label": "40–50%", "count": int(distributions.get("saving_40_50") or 0)},
+        {"label": "50%+", "count": int(distributions.get("saving_50_plus") or 0)},
+    ]
+    duration_distribution = [
+        {"label": "<30s", "count": int(distributions.get("duration_lt_30") or 0)},
+        {"label": "30–60s", "count": int(distributions.get("duration_30_60") or 0)},
+        {"label": "1–2m", "count": int(distributions.get("duration_60_120") or 0)},
+        {"label": "2–5m", "count": int(distributions.get("duration_120_300") or 0)},
+        {"label": "5–10m", "count": int(distributions.get("duration_300_600") or 0)},
+        {"label": "10m+", "count": int(distributions.get("duration_600_plus") or 0)},
+    ]
 
     cumulative_bytes = 0
     weighted_percent_saved = 0.0
@@ -575,13 +601,12 @@ def detailed_statistics():
         )
         group["count"] += int(row.get("count") or 0)
 
-    middle_range = [0.0, 0.0]
-    if saving_values:
-        lower_index = round((len(saving_values) - 1) * 0.25)
-        upper_index = round((len(saving_values) - 1) * 0.75)
-        middle_range = [round(saving_values[lower_index], 1), round(saving_values[upper_index], 1)]
+    middle_range = [
+        round(quantiles.get("saving_p25") or 0, 1),
+        round(quantiles.get("saving_p75") or 0, 1),
+    ]
 
-    return {
+    payload = {
         "health": {
             "library_coverage_percent": round(optimized_count / archive_count * 100, 1) if archive_count else 0,
             "average_percent_saved": round(totals.get("average_percent_saved") or 0, 1),
@@ -646,16 +671,13 @@ def detailed_statistics():
         ],
         "savings_distribution": savings_distribution,
         "savings_summary": {
-            "median": round(median(saving_values), 1) if saving_values else 0,
-            "average": round(sum(saving_values) / len(saving_values), 1) if saving_values else 0,
+            "median": round(quantiles.get("saving_median") or 0, 1),
+            "average": round(distributions.get("saving_average") or 0, 1),
             "middle_50": middle_range,
         },
         "processing": {
-            "median_seconds": round(median(duration_values), 1) if duration_values else 0,
-            "p90_seconds": round(
-                duration_values[round((len(duration_values) - 1) * 0.9)],
-                1,
-            ) if duration_values else 0,
+            "median_seconds": round(quantiles.get("duration_median") or 0, 1),
+            "p90_seconds": round(quantiles.get("duration_p90") or 0, 1),
             "distribution": duration_distribution,
             "policies": policy_efficiency,
         },
@@ -671,6 +693,13 @@ def detailed_statistics():
         },
         "run_trend": run_trend,
     }
+    with _STATISTICS_CACHE_LOCK:
+        _STATISTICS_CACHE.update(
+            key=cache_key,
+            cached_at=time.monotonic(),
+            payload=payload,
+        )
+    return payload
 
 
 @app.get("/api/jobs")
@@ -816,6 +845,18 @@ def get_job(job_id: str):
     for event in events:
         event["data"] = parse_json(event.pop("data_json", None), None)
     return {"job": hydrate_job(job, samples), "events": events, "results": results, "progress": samples}
+
+
+@app.get("/api/jobs/{job_id}/live")
+def get_live_job(job_id: str):
+    """Return only the compact state needed by the active conversion card."""
+    with connect() as conn:
+        job = row_dict(
+            conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        )
+    if not job:
+        raise HTTPException(404, "Scan not found")
+    return {"job": hydrate_job(job)}
 
 
 @app.get("/api/jobs/{job_id}/history")
@@ -1250,6 +1291,41 @@ def queue_issue_job(conn, issue, action, overrides=None):
         {"issue_id": issue["id"], "entry_path": issue.get("entry_path"), "action": action},
     )
     return job_id
+
+
+@app.get("/api/issues/summary")
+def issue_summary():
+    """Return attention counts without hydrating any archive result rows."""
+    with connect() as conn:
+        counts = rows_dict(
+            conn.execute(
+                """
+                SELECT kind, stage, COUNT(*) AS count
+                FROM archive_issues
+                WHERE status IN ('open', 'queued')
+                GROUP BY kind, stage
+                """
+            ).fetchall()
+        )
+    groups = {}
+    total = 0
+    for count_row in counts:
+        count = int(count_row.get("count") or 0)
+        total += count
+        descriptor = issue_group(count_row)
+        current = groups.setdefault(
+            descriptor["id"],
+            {**descriptor, "count": 0},
+        )
+        current["count"] += count
+    return {
+        "rows": [],
+        "groups": sorted(
+            groups.values(),
+            key=lambda item: (-int(item["count"]), str(item["label"])),
+        ),
+        "total": total,
+    }
 
 
 @app.get("/api/issues")

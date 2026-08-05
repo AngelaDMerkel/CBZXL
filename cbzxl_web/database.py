@@ -2,6 +2,7 @@ import calendar
 import json
 import os
 import sqlite3
+import threading
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -30,7 +31,8 @@ CONFIG_DIR = Path(os.getenv("CONFIG_DIR", "/config"))
 DB_PATH = Path(os.getenv("DB_PATH", str(CONFIG_DIR / "cbzxl-v3.sqlite3")))
 LIBRARY_PATH = os.getenv("LIBRARY_PATH", "/data")
 APP_TIMEZONE = os.getenv("TZ", "UTC")
-LATEST_SCHEMA_VERSION = 12
+LATEST_SCHEMA_VERSION = 13
+_INITIALIZE_LOCK = threading.RLock()
 DATABASE_MAINTENANCE_SECONDS = max(
     86400,
     int(os.getenv("DATABASE_MAINTENANCE_SECONDS", "604800")),
@@ -300,6 +302,62 @@ CREATE TABLE IF NOT EXISTS library_stat_snapshots (
     average_percent_saved REAL NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS library_dashboard_metrics (
+    library_id TEXT PRIMARY KEY REFERENCES libraries(id) ON DELETE CASCADE,
+    archive_count INTEGER NOT NULL DEFAULT 0,
+    optimized_count INTEGER NOT NULL DEFAULT 0,
+    failed_count INTEGER NOT NULL DEFAULT 0,
+    grew_count INTEGER NOT NULL DEFAULT 0,
+    saved_bytes INTEGER NOT NULL DEFAULT 0,
+    increased_bytes INTEGER NOT NULL DEFAULT 0,
+    net_bytes INTEGER NOT NULL DEFAULT 0,
+    source_bytes INTEGER NOT NULL DEFAULT 0,
+    current_bytes INTEGER NOT NULL DEFAULT 0,
+    page_count INTEGER NOT NULL DEFAULT 0,
+    converted_pages INTEGER NOT NULL DEFAULT 0,
+    lossless_pages INTEGER NOT NULL DEFAULT 0,
+    lossy_pages INTEGER NOT NULL DEFAULT 0,
+    retained_pages INTEGER NOT NULL DEFAULT 0,
+    percent_saved_sum REAL NOT NULL DEFAULT 0,
+    percent_sample_count INTEGER NOT NULL DEFAULT 0,
+    duration_sum REAL NOT NULL DEFAULT 0,
+    duration_sample_count INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS library_metric_state (
+    library_id TEXT PRIMARY KEY REFERENCES libraries(id) ON DELETE CASCADE,
+    dirty INTEGER NOT NULL DEFAULT 1 CHECK (dirty IN (0, 1)),
+    updated_at TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS archives_metrics_insert
+AFTER INSERT ON archives
+BEGIN
+    INSERT INTO library_metric_state(library_id, dirty, updated_at)
+    VALUES (NEW.library_id, 1, CURRENT_TIMESTAMP)
+    ON CONFLICT(library_id) DO UPDATE SET dirty=1, updated_at=excluded.updated_at;
+END;
+
+CREATE TRIGGER IF NOT EXISTS archives_metrics_update
+AFTER UPDATE ON archives
+BEGIN
+    INSERT INTO library_metric_state(library_id, dirty, updated_at)
+    VALUES (OLD.library_id, 1, CURRENT_TIMESTAMP)
+    ON CONFLICT(library_id) DO UPDATE SET dirty=1, updated_at=excluded.updated_at;
+    INSERT INTO library_metric_state(library_id, dirty, updated_at)
+    VALUES (NEW.library_id, 1, CURRENT_TIMESTAMP)
+    ON CONFLICT(library_id) DO UPDATE SET dirty=1, updated_at=excluded.updated_at;
+END;
+
+CREATE TRIGGER IF NOT EXISTS archives_metrics_delete
+AFTER DELETE ON archives
+BEGIN
+    INSERT INTO library_metric_state(library_id, dirty, updated_at)
+    VALUES (OLD.library_id, 1, CURRENT_TIMESTAMP)
+    ON CONFLICT(library_id) DO UPDATE SET dirty=1, updated_at=excluded.updated_at;
+END;
+
 CREATE TABLE IF NOT EXISTS import_batches (
     id TEXT PRIMARY KEY,
     source_path TEXT NOT NULL,
@@ -328,6 +386,9 @@ CREATE INDEX IF NOT EXISTS idx_archive_format_stats_format ON archive_format_sta
 CREATE INDEX IF NOT EXISTS idx_commit_intents_library ON archive_commit_intents(library_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_archive_issues_status ON archive_issues(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_archive_issues_job ON archive_issues(job_id);
+CREATE INDEX IF NOT EXISTS idx_archive_issues_open_group
+ON archive_issues(kind, stage, updated_at DESC)
+WHERE status IN ('open', 'queued');
 CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(enabled, next_run_at);
 CREATE INDEX IF NOT EXISTS idx_library_snapshots_date ON library_stat_snapshots(library_id, recorded_at);
 """
@@ -383,7 +444,6 @@ def connect(path: Path | str | None = None) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 5000")
-    conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")
     return conn
 
@@ -402,10 +462,46 @@ def existing_schema_version(path: Path | str | None = None) -> int | None:
         ).fetchone()
         if not table:
             return 0
-        row = source.execute(
-            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
+        versions = {
+            int(row[0])
+            for row in source.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            ).fetchall()
+        }
+        current = 0
+        while current + 1 in versions:
+            current += 1
+        return current
+    finally:
+        source.close()
+
+
+def schema_is_current(path: Path | str | None = None) -> bool:
+    """Return quickly when every migration has already been applied."""
+    target = Path(path or DB_PATH)
+    if not target.is_file() or target.stat().st_size == 0:
+        return False
+    source = sqlite3.connect(f"file:{target}?mode=ro", uri=True, timeout=30)
+    try:
+        table = source.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type='table' AND name='schema_migrations'
+            """
         ).fetchone()
-        return int(row[0] or 0)
+        if not table:
+            return False
+        row = source.execute(
+            """
+            SELECT COUNT(DISTINCT version), MIN(version), MAX(version)
+            FROM schema_migrations
+            WHERE version BETWEEN 1 AND ?
+            """,
+            (LATEST_SCHEMA_VERSION,),
+        ).fetchone()
+        return row == (LATEST_SCHEMA_VERSION, 1, LATEST_SCHEMA_VERSION)
+    except sqlite3.Error:
+        return False
     finally:
         source.close()
 
@@ -588,7 +684,182 @@ def classify_existing_extension_overhead(
     return len(classified_archives)
 
 
-def initialize() -> None:
+def refresh_dashboard_metrics(
+    conn: sqlite3.Connection,
+    library_id: str | None = None,
+) -> None:
+    """Refresh the constant-time library summary after durable archive writes."""
+    where_clause = "WHERE l.id=?" if library_id else ""
+    parameters = (library_id,) if library_id else ()
+    now = utc_now()
+    conn.execute(
+        f"""
+        INSERT INTO library_dashboard_metrics(
+            library_id, archive_count, optimized_count, failed_count,
+            grew_count, saved_bytes, increased_bytes, net_bytes,
+            source_bytes, current_bytes, page_count, converted_pages,
+            lossless_pages, lossy_pages, retained_pages,
+            percent_saved_sum, percent_sample_count,
+            duration_sum, duration_sample_count, updated_at
+        )
+        SELECT
+            l.id,
+            COUNT(a.id),
+            COALESCE(SUM(CASE WHEN a.status='processed' THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN a.status='failed' THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(CASE
+                WHEN a.status='processed' AND a.bytes_saved < 0
+                 AND COALESCE(a.size_variance_kind, '')!='extension_overhead'
+                THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(CASE
+                WHEN a.status='processed' AND a.bytes_saved > 0
+                THEN a.bytes_saved ELSE 0 END), 0),
+            COALESCE(SUM(CASE
+                WHEN a.status='processed' AND a.bytes_saved < 0
+                THEN -a.bytes_saved ELSE 0 END), 0),
+            COALESCE(SUM(CASE
+                WHEN a.status='processed' THEN a.bytes_saved ELSE 0 END), 0),
+            COALESCE(SUM(a.original_size), 0),
+            COALESCE(SUM(COALESCE(a.final_size, a.original_size)), 0),
+            COALESCE(SUM(CASE
+                WHEN a.status='processed' THEN a.image_count ELSE 0 END), 0),
+            COALESCE(SUM(CASE
+                WHEN a.status='processed' AND a.converted_pages > 0
+                THEN a.converted_pages
+                WHEN a.status='processed' AND a.bytes_saved > 0
+                THEN a.image_count ELSE 0 END), 0),
+            COALESCE(SUM(CASE
+                WHEN a.status='processed' AND a.lossless_pages > 0
+                THEN a.lossless_pages
+                WHEN a.status='processed' AND a.bytes_saved > 0
+                 AND LOWER(COALESCE(a.conversion_mode, '')) LIKE '%lossless%'
+                THEN a.image_count ELSE 0 END), 0),
+            COALESCE(SUM(CASE
+                WHEN a.status='processed' AND a.lossy_pages > 0
+                THEN a.lossy_pages
+                WHEN a.status='processed' AND a.bytes_saved > 0
+                 AND LOWER(COALESCE(a.conversion_mode, '')) LIKE '%lossy%'
+                THEN a.image_count ELSE 0 END), 0),
+            COALESCE(SUM(CASE
+                WHEN a.status='processed' AND a.retained_pages > 0
+                THEN a.retained_pages
+                WHEN a.status='processed' AND a.bytes_saved = 0
+                THEN a.image_count ELSE 0 END), 0),
+            COALESCE(SUM(CASE
+                WHEN a.status='processed' AND a.original_size > 0
+                THEN a.percent_saved ELSE 0 END), 0),
+            COALESCE(SUM(CASE
+                WHEN a.status='processed' AND a.original_size > 0
+                 AND a.percent_saved IS NOT NULL THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(CASE
+                WHEN a.status='processed'
+                THEN a.processing_duration_seconds ELSE 0 END), 0),
+            COALESCE(SUM(CASE
+                WHEN a.status='processed'
+                 AND a.processing_duration_seconds IS NOT NULL
+                THEN 1 ELSE 0 END), 0),
+            ?
+        FROM libraries l
+        LEFT JOIN archives a ON a.library_id=l.id
+        {where_clause}
+        GROUP BY l.id
+        ON CONFLICT(library_id) DO UPDATE SET
+            archive_count=excluded.archive_count,
+            optimized_count=excluded.optimized_count,
+            failed_count=excluded.failed_count,
+            grew_count=excluded.grew_count,
+            saved_bytes=excluded.saved_bytes,
+            increased_bytes=excluded.increased_bytes,
+            net_bytes=excluded.net_bytes,
+            source_bytes=excluded.source_bytes,
+            current_bytes=excluded.current_bytes,
+            page_count=excluded.page_count,
+            converted_pages=excluded.converted_pages,
+            lossless_pages=excluded.lossless_pages,
+            lossy_pages=excluded.lossy_pages,
+            retained_pages=excluded.retained_pages,
+            percent_saved_sum=excluded.percent_saved_sum,
+            percent_sample_count=excluded.percent_sample_count,
+            duration_sum=excluded.duration_sum,
+            duration_sample_count=excluded.duration_sample_count,
+            updated_at=excluded.updated_at
+        """,
+        (now, *parameters),
+    )
+    if library_id:
+        conn.execute(
+            """
+            INSERT INTO library_metric_state(library_id, dirty, updated_at)
+            VALUES (?, 0, ?)
+            ON CONFLICT(library_id) DO UPDATE SET dirty=0, updated_at=excluded.updated_at
+            """,
+            (library_id, now),
+        )
+    else:
+        conn.execute(
+            """
+            INSERT INTO library_metric_state(library_id, dirty, updated_at)
+            SELECT id, 0, ? FROM libraries WHERE 1
+            ON CONFLICT(library_id) DO UPDATE SET dirty=0, updated_at=excluded.updated_at
+            """,
+            (now,),
+        )
+
+
+def load_dashboard_metrics(
+    conn: sqlite3.Connection,
+    *,
+    refresh_dirty: bool = False,
+) -> dict[str, Any]:
+    missing = conn.execute(
+        """
+        SELECT 1
+        FROM libraries l
+        LEFT JOIN library_dashboard_metrics m ON m.library_id=l.id
+        WHERE m.library_id IS NULL
+        LIMIT 1
+        """
+    ).fetchone()
+    if missing:
+        refresh_dashboard_metrics(conn)
+    elif refresh_dirty:
+        dirty_ids = [
+            row[0]
+            for row in conn.execute(
+                "SELECT library_id FROM library_metric_state WHERE dirty=1"
+            ).fetchall()
+        ]
+        for dirty_id in dirty_ids:
+            refresh_dashboard_metrics(conn, dirty_id)
+    row = conn.execute(
+        """
+        SELECT
+            COALESCE(SUM(archive_count), 0) AS archive_count,
+            COALESCE(SUM(optimized_count), 0) AS optimized_count,
+            COALESCE(SUM(failed_count), 0) AS failed_count,
+            COALESCE(SUM(grew_count), 0) AS grew_count,
+            COALESCE(SUM(saved_bytes), 0) AS saved_bytes,
+            COALESCE(SUM(increased_bytes), 0) AS increased_bytes,
+            COALESCE(SUM(net_bytes), 0) AS net_bytes,
+            COALESCE(SUM(source_bytes), 0) AS source_bytes,
+            COALESCE(SUM(current_bytes), 0) AS current_bytes,
+            COALESCE(SUM(page_count), 0) AS page_count,
+            COALESCE(SUM(converted_pages), 0) AS converted_pages,
+            COALESCE(SUM(lossless_pages), 0) AS lossless_pages,
+            COALESCE(SUM(lossy_pages), 0) AS lossy_pages,
+            COALESCE(SUM(retained_pages), 0) AS retained_pages,
+            COALESCE(SUM(percent_saved_sum), 0) AS percent_saved_sum,
+            COALESCE(SUM(percent_sample_count), 0) AS percent_sample_count,
+            COALESCE(SUM(duration_sum), 0) AS duration_sum,
+            COALESCE(SUM(duration_sample_count), 0) AS duration_sample_count,
+            MAX(updated_at) AS updated_at
+        FROM library_dashboard_metrics
+        """
+    ).fetchone()
+    return row_dict(row)
+
+
+def _initialize_schema() -> None:
     current_version = existing_schema_version()
     if (
         current_version is not None
@@ -596,6 +867,7 @@ def initialize() -> None:
     ):
         backup_before_migration(current_version=current_version)
     with connect() as conn:
+        conn.execute("PRAGMA journal_mode = WAL")
         table_schema, index_schema = split_schema(SCHEMA)
         conn.executescript(table_schema)
         record_versions(conn, (1, 2), utc_now())
@@ -879,7 +1151,22 @@ def initialize() -> None:
             """,
             (now,),
         )
+        if not version_applied(conn, 13):
+            refresh_dashboard_metrics(conn)
+            conn.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (13, ?)",
+                (now,),
+            )
     run_database_maintenance()
+
+
+def initialize() -> None:
+    if schema_is_current():
+        return
+    with _INITIALIZE_LOCK:
+        if schema_is_current():
+            return
+        _initialize_schema()
 
 
 def upsert_archive_issue(

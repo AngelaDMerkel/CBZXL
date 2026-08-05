@@ -19,7 +19,7 @@ RUN /opt/libjxl/tools/cjxl --version 2>&1 | grep -F "v${LIBJXL_VERSION}" \
     && /opt/libjxl/tools/djxl --version 2>&1 | grep -F "v${LIBJXL_VERSION}"
 
 FROM python:3.13-alpine
-LABEL name="cbzxl-web" version="4.5.7"
+LABEL name="cbzxl-web" version="4.5.8"
 
 RUN apk add --no-cache \
     tzdata \
@@ -53,6 +53,7 @@ ENV PYTHONUNBUFFERED=1 \
     DURABLE_CHECKPOINT_ARCHIVES=10000 \
     PAGE_DECISION_RETENTION_DAYS=180 \
     ARCHIVE_STABLE_SECONDS=90 \
+    FINGERPRINT_AUDIT_DAYS=30 \
     AUTO_RETRY_ATTEMPTS=1 \
     DATABASE_MAINTENANCE_SECONDS=604800 \
     MIGRATION_BACKUP_KEEP=3 \

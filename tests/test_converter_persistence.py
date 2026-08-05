@@ -1439,6 +1439,119 @@ class ConverterPersistenceTests(unittest.TestCase):
         )
         self.assertIsNone(cbzxl.parse_jxl_version("version unavailable"))
 
+    def test_unchanged_archive_uses_stat_fast_path_before_zip_fingerprint(self):
+        library_root = Path(self.temp.name) / "stat-library"
+        library_root.mkdir()
+        archive_path = library_root / "Book.cbz"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("001.jxl", b"\xff\x0a" + b"page")
+        current = archive_path.stat()
+        stored = {
+            "final_size": current.st_size,
+            "archive_mtime": current.st_mtime,
+            "content_fingerprint": "known-fingerprint",
+            "format_inventory_fingerprint": "known-fingerprint",
+            "image_count": 1,
+            "converted_pages": 1,
+            "lossless_pages": 1,
+            "retained_pages": 0,
+            "conversion_mode": "Lossless",
+            "dominant_type": "JXL",
+            "bytes_saved": 20,
+            "percent_saved": 10,
+        }
+        cbzxl.RECHECK_ALL = False
+
+        with (
+            mock.patch.object(
+                cbzxl,
+                "archive_due_for_fingerprint_audit",
+                return_value=False,
+            ),
+            mock.patch.object(cbzxl, "archive_fingerprint") as fingerprint,
+        ):
+            outcome = cbzxl.attempt_archive(
+                archive_path,
+                library_root,
+                {"Book.cbz": stored},
+                None,
+                None,
+                SimpleNamespace(),
+            )
+
+        self.assertEqual(outcome[-1], "skipped")
+        fingerprint.assert_not_called()
+
+    def test_scoped_archive_resolution_rejects_library_escape(self):
+        library_root = Path(self.temp.name) / "scope-library"
+        library_root.mkdir()
+        archive_path = library_root / "Series" / "Book.cbz"
+        archive_path.parent.mkdir()
+        archive_path.touch()
+
+        self.assertEqual(
+            cbzxl.resolve_scoped_archive(library_root, "Series/Book.cbz"),
+            archive_path,
+        )
+        with self.assertRaises(RuntimeError):
+            cbzxl.resolve_scoped_archive(library_root, "../outside.cbz")
+
+    def test_only_path_job_never_walks_or_reconciles_the_library(self):
+        library_root = Path(self.temp.name) / "target-library"
+        archive_path = library_root / "Series" / "Book.cbz"
+        archive_path.parent.mkdir(parents=True)
+        archive_path.touch()
+        argv = [
+            "cbzxl.py",
+            str(library_root),
+            "--only-path",
+            "Series/Book.cbz",
+            "--run-id",
+            self.job_id,
+            "--quiet",
+        ]
+        preflight = {
+            "tools": 5,
+            "required_free_bytes": 256 * 1024 * 1024,
+        }
+
+        with (
+            mock.patch.object(cbzxl.sys, "argv", argv),
+            mock.patch.object(
+                cbzxl.Path,
+                "rglob",
+                side_effect=AssertionError("targeted jobs must not walk the library"),
+            ),
+            mock.patch.object(cbzxl, "run_preflight", return_value=preflight),
+            mock.patch.object(
+                cbzxl,
+                "recover_archive_commit_intents",
+                return_value={"recovered": 0},
+            ),
+            mock.patch.object(cbzxl, "reconcile_library") as reconcile,
+            mock.patch.object(
+                cbzxl,
+                "attempt_archive",
+                return_value=(0, False, False, "skipped"),
+            ) as attempt,
+            mock.patch.object(cbzxl, "install_signal_handlers"),
+        ):
+            result = cbzxl.main()
+
+        self.assertEqual(result, 0)
+        reconcile.assert_not_called()
+        self.assertEqual(attempt.call_args.args[0], archive_path)
+
+    def test_common_image_signature_avoids_file_subprocess(self):
+        image_path = Path(self.temp.name) / "page.bin"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"payload")
+
+        with mock.patch.object(cbzxl.subprocess, "run") as run:
+            mime = cbzxl.get_mime_type(image_path)
+
+        self.assertEqual(mime, "image/png")
+        run.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

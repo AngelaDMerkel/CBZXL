@@ -26,7 +26,7 @@ class DatabaseTests(unittest.TestCase):
                 row[0]
                 for row in conn.execute("SELECT name FROM conversion_profiles")
             }
-        self.assertEqual(version, 12)
+        self.assertEqual(version, 13)
         self.assertEqual(library["root_path"], database.LIBRARY_PATH)
         self.assertEqual(profile["name"], "Balanced lossless")
         self.assertEqual(
@@ -75,6 +75,8 @@ class DatabaseTests(unittest.TestCase):
         self.assertIn("idx_results_latest_processed", result_indexes)
         self.assertIn("archive_commit_intents", tables)
         self.assertIn("maintenance_state", tables)
+        self.assertIn("library_dashboard_metrics", tables)
+        self.assertIn("library_metric_state", tables)
         self.assertEqual(json.loads(profile["options_json"])["effort"], 10)
 
     def test_new_database_does_not_modify_legacy_v2_file(self):
@@ -265,7 +267,7 @@ class DatabaseTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(tuple(archive), (-62, "extension_overhead"))
         self.assertEqual(tuple(issue), ("resolved", "extension_overhead"))
-        self.assertEqual(version, 12)
+        self.assertEqual(version, 13)
 
     def test_human_schedule_calculation(self):
         after = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
@@ -329,9 +331,9 @@ class DatabaseTests(unittest.TestCase):
             )
             self.assertEqual(
                 backup.execute(
-                    "SELECT MAX(version) FROM schema_migrations"
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version=12"
                 ).fetchone()[0],
-                11,
+                0,
             )
         finally:
             backup.close()
@@ -347,6 +349,34 @@ class DatabaseTests(unittest.TestCase):
                 """
             ).fetchone()
         self.assertEqual(state["value"], "ok")
+
+    def test_dashboard_metrics_refresh_only_after_archive_changes(self):
+        with database.connect() as conn:
+            library = database.default_library(conn)
+            now = database.utc_now()
+            conn.execute(
+                """
+                INSERT INTO archives(
+                    library_id, path, status, original_size, final_size,
+                    bytes_saved, percent_saved, image_count,
+                    processing_duration_seconds, created_at, updated_at
+                ) VALUES (?, 'Fast.cbz', 'processed', 1000, 700, 300, 30,
+                          10, 5, ?, ?)
+                """,
+                (library["id"], now, now),
+            )
+            stale = database.load_dashboard_metrics(conn)
+            fresh = database.load_dashboard_metrics(conn, refresh_dirty=True)
+            dirty = conn.execute(
+                "SELECT dirty FROM library_metric_state WHERE library_id=?",
+                (library["id"],),
+            ).fetchone()[0]
+
+        self.assertEqual(stale["archive_count"], 0)
+        self.assertEqual(fresh["archive_count"], 1)
+        self.assertEqual(fresh["saved_bytes"], 300)
+        self.assertEqual(fresh["page_count"], 10)
+        self.assertEqual(dirty, 0)
 
 
 if __name__ == "__main__":

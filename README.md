@@ -284,7 +284,7 @@ docker compose up -d
 Open `http://<nas-host>:5000`.
 
 The included Compose file gives each container a 32 GB memory/shm allowance by
-default and applies a four-CPU ceiling to the worker. Resource settings can be
+default and applies an eight-CPU ceiling to the worker. Resource settings can be
 overridden:
 
 ```sh
@@ -337,12 +337,13 @@ token from being committed.
 | `SCRATCH_DIR` | `/dev/shm/cbzxl` | RAM conversion scratch directory |
 | `WORKSPACE_DIR` | `/dev/shm/cbzxl/workspaces` | Per-archive RAM workspaces |
 | `RUNTIME_DIR` | `/dev/shm/cbzxl-runtime` | Volatile live-progress state |
-| `CPU_LIMIT` | `4` | Shared WebUI/worker CPU ceiling; normally set through `CBZXL_CPU_LIMIT` |
+| `CPU_LIMIT` | `8` | Shared WebUI/worker CPU ceiling; normally set through `CBZXL_CPU_LIMIT` |
 | `LOG_FILE` | empty | Optional converter text log; empty avoids durable log writes |
 | `DURABLE_CHECKPOINT_SECONDS` | `300` | Batch interval for unchanged results; minimum 300 seconds |
 | `DURABLE_CHECKPOINT_ARCHIVES` | `10000` | Archive count that can also trigger a batch checkpoint |
 | `PAGE_DECISION_RETENTION_DAYS` | `180` | Retention for detailed per-page decisions |
 | `ARCHIVE_STABLE_SECONDS` | `90` | Required source quiet period before processing |
+| `FINGERPRINT_AUDIT_DAYS` | `30` | Spreads periodic ZIP content-fingerprint audits across normal scans |
 | `AUTO_RETRY_ATTEMPTS` | `1` | Conservative automatic compatibility retries; capped at one |
 | `DATABASE_MAINTENANCE_SECONDS` | `604800` | SQLite maintenance interval; minimum one day |
 | `MIGRATION_BACKUP_KEEP` | `3` | Number of verified pre-migration backups retained |

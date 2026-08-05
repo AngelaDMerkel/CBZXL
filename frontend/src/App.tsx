@@ -23,11 +23,49 @@ function LiveConversion({ initial, refresh, notify, onDismiss }: {
 }) {
   const [detail, setDetail] = useState<Json>({ job: initial, events: [] });
   useEffect(() => {
-    const load = () => api(`/api/jobs/${initial.id}`).then(setDetail).catch(() => undefined);
+    let stopped = false;
+    let timer: number | undefined;
+    let controller: AbortController | undefined;
+    const schedule = (delay: number) => {
+      if (!stopped && document.visibilityState === "visible") {
+        timer = window.setTimeout(load, delay);
+      }
+    };
+    const load = async () => {
+      if (stopped || document.visibilityState !== "visible") return;
+      controller = new AbortController();
+      try {
+        const payload = await api(`/api/jobs/${initial.id}/live`, { signal: controller.signal });
+        if (stopped) return;
+        setDetail(payload);
+        const nextJob = payload.job || {};
+        if (["queued", "running", "stopping"].includes(nextJob.status)) {
+          schedule(nextJob.status === "queued" ? 2500 : 1200);
+        } else {
+          refresh();
+        }
+      } catch (error) {
+        if (!stopped && (error as Error).name !== "AbortError") schedule(3000);
+      }
+    };
+    const visibilityChanged = () => {
+      if (document.visibilityState === "visible") {
+        if (timer) window.clearTimeout(timer);
+        load();
+      } else {
+        if (timer) window.clearTimeout(timer);
+        controller?.abort();
+      }
+    };
     load();
-    const timer = window.setInterval(load, 1800);
-    return () => window.clearInterval(timer);
-  }, [initial.id]);
+    document.addEventListener("visibilitychange", visibilityChanged);
+    return () => {
+      stopped = true;
+      if (timer) window.clearTimeout(timer);
+      controller?.abort();
+      document.removeEventListener("visibilitychange", visibilityChanged);
+    };
+  }, [initial.id, refresh]);
   const job = detail.job || initial;
   const percent = Number(job.smooth_percent ?? job.percent ?? 0);
   const terminal = !["queued", "running", "stopping"].includes(job.status);
@@ -648,7 +686,7 @@ function Attention({ refreshDashboard, notify }: {
   const [diagnostics, setDiagnostics] = useState<Record<number, Json>>({});
   const [diagnosticsLoading, setDiagnosticsLoading] = useState<number | null>(null);
   const fileInputs = useRef<Record<number, HTMLInputElement | null>>({});
-  const load = useCallback(() => api("/api/issues?limit=1").then(setData).catch((error) => notify(error.message, "error")), [notify]);
+  const load = useCallback(() => api("/api/issues/summary").then(setData).catch((error) => notify(error.message, "error")), [notify]);
   useEffect(() => { load(); }, [load]);
 
   const loadGroup = useCallback(async (groupId: string) => {
@@ -1202,10 +1240,47 @@ export default function App() {
   const loadDashboard = useCallback(() => api("/api/dashboard").then(setDashboard).catch(() => undefined), []);
   useEffect(() => {
     loadBootstrap();
-    loadDashboard();
-    const timer = window.setInterval(loadDashboard, 3500);
-    return () => window.clearInterval(timer);
-  }, [loadBootstrap, loadDashboard]);
+  }, [loadBootstrap]);
+  useEffect(() => {
+    let stopped = false;
+    let timer: number | undefined;
+    let controller: AbortController | undefined;
+    const schedule = (delay: number) => {
+      if (!stopped && document.visibilityState === "visible") {
+        timer = window.setTimeout(load, delay);
+      }
+    };
+    const load = async () => {
+      if (stopped || document.visibilityState !== "visible") return;
+      controller = new AbortController();
+      try {
+        const payload = await api("/api/dashboard", { signal: controller.signal });
+        if (stopped) return;
+        setDashboard(payload);
+        const converting = Boolean(payload.active_jobs?.length);
+        schedule(view === "overview" ? (converting ? 5000 : 12000) : (converting ? 12000 : 30000));
+      } catch (error) {
+        if (!stopped && (error as Error).name !== "AbortError") schedule(15000);
+      }
+    };
+    const visibilityChanged = () => {
+      if (document.visibilityState === "visible") {
+        if (timer) window.clearTimeout(timer);
+        load();
+      } else {
+        if (timer) window.clearTimeout(timer);
+        controller?.abort();
+      }
+    };
+    load();
+    document.addEventListener("visibilitychange", visibilityChanged);
+    return () => {
+      stopped = true;
+      if (timer) window.clearTimeout(timer);
+      controller?.abort();
+      document.removeEventListener("visibilitychange", visibilityChanged);
+    };
+  }, [view]);
   const notify = useCallback((message: string, kind: "success" | "error" = "success") => {
     setToast({ message, kind });
     window.setTimeout(() => setToast(null), 3800);
