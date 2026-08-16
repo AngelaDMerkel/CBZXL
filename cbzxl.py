@@ -71,7 +71,7 @@ from cbzxl_web.runtime_dependencies import validate_conversion_runtime
 # Default Constants (can be overwritten by args)
 DEFAULT_JXL_EFFORT = 10
 DEFAULT_THREADS = 10
-SCRIPT_VERSION = "4.5.8"
+SCRIPT_VERSION = "4.5.10"
 
 # Constants for use only in the Docker Container.
 CONFIG_DIR = os.getenv("CONFIG_DIR", "/config")
@@ -581,7 +581,12 @@ def record_library_snapshot(conn, job_id):
         """
         SELECT
             COUNT(*) AS archive_count,
-            SUM(CASE WHEN status='processed' THEN 1 ELSE 0 END) AS optimized_count,
+            SUM(CASE
+                WHEN status='processed'
+                 AND converted_pages > 0
+                 AND bytes_saved > 0
+                THEN 1 ELSE 0 END
+            ) AS optimized_count,
             SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed_count,
             COALESCE(SUM(CASE WHEN status='processed' THEN original_size ELSE 0 END), 0) AS baseline_bytes,
             COALESCE(SUM(CASE WHEN status='processed' THEN COALESCE(final_size, original_size) ELSE 0 END), 0) AS current_bytes,
@@ -589,7 +594,11 @@ def record_library_snapshot(conn, job_id):
             COALESCE(SUM(CASE WHEN status='processed' THEN image_count ELSE 0 END), 0) AS page_count,
             COALESCE(SUM(CASE WHEN status='processed' THEN converted_pages ELSE 0 END), 0) AS converted_pages,
             COALESCE(AVG(CASE
-                WHEN status='processed' AND original_size > 0 THEN percent_saved END
+                WHEN status='processed'
+                 AND converted_pages > 0
+                 AND bytes_saved > 0
+                 AND original_size > 0
+                THEN percent_saved END
             ), 0) AS average_percent_saved
         FROM archives
         WHERE library_id=?
@@ -1604,6 +1613,70 @@ def record_archive_failure(conn_main, conn_fail, cbz_path_obj, path_str, error, 
             commit=False,
         )
         conn_main.commit()
+
+
+def persist_page_failure_issues(conn, path_str, page_failures, *, commit=False):
+    """Persist every failed image while keeping the archive processable.
+
+    ``mark_processed`` resolves the previous issue set before this function is
+    called. Re-inserting every failure observed by the complete page pass makes
+    the open issue rows an exact snapshot rather than a fail-fast breadcrumb.
+    """
+    failures_by_entry = {
+        str(failure.get("entry_path") or ""): failure
+        for failure in page_failures or []
+        if failure.get("entry_path")
+    }
+    if not failures_by_entry:
+        return 0
+    if DRY_RUN or conn is None:
+        return len(failures_by_entry)
+    archive = conn.execute(
+        "SELECT id FROM archives WHERE library_id=? AND path=?",
+        (LIBRARY_ID, path_str),
+    ).fetchone()
+    if not archive:
+        raise sqlite3.DatabaseError(
+            f"Cannot persist page failures for unknown archive: {path_str}"
+        )
+    archive_id = int(archive["id"])
+    for entry_path, failure in sorted(failures_by_entry.items()):
+        upsert_archive_issue(
+            conn,
+            archive_id=archive_id,
+            job_id=RUN_ID,
+            kind=str(failure.get("kind") or "page_conversion_error"),
+            stage=str(failure.get("stage") or "encoding"),
+            entry_path=entry_path,
+            related_entry_path=failure.get("related_entry_path"),
+            message=str(failure.get("message") or f"Image processing failed: {entry_path}"),
+            detail=failure.get("detail"),
+        )
+    entries = sorted(failures_by_entry)
+    preview = ", ".join(entries[:5])
+    if len(entries) > 5:
+        preview += f", and {len(entries) - 5} more"
+    summary = (
+        f"{len(entries)} image processing failure"
+        f"{'s' if len(entries) != 1 else ''}; originals retained: {preview}"
+    )
+    conn.execute(
+        """
+        UPDATE archives
+        SET error_message=?, review_status='open', dismissed_until_rescan=0,
+            reviewed_at=NULL, updated_at=?
+        WHERE id=?
+        """,
+        (summary, utc_now(), archive_id),
+    )
+    if RUN_ID:
+        conn.execute(
+            "UPDATE jobs SET error_message=COALESCE(error_message, ?) WHERE id=?",
+            (summary, RUN_ID),
+        )
+    if commit:
+        conn.commit()
+    return len(entries)
 
 
 def queue_no_change_result(*args, **kwargs):
@@ -2957,6 +3030,7 @@ def convert_images(temp_dir_path, cli_args, workspace=None, archive_path=None):
         0,
         0,
         preserved_count,
+        [],
     )
 
     if not convertible_paths:
@@ -2979,6 +3053,7 @@ def convert_images(temp_dir_path, cli_args, workspace=None, archive_path=None):
                 0,
                 0,
                 preserved_count,
+                [],
             )
         else:
             return ConversionStatus.NO_IMAGES_RECOGNIZED, *base_return
@@ -3004,6 +3079,7 @@ def convert_images(temp_dir_path, cli_args, workspace=None, archive_path=None):
     )
 
     results = []
+    page_failures = []
     completed_pages = resumed_pages
     with ThreadPoolExecutor(max_workers=image_workers) as executor:
         futures = {
@@ -3051,13 +3127,19 @@ def convert_images(temp_dir_path, cli_args, workspace=None, archive_path=None):
                     if workspace
                     else futures[future].name
                 )
-                page_error = e if isinstance(e, PageConversionError) else PageConversionError(
-                    str(e),
-                    entry_path=entry_path,
-                    kind="page_conversion_error",
-                    stage="encoding",
-                    detail=str(e),
+                page_error = (
+                    e
+                    if isinstance(e, PageConversionError)
+                    else PageConversionError(
+                        str(e),
+                        entry_path=entry_path,
+                        kind="page_conversion_error",
+                        stage="encoding",
+                        detail=str(e),
+                    )
                 )
+                if not page_error.entry_path:
+                    page_error.entry_path = entry_path
                 emit(
                     "page_failed",
                     level="error",
@@ -3070,30 +3152,47 @@ def convert_images(temp_dir_path, cli_args, workspace=None, archive_path=None):
                     issue_kind=page_error.kind,
                     detail=page_error.detail,
                 )
-                retained_entry = getattr(cli_args, "repair_entry", None)
-                may_retain = (
-                    getattr(cli_args, "continue_on_page_error", False)
-                    and (not retained_entry or retained_entry == page_error.entry_path)
+                if workspace and entry_path not in workspace.manifest.get(
+                    "page_decisions", {}
+                ):
+                    source_path = futures[future]
+                    workspace.record_decision(
+                        entry_path,
+                        source_format=get_mime_type(source_path),
+                        source_size=get_size(source_path),
+                        candidate_size=None,
+                        final_size=get_size(source_path),
+                        outcome="failed",
+                        mode=None,
+                        distance=None,
+                        effort=None,
+                        reason=str(page_error),
+                        attempts=[],
+                    )
+                page_failures.append(
+                    {
+                        "entry_path": page_error.entry_path,
+                        "related_entry_path": page_error.related_entry_path,
+                        "kind": page_error.kind,
+                        "stage": page_error.stage,
+                        "message": str(page_error),
+                        "detail": page_error.detail,
+                    }
                 )
-                if may_retain:
-                    completed_pages += 1
-                    results.append(
-                        (0, 0.0, "Retained after error", 0, True, False, False)
-                    )
-                    emit(
-                        "page_completed",
-                        level="warning",
-                        message=f"Retained {entry_path} after conversion failure",
-                        archive=archive_path,
-                        stage="encoding",
-                        page=completed_pages,
-                        total_pages=total_work_pages,
-                        converted=False,
-                    )
-                    continue
-                for pending in futures:
-                    pending.cancel()
-                raise page_error
+                completed_pages += 1
+                results.append(
+                    (0, 0.0, "Retained after error", 0, True, False, False)
+                )
+                emit(
+                    "page_completed",
+                    level="warning",
+                    message=f"Retained {entry_path} after conversion failure",
+                    archive=archive_path,
+                    stage="encoding",
+                    page=completed_pages,
+                    total_pages=total_work_pages,
+                    converted=False,
+                )
     
     total_saved = sum(r[0] for r in results)
     resumed_conversions = sum(
@@ -3159,6 +3258,10 @@ def convert_images(temp_dir_path, cli_args, workspace=None, archive_path=None):
         lossless_pages,
         lossy_pages,
         retained_pages,
+        sorted(
+            page_failures,
+            key=lambda failure: str(failure.get("entry_path") or ""),
+        ),
     )
     if corrected_count > 0:
         return ConversionStatus.PROCESSED_EXTENSION_CORRECTION, *final_return
@@ -3417,6 +3520,7 @@ def process_cbz(
         workspace.set_stage("encoding")
 
         conversion_saved_bytes = 0
+        page_failures = []
         (
             status,
             saved_bytes,
@@ -3450,6 +3554,13 @@ def process_cbz(
             not cli_args.no_convert
             and repair_action not in {"restore_original", "repack"}
         ):
+            conversion_result = convert_images(
+                temp_dir_obj, cli_args, workspace, rel_path_str
+            )
+            # Keep compatibility with external conversion hooks that return the
+            # pre-4.5.9 tuple without the trailing page-failure collection.
+            if len(conversion_result) == 13:
+                conversion_result = (*conversion_result, [])
             (
                 status,
                 saved_bytes,
@@ -3464,7 +3575,8 @@ def process_cbz(
                 lossless_pages,
                 lossy_pages,
                 retained_pages,
-            ) = convert_images(temp_dir_obj, cli_args, workspace, rel_path_str)
+                page_failures,
+            ) = conversion_result
             conversion_saved_bytes = saved_bytes
             if status == ConversionStatus.NO_CONVERTIBLE_RECOGNIZED_IMAGES:
                 log(f"   ℹ️  Contains {dominant_other} image(s). No conversion needed.")
@@ -3485,16 +3597,63 @@ def process_cbz(
 
         duration_value = time.monotonic() - start_time
         if not action_taken:
-            queue_no_change_result(
-                conn_main, cbz_path_obj, rel_path_str, original_cbz_size, original_cbz_size, 0,
-                dominant_type, JXL_EFFORT, duration_value, img_count, num_jpg, num_png, conv_mode, mp_info, fingerprint,
-                input_fingerprint=fingerprint,
-                converted_pages=converted_pages,
-                lossless_pages=lossless_pages,
-                lossy_pages=lossy_pages,
-                retained_pages=retained_pages,
+            no_change_args = (
+                conn_main, cbz_path_obj, rel_path_str, original_cbz_size,
+                original_cbz_size, 0, dominant_type, JXL_EFFORT,
+                duration_value, img_count, num_jpg, num_png, conv_mode,
+                mp_info, fingerprint,
             )
+            no_change_options = {
+                "input_fingerprint": fingerprint,
+                "converted_pages": converted_pages,
+                "lossless_pages": lossless_pages,
+                "lossy_pages": lossy_pages,
+                "retained_pages": retained_pages,
+            }
+            if page_failures:
+                mark_processed(
+                    *no_change_args,
+                    commit=False,
+                    **no_change_options,
+                )
+                persist_page_decisions(
+                    conn_main,
+                    rel_path_str,
+                    workspace,
+                    commit=False,
+                )
+                failure_count = persist_page_failure_issues(
+                    conn_main,
+                    rel_path_str,
+                    page_failures,
+                    commit=False,
+                )
+                if conn_main:
+                    conn_main.commit()
+            else:
+                queue_no_change_result(
+                    *no_change_args,
+                    **no_change_options,
+                )
             workspace.complete()
+            if page_failures:
+                emit(
+                    "archive_partial",
+                    level="warning",
+                    message=(
+                        f"Retained the original archive after {failure_count} "
+                        f"image processing failure"
+                        f"{'s' if failure_count != 1 else ''}: {rel_path_str}"
+                    ),
+                    archive=rel_path_str,
+                    stage="complete",
+                    bytes_saved=0,
+                    page_failure_count=failure_count,
+                    failed_entries=[
+                        failure.get("entry_path") for failure in page_failures
+                    ],
+                )
+                return 0, False, False, "partial"
             emit("archive_completed", message=f"No changes required for {rel_path_str}", archive=rel_path_str, stage="complete", bytes_saved=0)
             return 0, False, False, "processed"
 
@@ -3601,9 +3760,35 @@ def process_cbz(
                         workspace,
                         commit=False,
                     )
+                    failure_count = persist_page_failure_issues(
+                        conn_main,
+                        rel_path_str,
+                        page_failures,
+                        commit=False,
+                    )
                     if conn_main:
                         conn_main.commit()
                     workspace.complete()
+                    if page_failures:
+                        emit(
+                            "archive_partial",
+                            level="warning",
+                            message=(
+                                f"Retained the original archive because the rebuilt "
+                                f"candidate was not smaller; {failure_count} image "
+                                f"processing failure"
+                                f"{'s' if failure_count != 1 else ''}: {rel_path_str}"
+                            ),
+                            archive=rel_path_str,
+                            stage="complete",
+                            bytes_saved=0,
+                            page_failure_count=failure_count,
+                            failed_entries=[
+                                failure.get("entry_path")
+                                for failure in page_failures
+                            ],
+                        )
+                        return 0, False, False, "partial"
                     emit(
                         "archive_completed",
                         level="warning",
@@ -3691,6 +3876,12 @@ def process_cbz(
             workspace,
             commit=False,
         )
+        failure_count = persist_page_failure_issues(
+            conn_main,
+            rel_path_str,
+            page_failures,
+            commit=False,
+        )
         clear_archive_commit_intent(
             conn_main,
             rel_path_str,
@@ -3700,6 +3891,26 @@ def process_cbz(
             conn_main.commit()
         workspace.complete()
         cleanup_repair_source(cli_args)
+        if page_failures:
+            emit(
+                "archive_partial",
+                level="warning",
+                message=(
+                    f"Converted the smaller verified pages and retained "
+                    f"{failure_count} failed image original"
+                    f"{'s' if failure_count != 1 else ''}: {rel_path_str}"
+                ),
+                archive=rel_path_str,
+                stage="complete",
+                bytes_saved=actual_saved_bytes,
+                page_failure_count=failure_count,
+                failed_entries=[
+                    failure.get("entry_path") for failure in page_failures
+                ],
+                converted_pages=converted_pages,
+                retained_pages=retained_pages,
+            )
+            return actual_saved_bytes, False, False, "partial"
         emit(
             "archive_completed",
             level="success",
@@ -4405,6 +4616,10 @@ def main():
                     skipped_count += 1
                 elif outcome == "failed":
                     failed_to_process_count += 1
+                elif outcome == "partial":
+                    failed_to_process_count += 1
+                    total_bytes_saved_overall += max(bytes_saved, 0)
+                    total_bytes_increased_overall += max(-bytes_saved, 0)
                 elif was_deleted:
                     deleted_empty_archives_count += 1
                 else:
@@ -4433,7 +4648,7 @@ def main():
     log(f"   Total archives found:     {total_files}")
     log(f"   Archives processed:       {processed_count}")
     log(f"   Skipped (already done):   {skipped_count}")
-    log(f"   Failed to process:        {failed_to_process_count}")
+    log(f"   Archives with failures:  {failed_to_process_count}")
     
     if net_bytes_saved >= 0:
         log(f"   Net space saved:          {net_bytes_saved / (1024 ** 3):.3f} GB ({net_bytes_saved / (1024 ** 2):.2f} MB)")

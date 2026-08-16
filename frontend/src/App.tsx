@@ -294,14 +294,11 @@ function PerformanceChart({ rows, range }: { rows: Json[]; range: "90" | "365" |
   const plotWidth = width - margin.left - margin.right;
   const plotHeight = height - margin.top - margin.bottom;
   const netValues = data.map((row: Json) => Number(row.cumulative_net_gb || 0));
-  const averageValues = data.map((row: Json) => Number(row.average_percent_saved || 0));
   const netFloor = Math.min(0, ...netValues);
   const netCeiling = Math.max(1, ...netValues);
   const netStep = niceChartStep((netCeiling - netFloor) / 4);
   const netMinimum = Math.floor(netFloor / netStep) * netStep;
   const netMaximum = Math.ceil(netCeiling / netStep) * netStep;
-  const averageMinimum = Math.floor(Math.min(...averageValues) / 5) * 5;
-  const averageMaximum = Math.max(5, Math.ceil(Math.max(...averageValues) / 5) * 5);
   const firstTimestamp = Number(data[0].timestamp);
   const lastTimestamp = Number(data[data.length - 1].timestamp);
   const timestampSpan = Math.max(1, lastTimestamp - firstTimestamp);
@@ -309,13 +306,14 @@ function PerformanceChart({ rows, range }: { rows: Json[]; range: "90" | "365" |
     ? margin.left + plotWidth
     : margin.left + (Number(row.timestamp) - firstTimestamp) / timestampSpan * plotWidth;
   const netY = (value: number) => margin.top + (netMaximum - value) / Math.max(1, netMaximum - netMinimum) * plotHeight;
-  const averageY = (value: number) => margin.top + (averageMaximum - value) / Math.max(1, averageMaximum - averageMinimum) * plotHeight;
+  const averageY = (value: number) => margin.top + (100 - Math.min(100, Math.max(0, value))) / 100 * plotHeight;
   const netPoints = data.map((row: Json, index: number) => `${x(row, index)},${netY(Number(row.cumulative_net_gb || 0))}`).join(" ");
   const averagePoints = data.map((row: Json, index: number) => `${x(row, index)},${averageY(Number(row.average_percent_saved || 0))}`).join(" ");
   const gridValues = Array.from(
     { length: Math.round((netMaximum - netMinimum) / netStep) + 1 },
     (_, index) => netMinimum + netStep * index,
   );
+  const percentageTicks = [0, 25, 50, 75, 100];
   const tickIndexes = [...new Set([0, Math.floor((data.length - 1) / 2), data.length - 1])];
   const dateFormat = range === "90"
     ? { day: "numeric", month: "short" } as const
@@ -326,12 +324,17 @@ function PerformanceChart({ rows, range }: { rows: Json[]; range: "90" | "365" |
   const displayedRuns = data.reduce((total: number, row: Json) => total + Number(row.run_count || 1), 0);
 
   return <figure className="performance-figure">
-    <svg className="performance-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Net savings and average percentage saved over completed conversion runs">
+    <svg className="performance-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Net savings and average reduction across accepted conversion runs">
       <title>Conversion performance over time</title>
       {gridValues.map((value) => <g key={value}>
         <line x1={margin.left} y1={netY(value)} x2={margin.left + plotWidth} y2={netY(value)} />
         <text x={margin.left - 9} y={netY(value) + 4} textAnchor="end">{Math.round(value)} GB</text>
       </g>)}
+      {percentageTicks.map((value) => <text
+        key={`percentage-${value}`}
+        x={margin.left + plotWidth + 10}
+        y={averageY(value) + 4}
+      >{value}%</text>)}
       <line x1={margin.left} y1={margin.top + plotHeight} x2={margin.left + plotWidth} y2={margin.top + plotHeight} />
       <polyline className="net-line" points={netPoints} />
       <polyline className="average-line" points={averagePoints} />
@@ -345,12 +348,10 @@ function PerformanceChart({ rows, range }: { rows: Json[]; range: "90" | "365" |
         y={height - 10}
         textAnchor={index === 0 ? "start" : index === data.length - 1 ? "end" : "middle"}
       >{formatDate(data[index])}</text>)}
-      <text className="chart-value" x={margin.left + plotWidth + 10} y={netY(Number(last.cumulative_net_gb || 0)) + 4}>{Number(last.cumulative_net_gb || 0).toFixed(1)} GB</text>
-      <text className="chart-value" x={margin.left + plotWidth + 10} y={averageY(Number(last.average_percent_saved || 0)) + 4}>{Number(last.average_percent_saved || 0).toFixed(1)}%</text>
     </svg>
     <figcaption className="chart-legend">
       <span><i className="net" />Cumulative net savings</span>
-      <span><i className="average" />Average percentage saved</span>
+      <span><i className="average" />Average reduction of accepted conversions</span>
       <small>{formatDate(first)}–{formatDate(last)} · {displayedRuns.toLocaleString()} runs · {Number(last.cumulative_net_gb || 0).toFixed(1)} GB saved · {Number(last.average_percent_saved || 0).toFixed(1)}% average</small>
     </figcaption>
   </figure>;
@@ -382,7 +383,7 @@ function DetailedStatistics({ data }: { data: Json }) {
 
     <section className="report-section">
       <header className="report-heading">
-        <div><h2>Performance over time</h2><p>Cumulative net savings and average percentage saved across completed runs.</p></div>
+        <div><h2>Performance over time</h2><p>Cumulative net savings and average reduction across accepted conversions. Retained originals are excluded.</p></div>
         <div className="range-controls" role="group" aria-label="Performance range">
           {(["90", "365", "all"] as const).map((value) => <button className={range === value ? "active" : ""} key={value} onClick={() => setRange(value)}>{value === "90" ? "90 days" : value === "365" ? "1 year" : "All time"}</button>)}
         </div>
@@ -788,6 +789,8 @@ function Attention({ refreshDashboard, notify }: {
           <div>
             <strong>{group.label}</strong>
             <span><b>{group.triage}</b>{group.recommended}</span>
+            {Number(group.count || 0) !== Number(group.archive_count || group.count || 0) &&
+              <span className="failure-scope">{Number(group.count || 0).toLocaleString()} failing images across {Number(group.archive_count || 0).toLocaleString()} archives</span>}
           </div>
           <span className="failure-count">{Number(group.count || 0).toLocaleString()}</span>
           <button className="button ghost" aria-expanded={expandedGroup} onClick={() => toggleGroup(group.id)}>{expandedGroup ? "Close" : "Review"}</button>
@@ -808,7 +811,13 @@ function Attention({ refreshDashboard, notify }: {
             );
             return <div className={`issue ${expanded ? "expanded" : ""}`} key={issue.id}>
               <div className="issue-summary">
-                <div><strong>{archiveName(issue.path)}</strong><span className="error-copy">{issueDisplayMessage(issue)}</span>{issue.entry_path && <code>{issue.entry_path}</code>}</div>
+                <div>
+                  <strong>{archiveName(issue.path)}</strong>
+                  {openGroup === "images" && Number(issue.archive_issue_count || 0) > 1 &&
+                    <span className="archive-failure-count">{Number(issue.archive_issue_count).toLocaleString()} failing images in this archive</span>}
+                  <span className="error-copy">{issueDisplayMessage(issue)}</span>
+                  {issue.entry_path && <code>{issue.entry_path}</code>}
+                </div>
                 <time>{dateTime(issue.updated_at)}</time>
                 <div className="issue-actions">
                   {!collision && <button className="button primary" disabled={busy === issue.id || issue.status === "queued"} onClick={() => act(issue, "retry")}>{issue.status === "queued" ? "Queued" : "Retry"}</button>}
@@ -864,7 +873,7 @@ function Attention({ refreshDashboard, notify }: {
               </div>}
             </div>;
           })}
-          {rows.length >= 100 && <div className="group-limit">Showing the 100 most recently updated archives in this failure type.</div>}
+          {rows.length >= 100 && <div className="group-limit">Showing the 100 most recently updated failures in this category.</div>}
         </div>}
       </article>;
     })}

@@ -31,7 +31,7 @@ CONFIG_DIR = Path(os.getenv("CONFIG_DIR", "/config"))
 DB_PATH = Path(os.getenv("DB_PATH", str(CONFIG_DIR / "cbzxl-v3.sqlite3")))
 LIBRARY_PATH = os.getenv("LIBRARY_PATH", "/data")
 APP_TIMEZONE = os.getenv("TZ", "UTC")
-LATEST_SCHEMA_VERSION = 13
+LATEST_SCHEMA_VERSION = 15
 _INITIALIZE_LOCK = threading.RLock()
 DATABASE_MAINTENANCE_SECONDS = max(
     86400,
@@ -263,7 +263,7 @@ CREATE TABLE IF NOT EXISTS archive_commit_intents (
 
 CREATE TABLE IF NOT EXISTS archive_issues (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    archive_id INTEGER NOT NULL UNIQUE REFERENCES archives(id) ON DELETE CASCADE,
+    archive_id INTEGER NOT NULL REFERENCES archives(id) ON DELETE CASCADE,
     job_id TEXT REFERENCES jobs(id) ON DELETE SET NULL,
     kind TEXT NOT NULL,
     stage TEXT NOT NULL,
@@ -386,6 +386,12 @@ CREATE INDEX IF NOT EXISTS idx_archive_format_stats_format ON archive_format_sta
 CREATE INDEX IF NOT EXISTS idx_commit_intents_library ON archive_commit_intents(library_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_archive_issues_status ON archive_issues(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_archive_issues_job ON archive_issues(job_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_archive_issues_entry_unique
+ON archive_issues(archive_id, entry_path)
+WHERE entry_path IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_archive_issues_archive_unique
+ON archive_issues(archive_id)
+WHERE entry_path IS NULL;
 CREATE INDEX IF NOT EXISTS idx_archive_issues_open_group
 ON archive_issues(kind, stage, updated_at DESC)
 WHERE status IN ('open', 'queued');
@@ -705,7 +711,11 @@ def refresh_dashboard_metrics(
         SELECT
             l.id,
             COUNT(a.id),
-            COALESCE(SUM(CASE WHEN a.status='processed' THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(CASE
+                WHEN a.status='processed'
+                 AND a.converted_pages > 0
+                 AND a.bytes_saved > 0
+                THEN 1 ELSE 0 END), 0),
             COALESCE(SUM(CASE WHEN a.status='failed' THEN 1 ELSE 0 END), 0),
             COALESCE(SUM(CASE
                 WHEN a.status='processed' AND a.bytes_saved < 0
@@ -746,16 +756,26 @@ def refresh_dashboard_metrics(
                 WHEN a.status='processed' AND a.bytes_saved = 0
                 THEN a.image_count ELSE 0 END), 0),
             COALESCE(SUM(CASE
-                WHEN a.status='processed' AND a.original_size > 0
+                WHEN a.status='processed'
+                 AND a.converted_pages > 0
+                 AND a.bytes_saved > 0
+                 AND a.original_size > 0
                 THEN a.percent_saved ELSE 0 END), 0),
             COALESCE(SUM(CASE
-                WHEN a.status='processed' AND a.original_size > 0
+                WHEN a.status='processed'
+                 AND a.converted_pages > 0
+                 AND a.bytes_saved > 0
+                 AND a.original_size > 0
                  AND a.percent_saved IS NOT NULL THEN 1 ELSE 0 END), 0),
             COALESCE(SUM(CASE
                 WHEN a.status='processed'
+                 AND a.converted_pages > 0
+                 AND a.bytes_saved > 0
                 THEN a.processing_duration_seconds ELSE 0 END), 0),
             COALESCE(SUM(CASE
                 WHEN a.status='processed'
+                 AND a.converted_pages > 0
+                 AND a.bytes_saved > 0
                  AND a.processing_duration_seconds IS NOT NULL
                 THEN 1 ELSE 0 END), 0),
             ?
@@ -857,6 +877,84 @@ def load_dashboard_metrics(
         """
     ).fetchone()
     return row_dict(row)
+
+
+def migrate_archive_issues_for_multiple_entries(
+    conn: sqlite3.Connection,
+) -> None:
+    """Remove the legacy one-issue-per-archive constraint.
+
+    Page failures are unique per archive entry, while archive-scoped failures
+    continue to have a single row. SQLite cannot drop the implicit UNIQUE
+    constraint from the legacy table, so an existing table must be rebuilt.
+    """
+    table = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='archive_issues'"
+    ).fetchone()
+    table_sql = str(table["sql"] or "") if table else ""
+    legacy_unique = "archive_id INTEGER NOT NULL UNIQUE" in " ".join(
+        table_sql.split()
+    )
+    if legacy_unique:
+        conn.execute("DROP INDEX IF EXISTS idx_archive_issues_status")
+        conn.execute("DROP INDEX IF EXISTS idx_archive_issues_job")
+        conn.execute("DROP INDEX IF EXISTS idx_archive_issues_open_group")
+        conn.execute("DROP INDEX IF EXISTS idx_archive_issues_entry_unique")
+        conn.execute("DROP INDEX IF EXISTS idx_archive_issues_archive_unique")
+        conn.execute("ALTER TABLE archive_issues RENAME TO archive_issues_legacy")
+        conn.execute(
+            """
+            CREATE TABLE archive_issues (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                archive_id INTEGER NOT NULL REFERENCES archives(id) ON DELETE CASCADE,
+                job_id TEXT REFERENCES jobs(id) ON DELETE SET NULL,
+                kind TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                entry_path TEXT,
+                related_entry_path TEXT,
+                message TEXT NOT NULL,
+                detail TEXT,
+                status TEXT NOT NULL DEFAULT 'open'
+                    CHECK (status IN ('open', 'queued', 'dismissed', 'resolved')),
+                remedy TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                resolved_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO archive_issues(
+                id, archive_id, job_id, kind, stage, entry_path,
+                related_entry_path, message, detail, status, remedy,
+                created_at, updated_at, resolved_at
+            )
+            SELECT
+                id, archive_id, job_id, kind, stage, entry_path,
+                related_entry_path, message, detail, status, remedy,
+                created_at, updated_at, resolved_at
+            FROM archive_issues_legacy
+            """
+        )
+        conn.execute("DROP TABLE archive_issues_legacy")
+    conn.executescript(
+        """
+        CREATE INDEX IF NOT EXISTS idx_archive_issues_status
+        ON archive_issues(status, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_archive_issues_job
+        ON archive_issues(job_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_archive_issues_entry_unique
+        ON archive_issues(archive_id, entry_path)
+        WHERE entry_path IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_archive_issues_archive_unique
+        ON archive_issues(archive_id)
+        WHERE entry_path IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_archive_issues_open_group
+        ON archive_issues(kind, stage, updated_at DESC)
+        WHERE status IN ('open', 'queued');
+        """
+    )
 
 
 def _initialize_schema() -> None:
@@ -1157,6 +1255,21 @@ def _initialize_schema() -> None:
                 "INSERT INTO schema_migrations(version, applied_at) VALUES (13, ?)",
                 (now,),
             )
+        if not version_applied(conn, 14):
+            migrate_archive_issues_for_multiple_entries(conn)
+            conn.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (14, ?)",
+                (now,),
+            )
+        if not version_applied(conn, 15):
+            # v15 narrows conversion-performance samples to accepted, smaller
+            # replacements. Refresh cached metrics so retained originals stop
+            # contributing zero-value percentage and duration samples at once.
+            refresh_dashboard_metrics(conn)
+            conn.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (15, ?)",
+                (now,),
+            )
     run_database_maintenance()
 
 
@@ -1182,14 +1295,19 @@ def upsert_archive_issue(
     detail: str | None = None,
 ) -> int:
     now = utc_now()
+    conflict_target = (
+        "(archive_id, entry_path) WHERE entry_path IS NOT NULL"
+        if entry_path is not None
+        else "(archive_id) WHERE entry_path IS NULL"
+    )
     conn.execute(
-        """
+        f"""
         INSERT INTO archive_issues(
             archive_id, job_id, kind, stage, entry_path, related_entry_path,
             message, detail,
             status, remedy, created_at, updated_at, resolved_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, ?, ?, NULL)
-        ON CONFLICT(archive_id) DO UPDATE SET
+        ON CONFLICT{conflict_target} DO UPDATE SET
             job_id=excluded.job_id,
             kind=excluded.kind,
             stage=excluded.stage,
@@ -1223,7 +1341,15 @@ def upsert_archive_issue(
         """,
         (now, archive_id),
     )
-    return int(conn.execute("SELECT id FROM archive_issues WHERE archive_id=?", (archive_id,)).fetchone()[0])
+    return int(
+        conn.execute(
+            """
+            SELECT id FROM archive_issues
+            WHERE archive_id=? AND entry_path IS ?
+            """,
+            (archive_id, entry_path),
+        ).fetchone()[0]
+    )
 
 
 def resolve_archive_issue(

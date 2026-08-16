@@ -121,6 +121,19 @@ def publish_event(job_id: str, event: dict) -> None:
         elif event_type == "archive_failed":
             state["failed"] = int(state.get("failed") or 0) + 1
             _record_completion(state, event)
+        elif event_type == "archive_partial":
+            state["failed"] = int(state.get("failed") or 0) + 1
+            saved = int(event.get("bytes_saved") or 0)
+            if saved >= 0:
+                state["bytes_saved"] = int(state.get("bytes_saved") or 0) + saved
+            else:
+                state["bytes_increased"] = int(
+                    state.get("bytes_increased") or 0
+                ) - saved
+            state["net_bytes_saved"] = int(state.get("bytes_saved") or 0) - int(
+                state.get("bytes_increased") or 0
+            )
+            _record_completion(state, event)
         elif event_type in {"job_completed", "job_failed", "job_cancelled"}:
             state["status"] = str(
                 event.get("status")

@@ -111,6 +111,35 @@ class WorkerProtocolTests(unittest.TestCase):
         self.assertEqual(live["recent_archive_seconds"], 1.0)
         self.assertEqual(sample_count, 0)
 
+    def test_partial_archive_counts_once_and_preserves_its_savings(self):
+        persist_output(
+            self.job_id,
+            encode_event(
+                "job_started",
+                message="Conversion started",
+                archives_found=1,
+                stage="discovering",
+            ),
+        )
+        persist_output(
+            self.job_id,
+            encode_event(
+                "archive_partial",
+                message="Two images failed",
+                archive="Series/Damaged.cbz",
+                stage="complete",
+                bytes_saved=4096,
+                page_failure_count=2,
+            ),
+        )
+
+        live = runtime_state.read_live_job(self.job_id)
+
+        self.assertEqual(live["processed"], 0)
+        self.assertEqual(live["failed"], 1)
+        self.assertEqual(live["bytes_saved"], 4096)
+        self.assertEqual(live["net_bytes_saved"], 4096)
+
     def test_legacy_text_is_ignored_after_structured_protocol_starts(self):
         persist_output(
             self.job_id,

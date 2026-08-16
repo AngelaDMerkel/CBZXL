@@ -26,7 +26,7 @@ class DatabaseTests(unittest.TestCase):
                 row[0]
                 for row in conn.execute("SELECT name FROM conversion_profiles")
             }
-        self.assertEqual(version, 13)
+        self.assertEqual(version, 15)
         self.assertEqual(library["root_path"], database.LIBRARY_PATH)
         self.assertEqual(profile["name"], "Balanced lossless")
         self.assertEqual(
@@ -98,6 +98,230 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(columns, ["run_id", "path"])
         self.assertEqual(row, ("old-run", "Series/Book.cbz"))
         self.assertIn("job_id", current_columns)
+
+    def test_performance_metrics_exclude_retained_originals(self):
+        now = database.utc_now()
+        with database.transaction() as conn:
+            library = database.default_library(conn)
+            conn.execute(
+                """
+                INSERT INTO archives(
+                    library_id, path, status, original_size, final_size,
+                    bytes_saved, percent_saved, processing_duration_seconds,
+                    image_count, converted_pages, retained_pages,
+                    conversion_mode, created_at, updated_at
+                ) VALUES
+                    (?, 'Converted.cbz', 'processed', 1000, 700, 300, 30,
+                     40, 10, 8, 2, 'Lossless', ?, ?),
+                    (?, 'Retained.cbz', 'processed', 1000, 1000, 0, 0,
+                     80, 10, 0, 10, 'Original retained', ?, ?)
+                """,
+                (library["id"], now, now, library["id"], now, now),
+            )
+
+        with database.connect() as conn:
+            metrics = database.load_dashboard_metrics(conn, refresh_dirty=True)
+
+        self.assertEqual(metrics["percent_sample_count"], 1)
+        self.assertEqual(metrics["percent_saved_sum"], 30)
+        self.assertEqual(metrics["duration_sample_count"], 1)
+        self.assertEqual(metrics["duration_sum"], 40)
+        self.assertEqual(metrics["optimized_count"], 1)
+
+    def test_version_fifteen_refreshes_cached_performance_samples(self):
+        now = database.utc_now()
+        with database.transaction() as conn:
+            library = database.default_library(conn)
+            conn.execute(
+                """
+                INSERT INTO archives(
+                    library_id, path, status, original_size, final_size,
+                    bytes_saved, percent_saved, processing_duration_seconds,
+                    converted_pages, created_at, updated_at
+                ) VALUES
+                    (?, 'Converted.cbz', 'processed', 1000, 700, 300, 30,
+                     40, 8, ?, ?),
+                    (?, 'Retained.cbz', 'processed', 1000, 1000, 0, 0,
+                     80, 0, ?, ?)
+                """,
+                (library["id"], now, now, library["id"], now, now),
+            )
+            conn.execute(
+                """
+                UPDATE library_dashboard_metrics
+                SET optimized_count=2,
+                    percent_saved_sum=30,
+                    percent_sample_count=2,
+                    duration_sum=120,
+                    duration_sample_count=2
+                WHERE library_id=?
+                """,
+                (library["id"],),
+            )
+            conn.execute("DELETE FROM schema_migrations WHERE version=15")
+
+        database.initialize()
+
+        with database.connect() as conn:
+            metrics = conn.execute(
+                """
+                SELECT optimized_count, percent_saved_sum, percent_sample_count,
+                       duration_sum, duration_sample_count
+                FROM library_dashboard_metrics
+                WHERE library_id=?
+                """,
+                (library["id"],),
+            ).fetchone()
+            version = conn.execute(
+                "SELECT MAX(version) FROM schema_migrations"
+            ).fetchone()[0]
+
+        self.assertEqual(tuple(metrics), (1, 30, 1, 40, 1))
+        self.assertEqual(version, 15)
+
+    def test_archive_can_track_multiple_page_failures_independently(self):
+        now = database.utc_now()
+        with database.transaction() as conn:
+            library = database.default_library(conn)
+            conn.execute(
+                """
+                INSERT INTO archives(
+                    library_id, path, status, created_at, updated_at
+                ) VALUES (?, 'Series/Damaged.cbz', 'processed', ?, ?)
+                """,
+                (library["id"], now, now),
+            )
+            archive_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            first_id = database.upsert_archive_issue(
+                conn,
+                archive_id=archive_id,
+                job_id=None,
+                kind="image_corrupt",
+                stage="decoding",
+                entry_path="007.jpg",
+                message="First image failed",
+            )
+            second_id = database.upsert_archive_issue(
+                conn,
+                archive_id=archive_id,
+                job_id=None,
+                kind="image_corrupt",
+                stage="decoding",
+                entry_path="009.jpg",
+                message="Second image failed",
+            )
+            updated_first_id = database.upsert_archive_issue(
+                conn,
+                archive_id=archive_id,
+                job_id=None,
+                kind="page_encode_failed",
+                stage="encoding",
+                entry_path="007.jpg",
+                message="First image still fails",
+            )
+
+        with database.connect() as conn:
+            issues = conn.execute(
+                """
+                SELECT id, entry_path, kind, message
+                FROM archive_issues
+                WHERE archive_id=?
+                ORDER BY entry_path
+                """,
+                (archive_id,),
+            ).fetchall()
+        self.assertNotEqual(first_id, second_id)
+        self.assertEqual(first_id, updated_first_id)
+        self.assertEqual(len(issues), 2)
+        self.assertEqual(
+            [tuple(issue) for issue in issues],
+            [
+                (first_id, "007.jpg", "page_encode_failed", "First image still fails"),
+                (second_id, "009.jpg", "image_corrupt", "Second image failed"),
+            ],
+        )
+
+    def test_version_fourteen_migrates_legacy_single_issue_constraint(self):
+        now = database.utc_now()
+        with database.transaction() as conn:
+            library = database.default_library(conn)
+            conn.execute(
+                """
+                INSERT INTO archives(
+                    library_id, path, status, created_at, updated_at
+                ) VALUES (?, 'Series/Legacy.cbz', 'processed', ?, ?)
+                """,
+                (library["id"], now, now),
+            )
+            archive_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            database.upsert_archive_issue(
+                conn,
+                archive_id=archive_id,
+                job_id=None,
+                kind="image_corrupt",
+                stage="decoding",
+                entry_path="001.jpg",
+                message="Legacy failure",
+            )
+            for index_name in (
+                "idx_archive_issues_status",
+                "idx_archive_issues_job",
+                "idx_archive_issues_open_group",
+                "idx_archive_issues_entry_unique",
+                "idx_archive_issues_archive_unique",
+            ):
+                conn.execute(f"DROP INDEX IF EXISTS {index_name}")
+            conn.execute("ALTER TABLE archive_issues RENAME TO archive_issues_v14")
+            conn.execute(
+                """
+                CREATE TABLE archive_issues (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    archive_id INTEGER NOT NULL UNIQUE
+                        REFERENCES archives(id) ON DELETE CASCADE,
+                    job_id TEXT REFERENCES jobs(id) ON DELETE SET NULL,
+                    kind TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    entry_path TEXT,
+                    related_entry_path TEXT,
+                    message TEXT NOT NULL,
+                    detail TEXT,
+                    status TEXT NOT NULL DEFAULT 'open'
+                        CHECK (status IN ('open', 'queued', 'dismissed', 'resolved')),
+                    remedy TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    resolved_at TEXT
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO archive_issues SELECT * FROM archive_issues_v14"
+            )
+            conn.execute("DROP TABLE archive_issues_v14")
+            conn.execute("DELETE FROM schema_migrations WHERE version=14")
+
+        database.initialize()
+
+        with database.transaction() as conn:
+            second_id = database.upsert_archive_issue(
+                conn,
+                archive_id=archive_id,
+                job_id=None,
+                kind="image_corrupt",
+                stage="decoding",
+                entry_path="002.jpg",
+                message="Second failure",
+            )
+            rows = conn.execute(
+                "SELECT entry_path FROM archive_issues WHERE archive_id=? ORDER BY entry_path",
+                (archive_id,),
+            ).fetchall()
+            version = conn.execute(
+                "SELECT MAX(version) FROM schema_migrations"
+            ).fetchone()[0]
+        self.assertGreater(second_id, 0)
+        self.assertEqual([row[0] for row in rows], ["001.jpg", "002.jpg"])
+        self.assertEqual(version, 15)
 
     def test_legacy_table_missing_job_id_is_upgraded_before_indexes(self):
         legacy_path = Path(self.temp.name) / "legacy-missing-job.sqlite3"
@@ -267,7 +491,7 @@ class DatabaseTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(tuple(archive), (-62, "extension_overhead"))
         self.assertEqual(tuple(issue), ("resolved", "extension_overhead"))
-        self.assertEqual(version, 13)
+        self.assertEqual(version, 15)
 
     def test_human_schedule_calculation(self):
         after = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)

@@ -121,6 +121,7 @@ input[type="range"] { width: 100%; accent-color: var(--blue); }
 .issue, .history-list > article { border-bottom: 1px solid var(--line); }
 .issue-summary { display: grid; grid-template-columns: minmax(210px, 1fr) 130px auto; align-items: center; gap: 20px; min-height: 74px; }
 .issue-summary > div:first-child strong, .issue-summary > div:first-child span, .issue-summary > div:first-child code { display: block; }.issue-summary > div:first-child strong { font-size: 13px; }.issue-summary > div:first-child span { margin-top: 4px; color: var(--muted); font-size: 10px; }.issue-summary > div:first-child code { margin-top: 5px; overflow-wrap: anywhere; color: var(--soft); font-size: 9px; }.issue-summary .error-copy { color: var(--red) !important; }
+.failure-type-summary .failure-scope { color: var(--amber); font-weight: 650; }.issue-summary .archive-failure-count { color: var(--amber) !important; font-weight: 700; }
 .issue-summary time { color: var(--soft); font-size: 10px; }
 .issue-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
 .issue-detail { display: grid; grid-template-columns: minmax(130px, 180px) minmax(0, 1fr); gap: 28px; padding: 12px 0 28px; animation: reveal .2s ease-out; }.issue-detail.without-preview { grid-template-columns: 1fr; }

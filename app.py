@@ -77,7 +77,7 @@ ROOT = Path(__file__).parent
 FRONTEND_DIST = ROOT / "frontend" / "dist"
 LEGACY_STATIC = ROOT / "static"
 
-VERSION = "4.5.8"
+VERSION = "4.5.10"
 LOGGER = logging.getLogger("cbzxl.web")
 DATABASE_STARTUP_ERROR: str | None = None
 RUNTIME_STARTUP_ERROR: str | None = None
@@ -243,9 +243,13 @@ def dashboard():
             conn.execute(
                 """
                 SELECT
-                    COUNT(*) AS total,
-                    SUM(CASE WHEN ai.kind='archive_grew' THEN 1 ELSE 0 END) AS grew,
-                    SUM(CASE WHEN ai.kind!='archive_grew' THEN 1 ELSE 0 END) AS failed
+                    COUNT(DISTINCT ai.archive_id) AS total,
+                    COUNT(DISTINCT CASE
+                        WHEN ai.kind='archive_grew' THEN ai.archive_id END
+                    ) AS grew,
+                    COUNT(DISTINCT CASE
+                        WHEN ai.kind!='archive_grew' THEN ai.archive_id END
+                    ) AS failed
                 FROM archive_issues ai
                 WHERE ai.status IN ('open', 'queued')
                 """
@@ -329,6 +333,8 @@ def detailed_statistics():
                     COALESCE(AVG(CASE WHEN original_size > 0 THEN percent_saved END), 0) AS average_percent_saved
                 FROM archives
                 WHERE status='processed'
+                  AND converted_pages > 0
+                  AND bytes_saved > 0
                 GROUP BY label
                 ORDER BY net_bytes DESC
                 LIMIT 8
@@ -384,6 +390,8 @@ def detailed_statistics():
                     SUM(CASE WHEN processing_duration_seconds >= 600 THEN 1 ELSE 0 END) AS duration_600_plus
                 FROM archives
                 WHERE status='processed'
+                  AND converted_pages > 0
+                  AND bytes_saved > 0
                 """
             ).fetchone()
         )
@@ -396,7 +404,10 @@ def detailed_statistics():
                         ROW_NUMBER() OVER (ORDER BY percent_saved) AS position,
                         COUNT(*) OVER () AS value_count
                     FROM archives
-                    WHERE status='processed' AND percent_saved IS NOT NULL
+                    WHERE status='processed'
+                      AND converted_pages > 0
+                      AND bytes_saved > 0
+                      AND percent_saved IS NOT NULL
                 ),
                 durations AS MATERIALIZED (
                     SELECT
@@ -405,6 +416,8 @@ def detailed_statistics():
                         COUNT(*) OVER () AS value_count
                     FROM archives
                     WHERE status='processed'
+                      AND converted_pages > 0
+                      AND bytes_saved > 0
                       AND processing_duration_seconds IS NOT NULL
                       AND processing_duration_seconds >= 0
                 )
@@ -429,6 +442,8 @@ def detailed_statistics():
                     SELECT
                         COALESCE(p.name, 'Deleted policy') AS policy,
                         ar.status,
+                        ar.bytes_saved,
+                        ar.converted_pages,
                         ar.processing_duration_seconds AS duration,
                         ar.percent_saved
                     FROM archive_results ar
@@ -439,8 +454,18 @@ def detailed_statistics():
                     SELECT
                         policy,
                         COUNT(*) AS attempted,
-                        SUM(CASE WHEN status='processed' THEN 1 ELSE 0 END) AS processed,
-                        AVG(CASE WHEN status='processed' THEN percent_saved END) AS average_percent_saved
+                        SUM(CASE
+                            WHEN status='processed'
+                             AND converted_pages > 0
+                             AND bytes_saved > 0
+                            THEN 1 ELSE 0 END
+                        ) AS processed,
+                        AVG(CASE
+                            WHEN status='processed'
+                             AND converted_pages > 0
+                             AND bytes_saved > 0
+                            THEN percent_saved END
+                        ) AS average_percent_saved
                     FROM base
                     GROUP BY policy
                 ),
@@ -451,7 +476,10 @@ def detailed_statistics():
                         ROW_NUMBER() OVER (PARTITION BY policy ORDER BY duration) AS position,
                         COUNT(*) OVER (PARTITION BY policy) AS value_count
                     FROM base
-                    WHERE status='processed' AND duration IS NOT NULL
+                    WHERE status='processed'
+                      AND converted_pages > 0
+                      AND bytes_saved > 0
+                      AND duration IS NOT NULL
                 ),
                 medians AS (
                     SELECT policy, AVG(duration) AS median_seconds
@@ -479,26 +507,62 @@ def detailed_statistics():
         run_rows = rows_dict(
             conn.execute(
                 """
-                SELECT
-                    j.id,
-                    COALESCE(j.finished_at, j.queued_at) AS date,
-                    j.net_bytes_saved,
-                    j.status,
-                    COUNT(ar.id) AS result_count,
-                    AVG(CASE WHEN ar.status='processed' THEN ar.percent_saved END) AS attempt_average_percent_saved,
-                    s.net_bytes AS snapshot_net_bytes,
-                    s.average_percent_saved AS snapshot_average_percent_saved
-                FROM (
-                    SELECT *
-                    FROM jobs
-                    WHERE status NOT IN ('queued', 'running', 'stopping')
-                    ORDER BY COALESCE(finished_at, queued_at) DESC, id DESC
+                WITH per_run AS MATERIALIZED (
+                    SELECT
+                        j.id,
+                        COALESCE(j.finished_at, j.queued_at) AS date,
+                        j.status,
+                        COUNT(CASE
+                            WHEN ar.status='processed'
+                             AND ar.converted_pages > 0
+                             AND ar.bytes_saved > 0
+                            THEN ar.id END
+                        ) AS successful_conversion_count,
+                        COALESCE(SUM(CASE
+                            WHEN ar.status='processed'
+                             AND ar.converted_pages > 0
+                             AND ar.bytes_saved > 0
+                            THEN ar.percent_saved ELSE 0 END
+                        ), 0) AS successful_percent_sum
+                    FROM jobs j
+                    LEFT JOIN archive_results ar ON ar.job_id=j.id
+                    WHERE j.status NOT IN ('queued', 'running', 'stopping')
+                    GROUP BY j.id
+                ),
+                cumulative AS MATERIALIZED (
+                    SELECT
+                        per_run.*,
+                        SUM(successful_conversion_count) OVER (
+                            ORDER BY date, id ROWS UNBOUNDED PRECEDING
+                        ) AS cumulative_conversion_count,
+                        SUM(successful_percent_sum) OVER (
+                            ORDER BY date, id ROWS UNBOUNDED PRECEDING
+                        ) AS cumulative_percent_sum
+                    FROM per_run
+                ),
+                recent AS (
+                    SELECT
+                        cumulative.id,
+                        cumulative.date,
+                        cumulative.status,
+                        cumulative.successful_conversion_count AS result_count,
+                        CASE
+                            WHEN cumulative.cumulative_conversion_count > 0
+                            THEN cumulative.cumulative_percent_sum
+                                 / cumulative.cumulative_conversion_count
+                            ELSE 0
+                        END AS average_percent_saved,
+                        snapshots.net_bytes AS snapshot_net_bytes
+                    FROM cumulative
+                    JOIN library_stat_snapshots snapshots
+                      ON snapshots.job_id=cumulative.id
+                    WHERE cumulative.successful_conversion_count > 0
+                    ORDER BY cumulative.date DESC, cumulative.id DESC
                     LIMIT 180
-                ) j
-                LEFT JOIN archive_results ar ON ar.job_id=j.id
-                LEFT JOIN library_stat_snapshots s ON s.job_id=j.id
-                GROUP BY j.id
-                ORDER BY COALESCE(j.finished_at, j.queued_at), j.id
+                )
+                SELECT *
+                FROM recent
+                ORDER BY date, id
                 """
             ).fetchall()
         )
@@ -556,39 +620,21 @@ def detailed_statistics():
         {"label": "10m+", "count": int(distributions.get("duration_600_plus") or 0)},
     ]
 
-    cumulative_bytes = 0
-    weighted_percent_saved = 0.0
-    weighted_result_count = 0
     run_trend = []
     for row in run_rows:
-        cumulative_bytes += int(row.get("net_bytes_saved") or 0)
         result_count = int(row.get("result_count") or 0)
-        attempt_average = float(row.get("attempt_average_percent_saved") or 0)
-        if result_count:
-            weighted_percent_saved += attempt_average * result_count
-            weighted_result_count += result_count
-        snapshot_net = row.get("snapshot_net_bytes")
-        snapshot_average = row.get("snapshot_average_percent_saved")
         run_trend.append(
             {
                 "id": row["id"],
                 "date": row["date"],
-                "cumulative_net_gb": gb(
-                    snapshot_net if snapshot_net is not None else cumulative_bytes
-                ),
+                "cumulative_net_gb": gb(row.get("snapshot_net_bytes")),
                 "average_percent_saved": round(
-                    snapshot_average
-                    if snapshot_average is not None
-                    else (
-                        weighted_percent_saved / weighted_result_count
-                        if weighted_result_count
-                        else 0
-                    ),
+                    row.get("average_percent_saved") or 0,
                     1,
                 ),
                 "status": row["status"],
                 "result_count": result_count,
-                "library_snapshot": snapshot_net is not None,
+                "library_snapshot": True,
             }
         )
 
@@ -1269,10 +1315,17 @@ def queue_issue_job(conn, issue, action, overrides=None):
     conn.execute(
         """
         UPDATE archives
-        SET review_status='queued', review_note=?, dismissed_until_rescan=0, updated_at=?
+        SET review_status=CASE
+                WHEN EXISTS (
+                    SELECT 1 FROM archive_issues
+                    WHERE archive_id=? AND status='open'
+                ) THEN 'open'
+                ELSE 'queued'
+            END,
+            review_note=?, dismissed_until_rescan=0, updated_at=?
         WHERE id=?
         """,
-        (action, now, issue["archive_id"]),
+        (issue["archive_id"], action, now, issue["archive_id"]),
     )
     conn.execute(
         """
@@ -1300,31 +1353,36 @@ def issue_summary():
         counts = rows_dict(
             conn.execute(
                 """
-                SELECT kind, stage, COUNT(*) AS count
+                SELECT kind, stage, archive_id
                 FROM archive_issues
                 WHERE status IN ('open', 'queued')
-                GROUP BY kind, stage
                 """
             ).fetchall()
         )
     groups = {}
-    total = 0
+    attention_archives = set()
     for count_row in counts:
-        count = int(count_row.get("count") or 0)
-        total += count
+        archive_id = int(count_row["archive_id"])
+        attention_archives.add(archive_id)
         descriptor = issue_group(count_row)
         current = groups.setdefault(
             descriptor["id"],
-            {**descriptor, "count": 0},
+            {**descriptor, "count": 0, "archive_ids": set()},
         )
-        current["count"] += count
+        current["count"] += 1
+        current["archive_ids"].add(archive_id)
+    rows = []
+    for group in groups.values():
+        archive_ids = group.pop("archive_ids")
+        group["archive_count"] = len(archive_ids)
+        rows.append(group)
     return {
         "rows": [],
         "groups": sorted(
-            groups.values(),
+            rows,
             key=lambda item: (-int(item["count"]), str(item["label"])),
         ),
-        "total": total,
+        "total": len(attention_archives),
     }
 
 
@@ -1341,6 +1399,9 @@ def list_issues(
                 WITH issue_page AS MATERIALIZED (
                     SELECT
                         ai.*,
+                        COUNT(*) OVER (
+                            PARTITION BY ai.archive_id
+                        ) AS archive_issue_count,
                         CASE WHEN issue_job.source='retry' THEN 1 ELSE 0 END AS retry_failed,
                         a.library_id AS issue_library_id,
                         a.path,
@@ -1487,15 +1548,34 @@ def act_on_issue(issue_id: int, payload: IssueActionPayload):
                 """,
                 (now, issue_id),
             )
-            conn.execute(
+            remaining = conn.execute(
                 """
-                UPDATE archives
-                SET review_status='reviewed', review_note='Dismissed until full rescan',
-                    dismissed_until_rescan=1, reviewed_at=?, updated_at=?
-                WHERE id=?
+                SELECT COUNT(*) FROM archive_issues
+                WHERE archive_id=? AND status IN ('open', 'queued')
                 """,
-                (now, now, issue["archive_id"]),
-            )
+                (issue["archive_id"],),
+            ).fetchone()[0]
+            if remaining:
+                conn.execute(
+                    """
+                    UPDATE archives
+                    SET review_status='open', review_note=NULL,
+                        dismissed_until_rescan=0, reviewed_at=NULL, updated_at=?
+                    WHERE id=?
+                    """,
+                    (now, issue["archive_id"]),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE archives
+                    SET review_status='reviewed',
+                        review_note='Dismissed until full rescan',
+                        dismissed_until_rescan=1, reviewed_at=?, updated_at=?
+                    WHERE id=?
+                    """,
+                    (now, now, issue["archive_id"]),
+                )
             conn.execute(
                 """
                 INSERT INTO review_actions(archive_id, job_id, action, note, created_at)
@@ -1543,7 +1623,7 @@ def act_on_issue(issue_id: int, payload: IssueActionPayload):
                 "continue_on_page_error": True,
                 "repair_entry": issue.get("entry_path"),
             })
-            if issue.get("kind") == "crc_mismatch":
+            if issue.get("entry_path"):
                 overrides["repair_action"] = "preserve"
         elif payload.action == "lossless":
             overrides.update(
@@ -2460,7 +2540,7 @@ def homepage_widget():
             ).fetchone()[0]
             attention_count = conn.execute(
                 """
-                SELECT COUNT(*) FROM archive_issues
+                SELECT COUNT(DISTINCT archive_id) FROM archive_issues
                 WHERE status IN ('open', 'queued')
                 """
             ).fetchone()[0]

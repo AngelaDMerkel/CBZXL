@@ -489,6 +489,49 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(dashboard["review"]["total"], 1)
         self.assertEqual(dashboard["review"]["grew"], 1)
 
+    def test_multiple_image_failures_report_page_and_archive_counts(self):
+        first_id = self.create_issue(
+            kind="image_corrupt",
+            entry_path="pages/001.jpg",
+        )
+        with database.transaction() as conn:
+            archive_id = conn.execute(
+                "SELECT archive_id FROM archive_issues WHERE id=?",
+                (first_id,),
+            ).fetchone()[0]
+            for entry in ("pages/002.jpg", "pages/003.jpg"):
+                database.upsert_archive_issue(
+                    conn,
+                    archive_id=archive_id,
+                    job_id=None,
+                    kind="image_corrupt",
+                    stage="decoding",
+                    entry_path=entry,
+                    message=f"Likely corrupt: {entry}",
+                )
+
+        summary = self.client.get("/api/issues/summary").json()
+        listed = self.client.get("/api/issues?group=images").json()
+        dashboard = self.client.get("/api/dashboard").json()
+
+        self.assertEqual(summary["total"], 1)
+        self.assertEqual(summary["groups"][0]["count"], 3)
+        self.assertEqual(summary["groups"][0]["archive_count"], 1)
+        self.assertEqual(len(listed["rows"]), 3)
+        self.assertEqual(
+            {row["archive_issue_count"] for row in listed["rows"]},
+            {3},
+        )
+        self.assertEqual(dashboard["review"]["total"], 1)
+        self.assertEqual(dashboard["review"]["failed"], 1)
+
+        dismissed = self.client.post(
+            f"/api/issues/{first_id}/action",
+            json={"action": "dismiss"},
+        )
+        self.assertEqual(dismissed.status_code, 201)
+        self.assertEqual(self.client.get("/api/dashboard").json()["review"]["total"], 1)
+
     def test_expected_filename_overhead_remains_in_net_savings_without_attention(self):
         with database.transaction() as conn:
             library = database.default_library(conn)
@@ -898,7 +941,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(outcomes["Lossless JXL"], 6)
         self.assertEqual(outcomes["Smart lossy"], 2)
         self.assertEqual(payload["run_trend"][0]["cumulative_net_gb"], 1.0)
-        self.assertEqual(payload["run_trend"][0]["average_percent_saved"], 25)
+        self.assertEqual(payload["run_trend"][0]["average_percent_saved"], 30)
         self.assertTrue(payload["run_trend"][0]["library_snapshot"])
         self.assertEqual(payload["processing"]["median_seconds"], 40)
         self.assertEqual(payload["effort"]["archives_attempted"], 1)
@@ -923,6 +966,93 @@ class ApiTests(unittest.TestCase):
         )
         self.assertEqual(payload["filetypes"]["inventoried_archives"], 1)
         self.assertEqual(payload["filetypes"]["archive_count"], 2)
+
+    def test_performance_trend_only_scores_accepted_conversions(self):
+        bootstrap = self.client.get("/api/bootstrap").json()
+        library_id = bootstrap["libraries"][0]["id"]
+        profile_id = bootstrap["profiles"][0]["id"]
+        jobs = [
+            ("accepted-one", "succeeded", "2026-08-01T00:00:00Z", 300),
+            ("retained", "succeeded", "2026-08-02T00:00:00Z", 0),
+            ("interrupted", "interrupted", "2026-08-03T00:00:00Z", 0),
+            ("accepted-two", "partial", "2026-08-04T00:00:00Z", 200),
+        ]
+        with database.transaction() as conn:
+            conn.executemany(
+                """
+                INSERT INTO jobs(
+                    id, source, library_id, profile_id, status, options_json,
+                    queued_at, started_at, finished_at, net_bytes_saved
+                ) VALUES (?, 'manual', ?, ?, ?, '{}', ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        job_id,
+                        library_id,
+                        profile_id,
+                        status,
+                        date,
+                        date,
+                        date,
+                        net_bytes,
+                    )
+                    for job_id, status, date, net_bytes in jobs
+                ],
+            )
+            conn.executemany(
+                """
+                INSERT INTO archive_results(
+                    job_id, path, status, original_size, final_size,
+                    bytes_saved, percent_saved, processing_duration_seconds,
+                    image_count, converted_pages, retained_pages
+                ) VALUES (?, ?, ?, 1000, ?, ?, ?, 10, 10, ?, ?)
+                """,
+                [
+                    ("accepted-one", "Accepted One.cbz", "processed", 700, 300, 30, 8, 2),
+                    ("retained", "Retained.cbz", "processed", 1000, 0, 0, 0, 10),
+                    ("interrupted", "Interrupted.cbz", "failed", 1000, 0, 0, 0, 10),
+                    ("accepted-two", "Accepted Two.cbz", "processed", 800, 200, 20, 5, 5),
+                ],
+            )
+            gib = 1024 ** 3
+            conn.executemany(
+                """
+                INSERT INTO library_stat_snapshots(
+                    job_id, library_id, recorded_at, archive_count,
+                    optimized_count, failed_count, baseline_bytes,
+                    current_bytes, net_bytes, page_count, converted_pages,
+                    average_percent_saved
+                ) VALUES (?, ?, ?, 1, 1, 0, 1000, 700, ?, 10, 8, 1)
+                """,
+                [
+                    ("accepted-one", library_id, jobs[0][2], 100 * gib),
+                    ("retained", library_id, jobs[1][2], 100 * gib),
+                    ("accepted-two", library_id, jobs[3][2], 101 * gib),
+                ],
+            )
+
+        payload = self.client.get("/api/statistics").json()
+
+        self.assertEqual(
+            [point["id"] for point in payload["run_trend"]],
+            ["accepted-one", "accepted-two"],
+        )
+        self.assertEqual(
+            [point["cumulative_net_gb"] for point in payload["run_trend"]],
+            [100.0, 101.0],
+        )
+        self.assertEqual(
+            [point["average_percent_saved"] for point in payload["run_trend"]],
+            [30.0, 25.0],
+        )
+        self.assertEqual(
+            [point["result_count"] for point in payload["run_trend"]],
+            [1, 1],
+        )
+        policy = payload["processing"]["policies"][0]
+        self.assertEqual(policy["attempted"], 4)
+        self.assertEqual(policy["average_percent_saved"], 25)
+        self.assertEqual(policy["success_percent"], 50)
 
     def test_crc_diagnostics_offer_recovery_for_a_decodable_jxl_with_bad_size(self):
         library_root = Path(self.temp.name) / "library"

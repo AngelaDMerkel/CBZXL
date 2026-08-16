@@ -20,10 +20,10 @@ The interface is organized into four focused pages:
 - **Overview** shows the active or most recent run, smooth archive-and-page
   progress, throughput, ETA, and the lifetime totals for Net Savings, Pages
   Optimized, Archives Optimized, and Need Attention.
-- **Attention** groups unresolved items by failure type. Each archive can be
-  retried, inspected, or dismissed until the next full rescan. Inspection
-  reveals diagnostics, previews, and repair actions appropriate to that
-  specific failure.
+- **Attention** groups unresolved items by failure type. Every failed image is
+  retained and reported separately, while archive-level counts distinguish a
+  single damaged page from an archive with many failures. Each item can be
+  retried, inspected, or dismissed until the next full rescan.
 - **History** explains the result of each run and distinguishes optimized,
   already-current, retained, and failed archives. It records page outcomes,
   bytes saved, prior processing context, encoder effort, and technical events.
@@ -96,10 +96,12 @@ Every eligible page is judged independently:
 4. Decode every smaller candidate with `djxl`; for lossless conversion, also
    compare its canonical sRGB pixels with the original source image, including
    when a metadata-free normalization input was required.
-5. Keep the candidate only after that verification succeeds. If a smaller
-   candidate cannot be verified, retain the source archive byte-for-byte but
-   fail the archive and surface the diagnostic through Attention, run history,
-   and ntfy. A verified non-smaller candidate remains a normal retention.
+5. Keep the candidate only after that verification succeeds. If a page cannot
+   be decoded, encoded, or verified, retain that original page and continue
+   attempting every other image in the archive. Commit the verified smaller
+   pages only when the complete rebuilt CBZ is also smaller, then report every
+   failed entry through Attention, run history, and ntfy. A verified
+   non-smaller candidate remains a normal retention.
 
 Smart lossy never bypasses that order. It first attempts lossless JPEG XL. A
 lossy candidate is attempted only when the configured size or resolution
@@ -172,11 +174,13 @@ Available recovery paths include:
   confirmation, rebuild only the fully recovered entries before a truncated
   tail.
 - **Image processing failures** — malformed ICC/EXIF metadata is normalized
-  into canonical sRGB pixels automatically. Sources that are likely corrupt,
-  truncated, or malformed offer an explicit tolerant pixel-recovery action;
-  the recovered image must strictly decode and the rebuilt archive must verify
-  before replacement. The page can instead be preserved, replaced, or
-  explicitly deleted.
+  into canonical sRGB pixels automatically. Conversion continues after each
+  failed image, retains every failed original, and reports all affected entry
+  paths with the number of failures in that archive. Sources that are likely
+  corrupt, truncated, or malformed offer an explicit tolerant pixel-recovery
+  action; the recovered image must strictly decode and the rebuilt archive
+  must verify before replacement. A page can instead be preserved, replaced,
+  or explicitly deleted.
 - **Filename collisions** — compare both conflicting images and choose which
   one the verified rebuild should retain.
 - **Archives larger than their lifetime baseline** — retry lossless, try the
@@ -206,7 +210,9 @@ Detailed reporting includes:
 
 - library coverage, average reduction, retained originals, and success rate;
 - cumulative net savings and average percentage saved over 90 days, one year,
-  or the full recorded lifetime;
+  or the full recorded lifetime, calculated only from accepted conversions
+  whose rebuilt archive was smaller; rejected candidates that retained the
+  original archive do not contribute a zero-value sample;
 - archive count, page count, source size, current size, and JXL coverage;
 - current image-format composition by both file count and compressed storage;
 - compression effectiveness by source format;

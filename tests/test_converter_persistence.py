@@ -133,6 +133,38 @@ class ConverterPersistenceTests(unittest.TestCase):
             self.assertEqual(check.execute("SELECT status FROM jobs WHERE id=?", (self.job_id,)).fetchone()[0], "succeeded")
             self.assertEqual(check.execute("SELECT COUNT(*) FROM job_progress_samples WHERE job_id=?", (self.job_id,)).fetchone()[0], 2)
 
+    def test_library_snapshot_average_excludes_original_retained(self):
+        now = database.utc_now()
+        with database.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO archives(
+                    library_id, path, status, original_size, final_size,
+                    bytes_saved, percent_saved, image_count, converted_pages,
+                    retained_pages, conversion_mode, created_at, updated_at
+                ) VALUES
+                    (?, 'Converted.cbz', 'processed', 1000, 700, 300, 30,
+                     10, 8, 2, 'Lossless', ?, ?),
+                    (?, 'Retained.cbz', 'processed', 1000, 1000, 0, 0,
+                     10, 0, 10, 'Original retained', ?, ?)
+                """,
+                (cbzxl.LIBRARY_ID, now, now, cbzxl.LIBRARY_ID, now, now),
+            )
+            cbzxl.record_library_snapshot(conn, self.job_id)
+
+        with database.connect() as conn:
+            snapshot = conn.execute(
+                """
+                SELECT optimized_count, average_percent_saved
+                FROM library_stat_snapshots
+                WHERE job_id=?
+                """,
+                (self.job_id,),
+            ).fetchone()
+
+        self.assertEqual(snapshot["optimized_count"], 1)
+        self.assertEqual(snapshot["average_percent_saved"], 30)
+
     def test_page_decisions_persist_exact_candidate_and_reason(self):
         now = database.utc_now()
         with database.transaction() as conn:
@@ -983,6 +1015,162 @@ class ConverterPersistenceTests(unittest.TestCase):
         self.assertEqual(convert.call_count, 1)
         self.assertEqual(Path(convert.call_args.args[0]).name, "002.jpg")
         self.assertEqual(damaged.read_bytes(), b"preserve-these-bytes")
+
+    def test_conversion_attempts_every_page_and_collects_all_failures(self):
+        extracted = Path(self.temp.name) / "collect-all"
+        extracted.mkdir()
+        for name in ("001.jpg", "002.jpg", "003.jpg"):
+            (extracted / name).write_bytes(name.encode() * 20)
+        attempted = []
+
+        def convert(path, *_args, **_kwargs):
+            attempted.append(path.name)
+            if path.name in {"001.jpg", "003.jpg"}:
+                raise cbzxl.PageConversionError(
+                    f"Likely corrupt, truncated or malformed: {path.name}",
+                    entry_path=path.name,
+                    kind="image_corrupt",
+                    stage="decoding",
+                    detail="Source image could not be decoded",
+                )
+            return (10, 1.0, "Lossless", 0, True, True, False)
+
+        args = SimpleNamespace(repair_action=None, repair_entry=None)
+        with mock.patch.object(
+            cbzxl,
+            "convert_single_image",
+            side_effect=convert,
+        ):
+            result = cbzxl.convert_images(extracted, args)
+
+        self.assertEqual(sorted(attempted), ["001.jpg", "002.jpg", "003.jpg"])
+        self.assertEqual(result[0], cbzxl.ConversionStatus.PROCESSED_SAVED_SPACE)
+        self.assertEqual(result[1], 10)
+        self.assertEqual(result[9], 1)
+        self.assertEqual(result[12], 2)
+        self.assertEqual(
+            [failure["entry_path"] for failure in result[13]],
+            ["001.jpg", "003.jpg"],
+        )
+        self.assertTrue((extracted / "001.jpg").exists())
+        self.assertTrue((extracted / "003.jpg").exists())
+
+    def test_partial_archive_commits_smaller_pages_and_reports_each_failure(self):
+        library_root = (Path(self.temp.name) / "partial-library").resolve()
+        library_root.mkdir()
+        archive_path = library_root / "Damaged.cbz"
+        with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_STORED) as archive:
+            for name in ("001.jpg", "002.jpg", "003.jpg"):
+                archive.writestr(name, name.encode() * 800)
+        original_size = archive_path.stat().st_size
+        scratch_dir = Path(self.temp.name) / "partial-scratch"
+        workspace_dir = Path(self.temp.name) / "partial-workspace"
+        args = SimpleNamespace(
+            input_dir=str(library_root),
+            no_convert=False,
+            integrity_audit=False,
+            smart_distance=False,
+            distance=None,
+            smart_mb=10.0,
+            smart_mp=5.0,
+            compatibility_mode=False,
+            continue_on_page_error=False,
+            repair_action=None,
+            repair_entry=None,
+            repair_entries=[],
+            repair_source=None,
+        )
+
+        def convert(path, _args, workspace, *_rest):
+            entry = path.relative_to(workspace.files).as_posix()
+            if path.name != "001.jpg":
+                raise cbzxl.PageConversionError(
+                    f"Likely corrupt, truncated or malformed: {path.name}",
+                    entry_path=entry,
+                    kind="image_corrupt",
+                    stage="decoding",
+                    detail="Source image could not be decoded",
+                )
+            source_size = path.stat().st_size
+            target = path.with_suffix(".jxl")
+            target.write_bytes(b"\xff\x0a" + b"jxl" * 10)
+            path.unlink()
+            workspace.record_page(
+                entry,
+                target.relative_to(workspace.files).as_posix(),
+                target.stat().st_size,
+                "Lossless",
+            )
+            workspace.record_decision(
+                entry,
+                source_format="image/jpeg",
+                source_size=source_size,
+                candidate_size=target.stat().st_size,
+                final_size=target.stat().st_size,
+                outcome="converted",
+                mode="Lossless",
+                distance=0,
+                effort=8,
+                reason="Verified JPEG XL candidate was smaller",
+                attempts=[],
+            )
+            return (
+                source_size - target.stat().st_size,
+                1.0,
+                "Lossless",
+                0,
+                True,
+                True,
+                False,
+            )
+
+        conn = cbzxl.init_db(cbzxl.DB_FILE)
+        with (
+            mock.patch.object(cbzxl, "SCRATCH_DIR", scratch_dir),
+            mock.patch.object(cbzxl, "WORKSPACE_DIR", workspace_dir),
+            mock.patch.object(
+                cbzxl,
+                "convert_single_image",
+                side_effect=convert,
+            ),
+            mock.patch.object(
+                cbzxl,
+                "verify_archive",
+                return_value={"entries": 3, "jxl_entries": 1, "decoded_samples": 1},
+            ),
+        ):
+            outcome = cbzxl.process_cbz(archive_path, conn, None, args)
+
+        self.assertEqual(outcome[-1], "partial")
+        self.assertLess(archive_path.stat().st_size, original_size)
+        with zipfile.ZipFile(archive_path) as rebuilt:
+            self.assertEqual(
+                sorted(rebuilt.namelist()),
+                ["001.jxl", "002.jpg", "003.jpg"],
+            )
+        with database.connect() as check:
+            archive = check.execute(
+                "SELECT status, error_message FROM archives WHERE path='Damaged.cbz'"
+            ).fetchone()
+            issues = check.execute(
+                """
+                SELECT entry_path, kind, ai.status
+                FROM archive_issues ai
+                JOIN archives a ON a.id=ai.archive_id
+                WHERE a.path='Damaged.cbz'
+                ORDER BY entry_path
+                """
+            ).fetchall()
+        self.assertEqual(archive["status"], "processed")
+        self.assertIn("2 image processing failures", archive["error_message"])
+        self.assertEqual(
+            [tuple(issue) for issue in issues],
+            [
+                ("002.jpg", "image_corrupt", "open"),
+                ("003.jpg", "image_corrupt", "open"),
+            ],
+        )
+        conn.close()
 
     def test_library_reconciliation_tracks_moves_and_marks_missing_archives(self):
         library_root = Path(self.temp.name) / "library"
