@@ -1,7 +1,7 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { Logo, Toast } from "./components/Brand";
-import { api } from "./lib/api";
+import { api, setToken, token } from "./lib/api";
 import {
   archiveName,
   compactNumber,
@@ -15,6 +15,14 @@ import {
 import { policyScope, policyStrategy, policySummary } from "./lib/policies";
 import type { Json, ToastValue, View } from "./types";
 
+export function liveStage(value = "") {
+  if (value === "discovering") return "Discovering";
+  if (value === "reconciling") return "Preparing Queue";
+  if (value === "archive_retrying") return "Retrying Safely";
+  if (["job_started", "archive_started", "page_completed", "archive_completed", "job_progress"].includes(value)) return "Converting";
+  return label(value || "Converting");
+}
+
 function LiveConversion({ initial, refresh, notify, onDismiss }: {
   initial: Json;
   refresh: () => void;
@@ -22,6 +30,7 @@ function LiveConversion({ initial, refresh, notify, onDismiss }: {
   onDismiss?: (job: Json) => void;
 }) {
   const [detail, setDetail] = useState<Json>({ job: initial, events: [] });
+  const [liveError, setLiveError] = useState(false);
   useEffect(() => {
     let stopped = false;
     let timer: number | undefined;
@@ -38,6 +47,7 @@ function LiveConversion({ initial, refresh, notify, onDismiss }: {
         const payload = await api(`/api/jobs/${initial.id}/live`, { signal: controller.signal });
         if (stopped) return;
         setDetail(payload);
+        setLiveError(false);
         const nextJob = payload.job || {};
         if (["queued", "running", "stopping"].includes(nextJob.status)) {
           schedule(nextJob.status === "queued" ? 2500 : 1200);
@@ -45,7 +55,10 @@ function LiveConversion({ initial, refresh, notify, onDismiss }: {
           refresh();
         }
       } catch (error) {
-        if (!stopped && (error as Error).name !== "AbortError") schedule(3000);
+        if (!stopped && (error as Error).name !== "AbortError") {
+          setLiveError(true);
+          schedule(3000);
+        }
       }
     };
     const visibilityChanged = () => {
@@ -67,7 +80,9 @@ function LiveConversion({ initial, refresh, notify, onDismiss }: {
     };
   }, [initial.id, refresh]);
   const job = detail.job || initial;
-  const percent = Number(job.smooth_percent ?? job.percent ?? 0);
+  const percent = Number(job.progress_percent ?? job.smooth_percent ?? job.percent ?? 0);
+  const completed = Number(job.completed || 0);
+  const total = Number(job.total || job.archives_found || 0);
   const terminal = !["queued", "running", "stopping"].includes(job.status);
   const failed = ["failed", "interrupted"].includes(job.status);
   const terminalTitle = failed
@@ -81,7 +96,7 @@ function LiveConversion({ initial, refresh, notify, onDismiss }: {
     ? label(job.status)
     : job.status === "queued"
       ? "Waiting for worker"
-      : label(job.current_stage || "Converting");
+      : liveStage(job.current_stage);
   const stop = async () => {
     try {
       await api(`/api/jobs/${job.id}/cancel`, { method: "POST" });
@@ -105,7 +120,8 @@ function LiveConversion({ initial, refresh, notify, onDismiss }: {
       <div className="run-copy">
         <span className={`status-pill ${terminal ? "terminal" : ""}`}><i />{statusText}</span>
         <h2>{terminal ? terminalTitle : job.current_archive ? archiveName(job.current_archive) : "Discovering your library"}</h2>
-        <code>{terminal ? job.error_message || `${job.completed || 0} of ${job.archives_found || 0} archives completed` : job.current_archive || "Preparing the conversion queue…"}</code>
+        <code>{terminal ? job.error_message || `${completed.toLocaleString()} of ${total.toLocaleString()} archives completed` : job.current_archive ? `${completed.toLocaleString()} of ${total.toLocaleString()} complete · ${job.current_archive}` : total ? `${total.toLocaleString()} archives found…` : "Preparing the conversion queue…"}</code>
+        {liveError && <small>Live progress is reconnecting…</small>}
       </div>
       <div className="run-actions">
         {terminal && failed && <button className="button primary" onClick={retry}>Retry remaining</button>}
@@ -117,9 +133,9 @@ function LiveConversion({ initial, refresh, notify, onDismiss }: {
     </div>
     <div className="progress-track" aria-label={`${percent.toFixed(1)} percent complete`}><span style={{ width: `${percent}%` }} /></div>
     <div className="run-facts">
-      <div><span>Overall</span><strong>{Math.round(percent)}%</strong></div>
-      <div><span>Remaining</span><strong>{duration(job.eta_seconds)}</strong></div>
-      <div><span>Throughput</span><strong>{job.rate_per_minute ? `${job.rate_per_minute}/min` : "Learning"}</strong></div>
+      <div><span>Overall</span><strong>{percent > 0 && percent < 1 ? percent.toFixed(2) : percent < 10 ? percent.toFixed(1) : Math.round(percent)}%</strong></div>
+      <div><span>Remaining</span><strong>{completed >= 10 ? duration(job.eta_seconds) : "Estimating"}</strong></div>
+      <div><span>Throughput</span><strong>{job.rate_per_minute ? `${Number(job.rate_per_minute).toFixed(1)}/min` : "Learning"}</strong></div>
       <div><span>Reclaimed</span><strong>{formatGb(job.net_gb)}</strong></div>
     </div>
   </section>;
@@ -137,6 +153,7 @@ function ManualConversion({ bootstrap, onQueued, notify }: {
   const defaultProfile = profiles.find((row: Json) => row.is_default) || profiles[0] || {};
   const [open, setOpen] = useState(false);
   const [scope, setScope] = useState<"library" | "unprocessed" | "failed">("unprocessed");
+  const [libraryId, setLibraryId] = useState(bootstrap.libraries?.[0]?.id || "");
   const [profileId, setProfileId] = useState(defaultProfile.id || "");
   const profile = profiles.find((row: Json) => row.id === profileId) || defaultProfile;
   const defaults = profile.options || {};
@@ -150,6 +167,11 @@ function ManualConversion({ bootstrap, onQueued, notify }: {
       setProfileId(defaultProfile.id);
     }
   }, [defaultProfile.id, profileId, profiles]);
+  useEffect(() => {
+    if (!bootstrap.libraries?.some((library: Json) => library.id === libraryId)) {
+      setLibraryId(bootstrap.libraries?.find((library: Json) => library.enabled)?.id || "");
+    }
+  }, [bootstrap.libraries, libraryId]);
 
   const chooseProfile = (nextProfile: Json) => {
     const options = nextProfile.options || {};
@@ -172,7 +194,7 @@ function ManualConversion({ bootstrap, onQueued, notify }: {
       await api("/api/jobs", {
         method: "POST",
         body: JSON.stringify({
-          library_id: bootstrap.libraries?.[0]?.id,
+          library_id: libraryId,
           profile_id: profile.id,
           scope,
           options,
@@ -209,6 +231,7 @@ function ManualConversion({ bootstrap, onQueued, notify }: {
         <div className="manual-fields">
           <label><span>Encoder effort · {effort}</span><input type="range" min="0" max="11" value={effort} onChange={(event) => setEffort(Number(event.target.value))} /></label>
           <label><span>CPU budget</span><select value={threads} onChange={(event) => setThreads(Number(event.target.value))}>{availableCpuOptions.map((value) => <option key={value} value={value}>{value} thread{value === 1 ? "" : "s"}</option>)}</select></label>
+          {bootstrap.libraries?.length > 1 && <label><span>Library</span><select value={libraryId} onChange={(event) => setLibraryId(event.target.value)}>{bootstrap.libraries.filter((library: Json) => library.enabled).map((library: Json) => <option key={library.id} value={library.id}>{library.name}</option>)}</select></label>}
         </div>
         <label className="switch"><input type="checkbox" checked={backup} onChange={(event) => setBackup(event.target.checked)} /><i /><span>Back up originals</span></label>
         <footer className="manual-actions">
@@ -378,7 +401,7 @@ function DetailedStatistics({ data }: { data: Json }) {
       <div><span>Library coverage</span><strong>{Number(health.library_coverage_percent || 0).toFixed(1)}%</strong><small>{Number(library.optimized_archives || 0).toLocaleString()} of {Number(library.archives || 0).toLocaleString()} archives</small></div>
       <div><span>Average reduction</span><strong>{Number(health.average_percent_saved || 0).toFixed(1)}%</strong><small>Across optimized archives</small></div>
       <div><span>Originals retained</span><strong>{compactNumber(health.retained_pages)} pages</strong><small>Larger candidates rejected</small></div>
-      <div><span>Success rate</span><strong>{Number(health.success_percent || 0).toFixed(1)}%</strong><small>Completed archive attempts</small></div>
+      <div><span>Success rate</span><strong>{Number(health.success_percent || 0).toFixed(1)}%</strong><small>Completed conversion attempts</small></div>
     </section>
 
     <section className="report-section">
@@ -483,7 +506,7 @@ function DetailedStatistics({ data }: { data: Json }) {
         <article className="report-panel">
           <header><h3>Efficiency by conversion policy</h3><p>Lifetime results for policies that completed runs.</p></header>
           <div className="policy-report-wrap"><table className="policy-report">
-            <thead><tr><th>Policy</th><th>Median</th><th>Avg saved</th><th>Success</th></tr></thead>
+            <thead><tr><th>Policy</th><th>Average</th><th>Avg saved</th><th>Success</th></tr></thead>
             <tbody>{(processing.policies || []).map((row: Json) => <tr key={row.name}><td>{row.name}</td><td>{duration(row.median_seconds)}</td><td>{Number(row.average_percent_saved || 0).toFixed(1)}%</td><td>{Number(row.success_percent || 0).toFixed(1)}%</td></tr>)}</tbody>
           </table></div>
         </article>
@@ -533,6 +556,7 @@ function Overview({ dashboard, bootstrap, refresh, notify }: {
   const [statistics, setStatistics] = useState<Json | null>(null);
   const [statisticsError, setStatisticsError] = useState("");
   const [statisticsLoading, setStatisticsLoading] = useState(false);
+  const latestFinishedAt = dashboard.recent_jobs?.[0]?.finished_at || "";
   useEffect(() => {
     if (!detailsOpen || statistics || statisticsLoading || statisticsError) return;
     setStatisticsLoading(true);
@@ -544,9 +568,13 @@ function Overview({ dashboard, bootstrap, refresh, notify }: {
       .catch((error) => setStatisticsError(error.message))
       .finally(() => setStatisticsLoading(false));
   }, [detailsOpen, statistics, statisticsError, statisticsLoading]);
+  useEffect(() => {
+    if (detailsOpen && latestFinishedAt) setStatistics(null);
+  }, [detailsOpen, latestFinishedAt]);
   const toggleDetails = () => {
     const next = !detailsOpen;
     setDetailsOpen(next);
+    if (next) setStatistics(null);
     try { window.localStorage.setItem("cbzxl-detailed-statistics", next ? "open" : "closed"); } catch { /* storage unavailable */ }
   };
   return <div className="page overview">
@@ -649,10 +677,33 @@ function issueDisplayMessage(issue: Json) {
 
 function IssuePreview({ issue, related = false }: { issue: Json; related?: boolean }) {
   const [failed, setFailed] = useState(false);
+  const [source, setSource] = useState("");
   const previewUrl = related ? issue.related_preview_url : issue.preview_url;
   const entryPath = related ? issue.related_entry_path : issue.entry_path;
+  useEffect(() => {
+    if (!previewUrl) return;
+    const controller = new AbortController();
+    let objectUrl = "";
+    const headers = new Headers();
+    if (token()) headers.set("Authorization", `Bearer ${token()}`);
+    fetch(previewUrl, { headers, signal: controller.signal })
+      .then((response) => {
+        if (!response.ok) throw new Error("preview unavailable");
+        return response.blob();
+      })
+      .then((blob) => {
+        objectUrl = URL.createObjectURL(blob);
+        setSource(objectUrl);
+      })
+      .catch((error) => { if (error.name !== "AbortError") setFailed(true); });
+    return () => {
+      controller.abort();
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [previewUrl]);
   if (!previewUrl || failed) return <figure className="issue-preview unavailable"><span>⌁</span><figcaption>{entryPath ? `Preview unavailable · ${entryPath}` : "Archive-level issue"}</figcaption></figure>;
-  return <figure className="issue-preview"><img src={previewUrl} alt={`Conflicting page ${entryPath}`} onError={() => setFailed(true)} /><figcaption><code>{entryPath}</code></figcaption></figure>;
+  if (!source) return <figure className="issue-preview unavailable"><span>…</span><figcaption>Loading preview · {entryPath}</figcaption></figure>;
+  return <figure className="issue-preview"><img src={source} alt={`Conflicting page ${entryPath}`} onError={() => setFailed(true)} /><figcaption><code>{entryPath}</code></figcaption></figure>;
 }
 
 const remedyLabels: Record<string, string> = {
@@ -680,6 +731,7 @@ function Attention({ refreshDashboard, notify }: {
 }) {
   const [data, setData] = useState<Json>({ rows: [], groups: [], total: 0 });
   const [groupRows, setGroupRows] = useState<Record<string, Json[]>>({});
+  const [groupNext, setGroupNext] = useState<Record<string, number | null>>({});
   const [groupLoading, setGroupLoading] = useState<string | null>(null);
   const [openGroup, setOpenGroup] = useState<string | null>(null);
   const [open, setOpen] = useState<number | null>(null);
@@ -690,17 +742,22 @@ function Attention({ refreshDashboard, notify }: {
   const load = useCallback(() => api("/api/issues/summary").then(setData).catch((error) => notify(error.message, "error")), [notify]);
   useEffect(() => { load(); }, [load]);
 
-  const loadGroup = useCallback(async (groupId: string) => {
+  const loadGroup = useCallback(async (groupId: string, append = false) => {
     setGroupLoading(groupId);
     try {
-      const payload = await api(`/api/issues?group=${encodeURIComponent(groupId)}&limit=100`);
-      setGroupRows((current) => ({ ...current, [groupId]: payload.rows || [] }));
+      const cursor = append && groupNext[groupId] ? `&before_id=${groupNext[groupId]}` : "";
+      const payload = await api(`/api/issues?group=${encodeURIComponent(groupId)}&limit=100${cursor}`);
+      setGroupRows((current) => ({
+        ...current,
+        [groupId]: append ? [...(current[groupId] || []), ...(payload.rows || [])] : payload.rows || [],
+      }));
+      setGroupNext((current) => ({ ...current, [groupId]: payload.next || null }));
     } catch (error) {
       notify((error as Error).message, "error");
     } finally {
       setGroupLoading(null);
     }
-  }, [notify]);
+  }, [groupNext, notify]);
 
   const toggleGroup = async (groupId: string) => {
     if (openGroup === groupId) {
@@ -722,7 +779,7 @@ function Attention({ refreshDashboard, notify }: {
   const act = async (issue: Json, action: string) => {
     if (action === "recover" && !window.confirm(`Attempt tolerant pixel recovery for ${issue.entry_path}? The original archive will remain unchanged unless the recovered image and rebuilt archive both verify successfully.`)) return;
     if (action === "delete" && !window.confirm(`Delete ${issue.entry_path} from ${archiveName(issue.path)}? The archive name will not change.`)) return;
-    if (action === "delete_archive" && !window.confirm(`Permanently delete ${archiveName(issue.path)} from the library? This cannot be undone.`)) return;
+    if (action === "delete_archive" && !window.confirm(`Move ${archiveName(issue.path)} to the library's .cbzxl-trash folder? It will leave the active library but can still be restored manually.`)) return;
     if (action === "salvage_partial" && !window.confirm(`Rebuild ${archiveName(issue.path)} using only entries that were recovered and fully verified? The truncated archive tail will be omitted.`)) return;
     if (action === "keep_primary" || action === "keep_related") {
       const kept = action === "keep_primary" ? issue.entry_path : issue.related_entry_path;
@@ -732,7 +789,7 @@ function Attention({ refreshDashboard, notify }: {
     setBusy(issue.id);
     try {
       await api(`/api/issues/${issue.id}/action`, { method: "POST", body: JSON.stringify({ action }) });
-      notify(action === "dismiss" ? "Dismissed until the next full rescan" : action === "delete_archive" ? "Archive deleted" : action.startsWith("keep_") ? "Selection queued for verified rebuild" : "Repair queued");
+      notify(action === "dismiss" ? "Dismissed until the next full rescan" : action === "delete_archive" ? "Archive moved to recoverable trash" : action.startsWith("keep_") ? "Selection queued for verified rebuild" : "Repair queued");
       if (action === "dismiss" || action === "delete_archive") setOpen(null);
       await refreshOpenGroup();
     } catch (error) {
@@ -804,6 +861,7 @@ function Attention({ refreshDashboard, notify }: {
             const expanded = open === issue.id;
             const collision = issue.kind === "filename_collision" && Boolean(issue.related_entry_path);
             const remedies = (issue.remedies || []).filter((remedy: string) =>
+              remedy === "dismiss" || remedy === "delete_archive" ? false :
               remedy === "rebuild" ? diagnostic?.repairable :
               remedy === "salvage" ? diagnostic?.salvageable :
               remedy === "salvage_partial" ? diagnostic?.partial_salvageable :
@@ -820,9 +878,9 @@ function Attention({ refreshDashboard, notify }: {
                 </div>
                 <time>{dateTime(issue.updated_at)}</time>
                 <div className="issue-actions">
-                  {!collision && <button className="button primary" disabled={busy === issue.id || issue.status === "queued"} onClick={() => act(issue, "retry")}>{issue.status === "queued" ? "Queued" : "Retry"}</button>}
+                  {!collision && <button className="button primary" disabled={busy === issue.id || issue.status === "queued"} onClick={() => act(issue, "retry")}>{issue.status === "queued" ? "Queued" : issue.kind === "archive_grew" && !issue.backup_available ? "Repack" : "Retry"}</button>}
                   <button className="button secondary" aria-expanded={expanded} onClick={() => toggleInspect(issue)}>{expanded ? "Close" : "Inspect"}</button>
-                  {issue.retry_failed && <button className="button ghost danger" disabled={busy === issue.id || issue.status === "queued"} onClick={() => act(issue, "delete_archive")}>Delete archive</button>}
+                  {Boolean(issue.retry_failed) && <button className="button ghost danger" disabled={busy === issue.id || issue.status === "queued"} onClick={() => act(issue, "delete_archive")}>Delete archive</button>}
                   <button className="button ghost" disabled={busy === issue.id} onClick={() => act(issue, "dismiss")}>Dismiss</button>
                 </div>
               </div>
@@ -873,16 +931,17 @@ function Attention({ refreshDashboard, notify }: {
               </div>}
             </div>;
           })}
-          {rows.length >= 100 && <div className="group-limit">Showing the 100 most recently updated failures in this category.</div>}
+          {groupNext[group.id] && <button className="button secondary" type="button" onClick={() => loadGroup(group.id, true)}>Load more</button>}
         </div>}
       </article>;
     })}
   </div>;
 }
 
-function HistoryDetail({ id }: { id: string }) {
+function HistoryDetail({ id, notify }: { id: string; notify: (message: string, kind?: "success" | "error") => void }) {
   const [detail, setDetail] = useState<Json | null>(null);
   const [filter, setFilter] = useState("all");
+  const [pageDetails, setPageDetails] = useState<Record<number, Json[]>>({});
   useEffect(() => { api(`/api/jobs/${id}/history`).then(setDetail).catch(() => setDetail({ events: [] })); }, [id]);
   if (!detail) return <div className="history-loading" />;
   const job = detail.job || {};
@@ -891,6 +950,35 @@ function HistoryDetail({ id }: { id: string }) {
   const filteredEntries = filter === "all"
     ? entries
     : entries.filter((entry: Json) => entry.outcome === filter);
+  const loadMore = async () => {
+    if (!detail.next_outcome) return;
+    const next = await api(`/api/jobs/${id}/history?before_outcome=${detail.next_outcome}`);
+    setDetail({
+      ...next,
+      history_entries: [...entries, ...(next.history_entries || [])],
+    });
+  };
+  const togglePages = async (entry: Json) => {
+    if (pageDetails[entry.id]) {
+      setPageDetails((current) => {
+        const next = { ...current };
+        delete next[entry.id];
+        return next;
+      });
+      return;
+    }
+    try {
+      const value = await api(`/api/jobs/${id}/page-decisions?path=${encodeURIComponent(entry.path)}&limit=500`);
+      setPageDetails((current) => ({ ...current, [entry.id]: value.rows || [] }));
+    } catch (error) { notify((error as Error).message, "error"); }
+  };
+  const review = async (entry: Json, action: "reviewed" | "reopen" | "recheck") => {
+    if (!entry.archive_id) return;
+    try {
+      await api(`/api/archives/${entry.archive_id}/review`, { method: "POST", body: JSON.stringify({ action }) });
+      notify(action === "recheck" ? "Archive recheck queued" : action === "reviewed" ? "Archive marked reviewed" : "Archive review reopened");
+    } catch (error) { notify((error as Error).message, "error"); }
+  };
   const filters = [
     ["all", "All"],
     ["optimized", "Optimized"],
@@ -932,11 +1020,16 @@ function HistoryDetail({ id }: { id: string }) {
             {entry.bytes_saved > 0 && <span>{formatBytes(entry.bytes_saved)} saved</span>}
             {entry.previous_processed_at && <span>Previously processed {dateTime(entry.previous_processed_at)}</span>}
             {entry.jxl_effort !== null && entry.jxl_effort !== undefined && <span>Effort {entry.jxl_effort}</span>}
+            <button className="button ghost" type="button" onClick={() => togglePages(entry)}>{pageDetails[entry.id] ? "Hide pages" : "Page decisions"}</button>
+            {entry.archive_id && <button className="button ghost" type="button" onClick={() => review(entry, "reviewed")}>Mark reviewed</button>}
+            {entry.archive_id && <button className="button ghost" type="button" onClick={() => review(entry, "recheck")}>Recheck</button>}
           </footer>
+          {pageDetails[entry.id] && <div className="event-list">{pageDetails[entry.id].map((page: Json) => <div key={page.id}><i className={page.outcome === "failed" ? "error" : "success"} /><code>{page.entry_path}</code><strong>{label(page.outcome)}</strong>{page.reason && <span>{page.reason}</span>}</div>)}{!pageDetails[entry.id].length && <small>No page-level decisions were recorded for this archive.</small>}</div>}
         </div>
       </article>)}
       {!filteredEntries.length && <div className="history-outcome-empty">No {filter === "all" ? "archive outcomes" : filters.find(([value]) => value === filter)?.[1].toLowerCase()} are available in this history window.</div>}
       {Number(counts[filter] || 0) > filteredEntries.length && <small className="history-outcome-limit">Showing the latest {filteredEntries.length.toLocaleString()} of {Number(counts[filter] || 0).toLocaleString()} matching archives.</small>}
+      {detail.next_outcome && <button className="button secondary" type="button" onClick={loadMore}>Load more outcomes</button>}
     </div>
     <details className="history-technical">
       <summary>Technical activity</summary>
@@ -947,8 +1040,15 @@ function HistoryDetail({ id }: { id: string }) {
 
 function History({ notify }: { notify: (message: string, kind?: "success" | "error") => void }) {
   const [rows, setRows] = useState<Json[]>([]);
+  const [next, setNext] = useState<string | null>(null);
   const [open, setOpen] = useState<string | null>(null);
-  const load = useCallback(() => api("/api/jobs?limit=100").then((value) => setRows(value.rows)).catch((error) => notify(error.message, "error")), [notify]);
+  const load = useCallback((append = false, before?: string) => {
+    const cursor = append && before ? `&before_id=${encodeURIComponent(before)}` : "";
+    api(`/api/jobs?limit=100${cursor}`).then((value) => {
+      setRows((current) => append ? [...current, ...(value.rows || [])] : value.rows || []);
+      setNext(value.next || null);
+    }).catch((error) => notify(error.message, "error"));
+  }, [notify]);
   useEffect(() => { load(); }, [load]);
   return <div className="history-list">
     {rows.map((row) => {
@@ -962,9 +1062,10 @@ function History({ notify }: { notify: (message: string, kind?: "success" | "err
         <span className="status-label">{label(row.status)}</span>
         <b>{open === row.id ? "−" : "+"}</b>
       </button>
-      {open === row.id && <HistoryDetail id={row.id} />}
+      {open === row.id && <HistoryDetail id={row.id} notify={notify} />}
     </article>;
     })}
+    {next && <button className="button secondary" type="button" onClick={() => load(true, next)}>Older jobs</button>}
   </div>;
 }
 
@@ -977,6 +1078,7 @@ function Settings({ bootstrap, reload, notify }: {
   const cpuLimit = Math.max(1, Number(bootstrap.capabilities?.cpu_limit || 1));
   const availableCpuOptions = cpuOptions(cpuLimit);
   const [newOpen, setNewOpen] = useState(false);
+  const [editingSchedule, setEditingSchedule] = useState<string | null>(null);
   const profiles = bootstrap.profiles || [];
   const defaultProfile = profiles.find((row: Json) => row.is_default) || profiles[0] || {};
   const [form, setForm] = useState({
@@ -984,12 +1086,18 @@ function Settings({ bootstrap, reload, notify }: {
     cadence: "daily",
     hour: 4,
     minute: 0,
+    weekday: 0,
+    day_of_month: 1,
+    interval_value: 24,
+    interval_unit: "hours",
+    library_id: bootstrap.libraries?.[0]?.id || "",
     profile_id: defaultProfile.id || "",
   });
   const [policyOpen, setPolicyOpen] = useState(false);
   const [policyBusy, setPolicyBusy] = useState(false);
   const [policyForm, setPolicyForm] = useState<Json>({});
   const [scheduleProfiles, setScheduleProfiles] = useState<Record<string, string>>({});
+  const [libraryForm, setLibraryForm] = useState<Json | null>(null);
   const load = useCallback(() => api("/api/schedules").then((value) => {
     setSchedules(value.rows);
     setScheduleProfiles(Object.fromEntries(value.rows.map((row: Json) => [row.id, row.profile_id])));
@@ -1094,26 +1202,86 @@ function Settings({ bootstrap, reload, notify }: {
       notify((error as Error).message, "error");
     }
   };
+  const saveLibrary = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!libraryForm) return;
+    try {
+      await api(libraryForm.id ? `/api/libraries/${libraryForm.id}` : "/api/libraries", {
+        method: libraryForm.id ? "PUT" : "POST",
+        body: JSON.stringify({
+          name: libraryForm.name,
+          root_path: libraryForm.root_path,
+          enabled: Boolean(libraryForm.enabled),
+        }),
+      });
+      notify(libraryForm.id ? "Library updated" : "Library added");
+      setLibraryForm(null);
+      await reload();
+    } catch (error) { notify((error as Error).message, "error"); }
+  };
+  const removeLibrary = async (library: Json) => {
+    if (!window.confirm(`Delete ${library.name}? Libraries with history cannot be deleted.`)) return;
+    try {
+      await api(`/api/libraries/${library.id}`, { method: "DELETE" });
+      notify("Library deleted");
+      await reload();
+    } catch (error) { notify((error as Error).message, "error"); }
+  };
 
   const save = async (event: FormEvent) => {
     event.preventDefault();
     try {
-      await api("/api/schedules", {
-        method: "POST",
+      await api(editingSchedule ? `/api/schedules/${editingSchedule}` : "/api/schedules", {
+        method: editingSchedule ? "PUT" : "POST",
         body: JSON.stringify({
           ...form,
           enabled: true,
-          weekday: form.cadence === "weekly" ? 0 : null,
-          day_of_month: form.cadence === "monthly" ? 1 : null,
-          library_id: bootstrap.libraries?.[0]?.id,
+          library_id: form.library_id || bootstrap.libraries?.[0]?.id,
           profile_id: form.profile_id || defaultProfile.id,
         }),
       });
-      notify("Schedule created");
+      notify(editingSchedule ? "Schedule updated" : "Schedule created");
       setNewOpen(false);
+      setEditingSchedule(null);
       load();
       reload();
     } catch (error) { notify((error as Error).message, "error"); }
+  };
+  const editSchedule = (row: Json) => {
+    setForm({
+      name: row.name,
+      cadence: row.cadence,
+      hour: Number(row.hour || 0),
+      minute: Number(row.minute || 0),
+      weekday: Number(row.weekday || 0),
+      day_of_month: Number(row.day_of_month ?? 1),
+      interval_value: Number(row.interval_value || 24),
+      interval_unit: row.interval_unit || "hours",
+      library_id: row.library_id,
+      profile_id: row.profile_id,
+    });
+    setEditingSchedule(row.id);
+    setNewOpen(true);
+  };
+  const newSchedule = () => {
+    if (newOpen && !editingSchedule) {
+      setNewOpen(false);
+      return;
+    }
+    setForm({
+      name: "Library maintenance",
+      cadence: "daily",
+      hour: 4,
+      minute: 0,
+      weekday: 0,
+      day_of_month: 1,
+      interval_value: 24,
+      interval_unit: "hours",
+      library_id: bootstrap.libraries?.[0]?.id || "",
+      profile_id: defaultProfile.id || "",
+    });
+    setEditingSchedule(null);
+    setNewOpen(true);
   };
   const toggle = async (row: Json) => {
     try {
@@ -1152,6 +1320,20 @@ function Settings({ bootstrap, reload, notify }: {
       <div><span>Library</span><strong><code>{bootstrap.libraries?.[0]?.root_path || "/data"}</code></strong></div>
       <div><span>Default policy</span><strong>{defaultProfile.name || "Balanced lossless"}</strong></div>
       <div><span>Active schedule</span><strong>{schedules.find((row) => row.enabled)?.description || "Not scheduled"}</strong></div>
+    </section>
+
+    <section className="policy-section">
+      <header><div><h2>Libraries</h2><p>Manage container paths without changing the retained interface.</p></div><button className="button primary" type="button" onClick={() => setLibraryForm({ name: "", root_path: "/data", enabled: true })}>Add library</button></header>
+      <div className="policy-list">{(bootstrap.libraries || []).map((library: Json) => <article key={library.id}>
+        <div><div className="policy-name"><strong>{library.name}</strong>{library.enabled && <span className="status-label">Enabled</span>}</div><span><code>{library.root_path}</code></span></div>
+        <div className="policy-actions"><button className="button secondary" type="button" onClick={() => setLibraryForm({ ...library })}>Edit</button><button className="button ghost danger" type="button" onClick={() => removeLibrary(library)}>Delete</button></div>
+      </article>)}</div>
+      {libraryForm && <form className="policy-editor" onSubmit={saveLibrary}>
+        <header><div><h3>{libraryForm.id ? "Edit library" : "Add library"}</h3><p>Paths are resolved inside the container.</p></div><button className="button ghost" type="button" onClick={() => setLibraryForm(null)}>Close</button></header>
+        <div className="policy-fields"><label><span>Name</span><input value={libraryForm.name || ""} onChange={(event) => setLibraryForm({ ...libraryForm, name: event.target.value })} required /></label><label><span>Container path</span><input value={libraryForm.root_path || ""} onChange={(event) => setLibraryForm({ ...libraryForm, root_path: event.target.value })} required /></label></div>
+        <div className="policy-switches"><label className="switch"><input type="checkbox" checked={Boolean(libraryForm.enabled)} onChange={(event) => setLibraryForm({ ...libraryForm, enabled: event.target.checked })} /><i /><span>Enabled</span></label></div>
+        <footer><button className="button ghost" type="button" onClick={() => setLibraryForm(null)}>Cancel</button><button className="button primary" type="submit">Save library</button></footer>
+      </form>}
     </section>
 
     <section className="policy-section">
@@ -1222,18 +1404,25 @@ function Settings({ bootstrap, reload, notify }: {
     </section>
 
     <section className="schedule-section">
-      <header><div><h2>Schedules</h2><p>Recurring conversions use the same verified pipeline.</p></div><button className="button primary" onClick={() => setNewOpen(!newOpen)}>{newOpen ? "Close" : "New schedule"}</button></header>
+      <header><div><h2>Schedules</h2><p>Recurring conversions use the same verified pipeline.</p></div><button className="button primary" onClick={newSchedule}>{newOpen && !editingSchedule ? "Close" : "New schedule"}</button></header>
       {newOpen && <form className="schedule-form" onSubmit={save}>
         <label><span>Name</span><input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} required /></label>
-        <label><span>Cadence</span><select value={form.cadence} onChange={(event) => setForm({ ...form, cadence: event.target.value })}><option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option></select></label>
+        <label><span>Cadence</span><select value={form.cadence} onChange={(event) => setForm({ ...form, cadence: event.target.value })}><option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option><option value="interval">Interval</option></select></label>
+        {form.cadence !== "interval" && <>
         <label><span>Hour</span><select value={form.hour} onChange={(event) => setForm({ ...form, hour: Number(event.target.value) })}>{Array.from({ length: 24 }, (_, hour) => <option key={hour} value={hour}>{new Date(2000, 0, 1, hour).toLocaleTimeString([], { hour: "numeric" })}</option>)}</select></label>
+        <label><span>Minute</span><input type="number" min="0" max="59" value={form.minute} onChange={(event) => setForm({ ...form, minute: Number(event.target.value) })} /></label>
+        </>}
+        {form.cadence === "weekly" && <label><span>Weekday</span><select value={form.weekday} onChange={(event) => setForm({ ...form, weekday: Number(event.target.value) })}>{["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"].map((day, index) => <option key={day} value={index}>{day}</option>)}</select></label>}
+        {form.cadence === "monthly" && <label><span>Day</span><input type="number" min="-1" max="31" value={form.day_of_month} onChange={(event) => setForm({ ...form, day_of_month: Number(event.target.value) })} /><small>Use -1 for the last day.</small></label>}
+        {form.cadence === "interval" && <><label><span>Every</span><input type="number" min="1" value={form.interval_value} onChange={(event) => setForm({ ...form, interval_value: Number(event.target.value) })} /></label><label><span>Unit</span><select value={form.interval_unit} onChange={(event) => setForm({ ...form, interval_unit: event.target.value })}><option value="hours">Hours</option><option value="days">Days</option></select></label></>}
+        {bootstrap.libraries?.length > 1 && <label><span>Library</span><select value={form.library_id} onChange={(event) => setForm({ ...form, library_id: event.target.value })}>{bootstrap.libraries.map((library: Json) => <option key={library.id} value={library.id}>{library.name}</option>)}</select></label>}
         <label><span>Conversion policy</span><select value={form.profile_id} onChange={(event) => setForm({ ...form, profile_id: event.target.value })}>{profiles.map((profile: Json) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}</select></label>
-        <button className="button primary" type="submit">Save schedule</button>
+        <button className="button ghost" type="button" onClick={() => { setNewOpen(false); setEditingSchedule(null); }}>Cancel</button><button className="button primary" type="submit">{editingSchedule ? "Update schedule" : "Save schedule"}</button>
       </form>}
       <div className="schedule-list">{schedules.map((row) => <article key={row.id} className={!row.enabled ? "disabled" : ""}>
         <div><strong>{row.name}</strong><span>{row.description} · {row.enabled ? `next ${dateTime(row.next_run_at)}` : "paused"}</span></div>
         <label className="schedule-policy"><span>Conversion policy</span><select value={scheduleProfiles[row.id] || row.profile_id} onChange={(event) => setScheduleProfiles({ ...scheduleProfiles, [row.id]: event.target.value })}>{profiles.map((profile: Json) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}</select></label>
-        <div><button className="button secondary" onClick={() => saveSchedulePolicy(row)} disabled={(scheduleProfiles[row.id] || row.profile_id) === row.profile_id}>Save</button><button className="button secondary" onClick={() => toggle(row)}>{row.enabled ? "Pause" : "Enable"}</button><button className="button ghost danger" onClick={() => remove(row)}>Delete</button></div>
+        <div><button className="button secondary" onClick={() => editSchedule(row)}>Edit</button><button className="button secondary" onClick={() => saveSchedulePolicy(row)} disabled={(scheduleProfiles[row.id] || row.profile_id) === row.profile_id}>Save policy</button><button className="button secondary" onClick={() => toggle(row)}>{row.enabled ? "Pause" : "Enable"}</button><button className="button ghost danger" onClick={() => remove(row)}>Delete</button></div>
       </article>)}</div>
     </section>
   </div>;
@@ -1245,10 +1434,24 @@ export default function App() {
   const [bootstrap, setBootstrap] = useState<Json>({ libraries: [], profiles: [], schedules: [] });
   const [dashboard, setDashboard] = useState<Json>({});
   const [toast, setToast] = useState<ToastValue>(null);
-  const loadBootstrap = useCallback(() => api("/api/bootstrap").then(setBootstrap), []);
-  const loadDashboard = useCallback(() => api("/api/dashboard").then(setDashboard).catch(() => undefined), []);
+  const [authenticationRequired, setAuthenticationRequired] = useState(false);
+  const [credential, setCredential] = useState("");
+  const [authenticationError, setAuthenticationError] = useState("");
+  const [dashboardError, setDashboardError] = useState("");
+  const loadBootstrap = useCallback(() => api("/api/bootstrap").then((value) => {
+    setBootstrap(value);
+    setAuthenticationRequired(false);
+    setAuthenticationError("");
+  }), []);
+  const loadDashboard = useCallback(() => api("/api/dashboard").then((value) => {
+    setDashboard(value);
+    setDashboardError("");
+  }).catch((error) => setDashboardError(error.message)), []);
   useEffect(() => {
-    loadBootstrap();
+    loadBootstrap().catch((error) => {
+      if (error.message === "Authentication required") setAuthenticationRequired(true);
+      else setAuthenticationError(error.message);
+    });
   }, [loadBootstrap]);
   useEffect(() => {
     let stopped = false;
@@ -1266,10 +1469,14 @@ export default function App() {
         const payload = await api("/api/dashboard", { signal: controller.signal });
         if (stopped) return;
         setDashboard(payload);
+        setDashboardError("");
         const converting = Boolean(payload.active_jobs?.length);
         schedule(view === "overview" ? (converting ? 5000 : 12000) : (converting ? 12000 : 30000));
       } catch (error) {
-        if (!stopped && (error as Error).name !== "AbortError") schedule(15000);
+        if (!stopped && (error as Error).name !== "AbortError") {
+          setDashboardError((error as Error).message);
+          schedule(15000);
+        }
       }
     };
     const visibilityChanged = () => {
@@ -1309,6 +1516,11 @@ export default function App() {
     { id: "history" as View, label: "History" },
     { id: "settings" as View, label: "Settings" },
   ], [attention]);
+  if (authenticationRequired) return <div className="app-shell"><main className="app-content"><form className="authentication-card" onSubmit={async (event) => {
+    event.preventDefault();
+    setToken(credential.trim());
+    try { await loadBootstrap(); } catch (error) { setAuthenticationRequired(true); setAuthenticationError((error as Error).message); }
+  }}><Logo /><h1>Connect to CBZXL</h1><p>Enter the API token configured for this server.</p><label><span>API token</span><input type="password" autoComplete="current-password" value={credential} onChange={(event) => setCredential(event.target.value)} required /></label>{authenticationError && <strong>{authenticationError}</strong>}<button className="button primary" type="submit">Continue</button></form></main></div>;
   return <div className="app-shell">
     <header className="app-header">
       <button className="brand" onClick={() => navigate("overview")}><span><Logo /></span><strong>CBZXL</strong></button>
@@ -1316,6 +1528,7 @@ export default function App() {
       <span className={`service-state ${unavailable || runtimeUnavailable ? "error" : active ? "busy" : ""}`}><i />{unavailable ? "Database unavailable" : runtimeUnavailable ? "Conversion unavailable" : active ? "Converting" : "Ready"}</span>
     </header>
     <main className="app-content">
+      {dashboardError && <section className="database-alert" role="status"><strong>Live updates are temporarily unavailable.</strong><code>{dashboardError}</code></section>}
       {unavailable && <section className="database-alert" role="alert"><strong>The web interface is online, but the database could not be opened.</strong><code>{bootstrap.database_error}</code></section>}
       {!unavailable && runtimeUnavailable && <section className="database-alert" role="alert"><strong>Lossless conversion is unavailable. New conversion jobs are blocked.</strong><code>{bootstrap.conversion_runtime_error}</code></section>}
       {!unavailable && view === "overview" && <Overview dashboard={dashboard} bootstrap={bootstrap} refresh={loadDashboard} notify={notify} />}
