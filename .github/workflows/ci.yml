@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.96"
+          components: rustfmt, clippy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all-targets --locked
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - run: corepack enable && corepack prepare pnpm@11.9.0 --activate
+      - run: pnpm install --frozen-lockfile
+        working-directory: frontend
+      - run: pnpm run build
+        working-directory: frontend
+      - run: pnpm run test
+        working-directory: frontend
+      - run: docker compose config --quiet
+      - run: docker build --tag cbzxl:ci .
+      - run: docker run --rm cbzxl:ci doctor
+      - run: docker run --rm -e CBZXL_UID=65532 -e CBZXL_GID=65532 cbzxl:ci doctor
+      - run: ./tests/container-smoke.sh

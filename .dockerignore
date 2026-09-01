@@ -4,3 +4,7 @@
 frontend/node_modules
 .pnpm-store
 tests
+legacy
+.github
+target
+stack.env

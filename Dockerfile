@@ -1,67 +1,78 @@
-FROM node:22-alpine AS frontend
+FROM node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32 AS frontend
 WORKDIR /build
 COPY frontend/package.json frontend/pnpm-lock.yaml frontend/pnpm-workspace.yaml ./
-RUN corepack enable && corepack prepare pnpm@11.9.0 --activate && pnpm install --frozen-lockfile
+RUN corepack enable && corepack prepare pnpm@11.9.0 --activate \
+    && pnpm install --frozen-lockfile
 COPY frontend/ ./
 RUN pnpm run build
 
-FROM alpine:3.24 AS libjxl
+FROM rust:1.96-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS backend
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build --release --locked \
+    && install -Dm755 target/release/cbzxl /out/cbzxl
+
+FROM debian:bookworm@sha256:813017f3d62be4b5891a7acca6a01bdcd4b8513daa81b1ab99d3a50385b26931 AS libjxl
 ARG LIBJXL_VERSION=0.12.0
-RUN apk add --no-cache curl lzip
-RUN curl -fsSL \
-    "https://github.com/libjxl/libjxl/releases/download/v${LIBJXL_VERSION}/jxl-linux-x86_64-static.tar.lz" \
-    -o /tmp/libjxl.tar.lz
-RUN sha256sum /tmp/libjxl.tar.lz \
-    | grep -Fx "5318a1ea40adad76d023e0c17a03d4627f8282f83cb2b575e69be8e74f1ff456  /tmp/libjxl.tar.lz"
-RUN mkdir -p /opt/libjxl \
-    && lzip -dc /tmp/libjxl.tar.lz | tar -xf - -C /opt/libjxl
-RUN /opt/libjxl/tools/cjxl --version 2>&1 | grep -F "v${LIBJXL_VERSION}" \
-    && /opt/libjxl/tools/djxl --version 2>&1 | grep -F "v${LIBJXL_VERSION}"
+ARG LIBJXL_COMMIT=a7a9c787341cf703dede03c2009fa460cae5e5df
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates cmake git ninja-build pkg-config g++ libbrotli-dev \
+    zlib1g-dev libpng-dev libjpeg-dev libgif-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN git clone --branch "v${LIBJXL_VERSION}" --depth 1 --recursive \
+    https://github.com/libjxl/libjxl.git /src/libjxl \
+    && test "$(git -C /src/libjxl rev-parse HEAD)" = "${LIBJXL_COMMIT}"
+RUN cmake -S /src/libjxl -B /src/libjxl/build -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/opt/libjxl \
+    -DBUILD_SHARED_LIBS=OFF \
+    -DBUILD_TESTING=OFF \
+    -DJPEGXL_ENABLE_BENCHMARK=OFF \
+    -DJPEGXL_ENABLE_EXAMPLES=OFF \
+    -DJPEGXL_ENABLE_FUZZERS=OFF \
+    -DJPEGXL_ENABLE_MANPAGES=OFF \
+    -DJPEGXL_ENABLE_PLUGINS=OFF \
+    -DJPEGXL_ENABLE_TOOLS=ON \
+    && cmake --build /src/libjxl/build --target cjxl djxl -j2 \
+    && install -Dm755 /src/libjxl/build/tools/cjxl /opt/libjxl/bin/cjxl \
+    && install -Dm755 /src/libjxl/build/tools/djxl /opt/libjxl/bin/djxl
 
-FROM python:3.13-alpine
-LABEL name="cbzxl-web" version="4.5.10"
-
-RUN apk add --no-cache \
-    tzdata \
-    imagemagick \
-    imagemagick-jpeg \
-    imagemagick-tiff \
-    imagemagick-webp \
-    file
-COPY --from=libjxl /opt/libjxl/tools/cjxl /usr/local/bin/cjxl
-COPY --from=libjxl /opt/libjxl/tools/djxl /usr/local/bin/djxl
-
-WORKDIR /app
-RUN mkdir -p /data /config /dev/shm/cbzxl /dev/shm/cbzxl-runtime
-
-COPY requirements.txt /app/
-RUN pip install --no-cache-dir -r requirements.txt
-COPY cbzxl.py app.py /app/
-COPY cbzxl_web /app/cbzxl_web
+FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
+LABEL org.opencontainers.image.title="CBZXL" \
+      org.opencontainers.image.version="5.2.0"
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates gosu imagemagick tzdata libgif7 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=backend /out/cbzxl /usr/local/bin/cbzxl
+COPY --from=libjxl /opt/libjxl/bin/ /usr/local/bin/
 COPY --from=frontend /build/dist /app/frontend/dist
-RUN python -m cbzxl_web.runtime_dependencies
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN mkdir -p /data /config /runtime /dev/shm/cbzxl \
+    && chmod 0755 /usr/local/bin/docker-entrypoint.sh \
+    && cjxl --version \
+    && djxl --version \
+    && cbzxl --version
 
-ENV PYTHONUNBUFFERED=1 \
-    CONFIG_DIR=/config \
-    DB_PATH=/config/cbzxl-v3.sqlite3 \
+ENV DB_PATH=/config/cbzxl-v5.sqlite3 \
     LIBRARY_PATH=/data \
-    LOG_FILE= \
     SCRATCH_DIR=/dev/shm/cbzxl \
-    WORKSPACE_DIR=/dev/shm/cbzxl/workspaces \
-    RUNTIME_DIR=/dev/shm/cbzxl-runtime \
-    DURABLE_CHECKPOINT_SECONDS=300 \
-    DURABLE_CHECKPOINT_ARCHIVES=10000 \
-    PAGE_DECISION_RETENTION_DAYS=180 \
+    RUNTIME_DIR=/runtime \
+    FRONTEND_DIR=/app/frontend/dist \
+    LISTEN_ADDR=0.0.0.0:5000 \
+    CPU_LIMIT=4 \
     ARCHIVE_STABLE_SECONDS=90 \
     FINGERPRINT_AUDIT_DAYS=30 \
-    AUTO_RETRY_ATTEMPTS=1 \
-    DATABASE_MAINTENANCE_SECONDS=604800 \
-    MIGRATION_BACKUP_KEEP=3 \
-    WORKER_STALL_SECONDS=900 \
-    TMPDIR=/dev/shm \
-    TEMP=/dev/shm \
-    TMP=/dev/shm
+    PAGE_OUTCOME_RETENTION_DAYS=180 \
+    MAX_ARCHIVE_UNCOMPRESSED_MB=8192 \
+    TZ=UTC \
+    RUST_LOG=cbzxl=info
 
 VOLUME ["/data", "/config"]
 EXPOSE 5000
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "5000", "--no-access-log"]
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=20s \
+    CMD ["cbzxl", "healthcheck"]
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["run"]

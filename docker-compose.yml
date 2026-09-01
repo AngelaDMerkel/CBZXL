@@ -1,91 +1,68 @@
-x-cbzxl-common: &cbzxl-common
-  image: angeladmerkel/cbzxl-web:4.5.10
-  platform: linux/amd64
-  pull_policy: always
-
-  volumes:
-    - /mnt/Array/Media/Manga:/data
-    - /mnt/Array/appdata/cbzxl:/config
-    - /dev/shm/cbzxl-runtime:/runtime
-
-  environment: &cbzxl-environment
-    TZ: America/New_York
-    PYTHONUNBUFFERED: "1"
-
-    CONFIG_DIR: /config
-    DB_PATH: /config/cbzxl-v3.sqlite3
-    LIBRARY_PATH: /data
-
-    SCRATCH_DIR: /dev/shm/cbzxl
-    WORKSPACE_DIR: /dev/shm/cbzxl/workspaces
-    RUNTIME_DIR: /runtime
-
-    TMPDIR: /dev/shm
-    TEMP: /dev/shm
-    TMP: /dev/shm
-
-    LOG_FILE: ""
-    CPU_LIMIT: ${CBZXL_CPU_LIMIT:-8}
-
-    DURABLE_CHECKPOINT_SECONDS: "600"
-    DURABLE_CHECKPOINT_ARCHIVES: "10000"
-    PAGE_DECISION_RETENTION_DAYS: "180"
-
-    WORKER_STALL_SECONDS: "900"
-    MAX_ARCHIVE_UNCOMPRESSED_MB: "8192"
-
-  shm_size: 32g
-  mem_limit: 32g
-  pids_limit: 512
-
-  security_opt:
-    - no-new-privileges:true
-
-  cap_drop:
-    - ALL
-
-  restart: unless-stopped
-
 services:
   cbzxl-web:
-    <<: *cbzxl-common
+    image: angeladmerkel/cbzxl-web:latest
     container_name: CBZXL-Web
+    pull_policy: always
+    init: true
 
     ports:
       - "5000:5000"
 
+    volumes:
+      - /mnt/Array/Media/Manga:/data
+      - /mnt/Array/appdata/cbzxl:/config
+      - /dev/shm/cbzxl-runtime:/runtime
+
+    environment:
+      TZ: America/New_York
+      # This file is upgraded to the v5 schema in place; keep its existing path.
+      DB_PATH: /config/cbzxl-v3.sqlite3
+      LIBRARY_PATH: /data
+      SCRATCH_DIR: /dev/shm/cbzxl
+      WORKSPACE_DIR: /dev/shm/cbzxl/workspaces
+      RUNTIME_DIR: /runtime
+      TMPDIR: /dev/shm
+      TEMP: /dev/shm
+      TMP: /dev/shm
+      CPU_LIMIT: ${CBZXL_CPU_LIMIT:-8}
+      ARCHIVE_STABLE_SECONDS: ${CBZXL_ARCHIVE_STABLE_SECONDS:-90}
+      FINGERPRINT_AUDIT_DAYS: ${CBZXL_FINGERPRINT_AUDIT_DAYS:-30}
+      PAGE_OUTCOME_RETENTION_DAYS: ${CBZXL_PAGE_OUTCOME_RETENTION_DAYS:-180}
+      PAGE_DECISION_RETENTION_DAYS: ${CBZXL_PAGE_DECISION_RETENTION_DAYS:-180}
+      DURABLE_CHECKPOINT_SECONDS: ${CBZXL_DURABLE_CHECKPOINT_SECONDS:-300}
+      DURABLE_CHECKPOINT_ARCHIVES: ${CBZXL_DURABLE_CHECKPOINT_ARCHIVES:-10000}
+      DATABASE_MAINTENANCE_SECONDS: ${CBZXL_DATABASE_MAINTENANCE_SECONDS:-604800}
+      STATISTICS_CACHE_SECONDS: ${CBZXL_STATISTICS_CACHE_SECONDS:-30}
+      MIGRATION_BACKUP_KEEP: ${CBZXL_MIGRATION_BACKUP_KEEP:-3}
+      WORKER_STALL_SECONDS: ${CBZXL_WORKER_STALL_SECONDS:-900}
+      AUTO_RETRY_ATTEMPTS: ${CBZXL_AUTO_RETRY_ATTEMPTS:-1}
+      MAX_ARCHIVE_UNCOMPRESSED_MB: ${CBZXL_MAX_ARCHIVE_UNCOMPRESSED_MB:-8192}
+      AUXILIARY_TIMEOUT_SECONDS: ${CBZXL_AUXILIARY_TIMEOUT_SECONDS:-300}
+      ENCODER_MAX_SECONDS: ${CBZXL_ENCODER_MAX_SECONDS:-0}
+      WORKER_POLL_MS: ${CBZXL_WORKER_POLL_MS:-1000}
+      CBZXL_API_TOKEN: ${CBZXL_API_TOKEN:-}
+      CBZXL_UID: ${CBZXL_UID:-0}
+      CBZXL_GID: ${CBZXL_GID:-0}
+      RUST_LOG: ${CBZXL_LOG:-cbzxl=info}
+      LOG_FILE: ${CBZXL_LOG_FILE:-}
+      NTFY_URL: ${CBZXL_NTFY_URL:-}
+      NTFY_TOKEN: ${CBZXL_NTFY_TOKEN:-}
+      NTFY_TIMEOUT_SECONDS: ${CBZXL_NTFY_TIMEOUT_SECONDS:-10}
+
+    cpus: ${CBZXL_CPU_LIMIT:-8}
+    shm_size: 32g
+    mem_limit: 32g
+    pids_limit: 512
+
     healthcheck:
-      test:
-        - CMD
-        - python
-        - -c
-        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/ready', timeout=5)"
+      test: ["CMD", "cbzxl", "healthcheck"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 20s
 
-  cbzxl-worker:
-    <<: *cbzxl-common
-    container_name: CBZXL-Worker
-    command:
-      - python
-      - -m
-      - cbzxl_web.worker
-    environment:
-      <<: *cbzxl-environment
-      NTFY_URL: ${CBZXL_NTFY_URL:-}
-      NTFY_TOKEN: ${CBZXL_NTFY_TOKEN:-}
-      NTFY_TIMEOUT_SECONDS: ${CBZXL_NTFY_TIMEOUT_SECONDS:-10}
-    cpus: ${CBZXL_CPU_LIMIT:-8}
-
-    healthcheck:
-      test:
-        - CMD
-        - python
-        - -m
-        - cbzxl_web.runtime_dependencies
-      interval: 5m
-      timeout: 60s
-      retries: 2
-      start_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
