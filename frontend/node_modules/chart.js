@@ -1,1 +1,0 @@
-.pnpm/chart.js@4.5.1/node_modules/chart.js
