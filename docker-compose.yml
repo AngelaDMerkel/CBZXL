@@ -1,22 +1,20 @@
 services:
-  cbzxl-web:
-    image: angeladmerkel/cbzxl-web:latest
-    container_name: CBZXL-Web
-    pull_policy: always
+  cbzxl:
+    image: ${CBZXL_IMAGE:-ghcr.io/angeladmerkel/cbzxl:latest}
     init: true
 
     ports:
-      - "5000:5000"
+      - "${CBZXL_BIND_ADDRESS:-127.0.0.1}:${CBZXL_PORT:-5000}:5000"
 
     volumes:
-      - /mnt/Array/Media/Manga:/data
-      - /mnt/Array/appdata/cbzxl:/config
-      - /dev/shm/cbzxl-runtime:/runtime
+      - ${CBZXL_LIBRARY_PATH:-./comics}:/data
+      - cbzxl-config:/config
+    tmpfs:
+      - /runtime:size=64m,mode=0755
 
     environment:
-      TZ: America/New_York
-      # This file is upgraded to the v5 schema in place; keep its existing path.
-      DB_PATH: /config/cbzxl-v3.sqlite3
+      TZ: ${TZ:-UTC}
+      DB_PATH: ${CBZXL_DB_PATH:-/config/cbzxl-v5.sqlite3}
       LIBRARY_PATH: /data
       SCRATCH_DIR: /dev/shm/cbzxl
       WORKSPACE_DIR: /dev/shm/cbzxl/workspaces
@@ -24,7 +22,7 @@ services:
       TMPDIR: /dev/shm
       TEMP: /dev/shm
       TMP: /dev/shm
-      CPU_LIMIT: ${CBZXL_CPU_LIMIT:-8}
+      CPU_LIMIT: ${CBZXL_CPU_LIMIT:-2}
       ARCHIVE_STABLE_SECONDS: ${CBZXL_ARCHIVE_STABLE_SECONDS:-90}
       FINGERPRINT_AUDIT_DAYS: ${CBZXL_FINGERPRINT_AUDIT_DAYS:-30}
       PAGE_OUTCOME_RETENTION_DAYS: ${CBZXL_PAGE_OUTCOME_RETENTION_DAYS:-180}
@@ -49,9 +47,9 @@ services:
       NTFY_TOKEN: ${CBZXL_NTFY_TOKEN:-}
       NTFY_TIMEOUT_SECONDS: ${CBZXL_NTFY_TIMEOUT_SECONDS:-10}
 
-    cpus: ${CBZXL_CPU_LIMIT:-8}
-    shm_size: 32g
-    mem_limit: 32g
+    cpus: ${CBZXL_CPU_LIMIT:-2}
+    shm_size: ${CBZXL_SHM_SIZE:-1g}
+    mem_limit: ${CBZXL_MEMORY_LIMIT:-4g}
     pids_limit: 512
 
     healthcheck:
@@ -65,4 +63,13 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    # The entrypoint prepares writable directories and then drops to CBZXL_UID/GID.
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
     restart: unless-stopped
+
+volumes:
+  cbzxl-config:
