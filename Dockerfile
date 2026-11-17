@@ -41,8 +41,15 @@ RUN cmake -S /src/libjxl -B /src/libjxl/build -G Ninja \
     && install -Dm755 /src/libjxl/build/tools/djxl /opt/libjxl/bin/djxl
 
 FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
+ARG VERSION=development
+ARG REVISION=unknown
+ARG SOURCE=https://github.com/AngelaDMerkel/CBZXL
 LABEL org.opencontainers.image.title="CBZXL" \
-      org.opencontainers.image.version="5.2.0"
+      org.opencontainers.image.description="Comic archive optimizer with a web UI and JPEG XL worker" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.source="${SOURCE}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.version="${VERSION}"
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates gosu imagemagick tzdata libgif7 \
     && rm -rf /var/lib/apt/lists/*

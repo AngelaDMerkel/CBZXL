@@ -8,3 +8,6 @@ legacy
 .github
 target
 stack.env
+.env
+.env.*
+comics

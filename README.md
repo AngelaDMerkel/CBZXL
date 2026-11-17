@@ -66,7 +66,7 @@ place and appear individually in Attention.
 
 ## Architecture
 
-The `cbzxl` binary has five commands:
+The `cbzxl` binary has six commands:
 
 | Command | Purpose |
 | --- | --- |
@@ -96,32 +96,34 @@ timeout, batched outcomes, passive checkpoints, and online backups.
 
 ## Docker Compose
 
-Edit the two host paths in `docker-compose.yml`:
+The production image is **`ghcr.io/angeladmerkel/cbzxl`**, containing the web UI,
+API, and worker. It supports Linux AMD64 and ARM64. Images become available after
+the publishing workflow runs on `main`; `latest` is created by the first stable
+GitHub Release using that workflow.
 
-```yaml
-volumes:
-  - /path/to/comics:/data
-  - /path/to/cbzxl-config:/config
-```
-
-Then run:
+Put comics in `./comics` (or set `CBZXL_LIBRARY_PATH` in `.env`), then run:
 
 ```sh
-docker compose build
+mkdir -p comics
+docker compose pull
 docker compose up -d
 ```
 
-Open `http://<host>:5000`.
+Open `http://localhost:5000`. Compose binds to loopback by default and stores
+the database in the `cbzxl-config` named volume. Set `CBZXL_API_TOKEN` before
+exposing the service to other machines. CBZXL modifies library archives in place;
+keep backups of both your library and configuration.
 
-The image builds libjxl 0.12.0 from its pinned release tag for the target
-architecture. Both AMD64 and ARM64 builds use the same runtime validation.
+See [Container usage and publishing](docs/containers.md) for plain Docker commands,
+mount permissions, resource sizing, release tags, upgrades, and one-time GHCR setup.
+Use a version tag or digest for controlled upgrades; `dev` is for development only.
 
 Resource overrides now affect Compose directly:
 
 ```sh
-CBZXL_CPU_LIMIT=12 \
-CBZXL_MEMORY_LIMIT=24g \
-CBZXL_SHM_SIZE=12g \
+CBZXL_CPU_LIMIT=4 \
+CBZXL_MEMORY_LIMIT=8g \
+CBZXL_SHM_SIZE=4g \
 docker compose up -d
 ```
 
@@ -265,14 +267,18 @@ The frontend uses pnpm:
 cd frontend
 pnpm install --frozen-lockfile
 pnpm run build
+pnpm run test
 ```
 
 Validate deployment configuration and the production image:
 
 ```sh
 docker compose config --quiet
-docker build -t cbzxl:test .
+python3 -m unittest discover -s tests -p 'test_image_metadata.py'
+docker build -t cbzxl:ci .
+./tests/container-smoke.sh cbzxl:ci
+SMOKE_UID=65532 ./tests/container-smoke.sh cbzxl:ci
 ```
 
-The production worker performs end-to-end lossless JPEG, PNG, TIFF, BMP, and
-BMP probes before accepting jobs. WebP is deliberately inventory-only.
+The production worker performs end-to-end lossless JPEG, PNG, TIFF, and BMP
+probes before accepting jobs. WebP is deliberately inventory-only.
