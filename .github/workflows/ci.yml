@@ -1,44 +1,228 @@
 name: CI
 
 on:
-  push:
   pull_request:
+  push:
+    branches: [main]
+  release:
+    types: [published]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  validate:
-    runs-on: ubuntu-latest
+  metadata:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      revision: ${{ steps.meta.outputs.revision }}
+      source: ${{ steps.meta.outputs.source }}
+      version: ${{ steps.meta.outputs.version }}
+      tags: ${{ steps.meta.outputs.tags }}
+      publish: ${{ steps.meta.outputs.publish }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: python3 -m unittest discover -s tests -p 'test_image_metadata.py'
+      - id: meta
+        run: python3 scripts/image-metadata.py
+
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           toolchain: "1.96"
           components: rustfmt, clippy
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
+            ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-1.96-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('src/**', 'tests/**') }}
+          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-1.96-${{ hashFiles('Cargo.lock') }}-
       - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --all-targets --locked
-      - uses: actions/setup-node@v4
+      # Install pnpm before setup-node tries to locate its cache directory.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+      - run: corepack enable && corepack prepare pnpm@11.9.0 --activate
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
           cache: pnpm
           cache-dependency-path: frontend/pnpm-lock.yaml
-      - run: corepack enable && corepack prepare pnpm@11.9.0 --activate
       - run: pnpm install --frozen-lockfile
         working-directory: frontend
-      - run: pnpm run build
-        working-directory: frontend
-      - run: pnpm run test
+      - run: pnpm run build && pnpm run test
         working-directory: frontend
       - run: docker compose config --quiet
-      - run: docker build --tag cbzxl:ci .
-      - run: docker run --rm cbzxl:ci doctor
-      - run: docker run --rm -e CBZXL_UID=65532 -e CBZXL_GID=65532 cbzxl:ci doctor
-      - run: ./tests/container-smoke.sh
+
+  container:
+    needs: metadata
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build the runtime once, without registry credentials
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          push: false
+          tags: cbzxl:ci-${{ matrix.arch }}
+          outputs: type=docker,dest=${{ runner.temp }}/cbzxl.tar
+          build-args: |
+            VERSION=${{ needs.metadata.outputs.version }}
+            REVISION=${{ needs.metadata.outputs.revision }}
+            SOURCE=${{ needs.metadata.outputs.source }}
+          cache-from: type=gha,scope=cbzxl-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=cbzxl-${{ matrix.arch }}
+      - name: Test the exported runtime as root and a numeric user
+        env:
+          ARCH: ${{ matrix.arch }}
+          IMAGE_ARCHIVE: ${{ runner.temp }}/cbzxl.tar
+          IMAGE_ID: ${{ runner.temp }}/image-id.txt
+        run: |
+          docker load --input "$IMAGE_ARCHIVE"
+          ./tests/container-smoke.sh "cbzxl:ci-$ARCH"
+          SMOKE_UID=65532 ./tests/container-smoke.sh "cbzxl:ci-$ARCH"
+          docker image inspect --format '{{.Id}}' "cbzxl:ci-$ARCH" > "$IMAGE_ID"
+          echo "Tested linux/$ARCH image config: $(cat "$IMAGE_ID")" >> "$GITHUB_STEP_SUMMARY"
+      - name: Save only tested images for publication
+        if: needs.metadata.outputs.publish == 'true' && github.event_name != 'pull_request'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: container-${{ matrix.arch }}
+          path: |
+            ${{ runner.temp }}/cbzxl.tar
+            ${{ runner.temp }}/image-id.txt
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+  publish:
+    needs: [metadata, validate, container]
+    if: >-
+      needs.metadata.outputs.publish == 'true' &&
+      (github.event_name == 'release' ||
+       (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: ghcr-publish
+      cancel-in-progress: false
+    outputs:
+      digest: ${{ steps.publish.outputs.digest }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: container-*
+          path: images
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish tested images and assemble their multi-platform index
+        id: publish
+        env:
+          IMAGE: ${{ needs.metadata.outputs.image }}
+          TAGS: ${{ needs.metadata.outputs.tags }}
+          REVISION: ${{ needs.metadata.outputs.revision }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+          SOURCE: ${{ needs.metadata.outputs.source }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          refs=()
+          for arch in amd64 arm64; do
+            docker load --input "images/container-$arch/cbzxl.tar"
+            local_image="cbzxl:ci-$arch"
+            test "$(docker image inspect --format '{{.Id}}' "$local_image")" = "$(cat "images/container-$arch/image-id.txt")"
+            docker image inspect "$local_image" | jq -e \
+              --arg arch "$arch" --arg revision "$REVISION" --arg version "$VERSION" --arg source "$SOURCE" \
+              '.[0] | .Architecture == $arch and .Os == "linux" and
+              .Config.Labels["org.opencontainers.image.revision"] == $revision and
+              .Config.Labels["org.opencontainers.image.version"] == $version and
+              .Config.Labels["org.opencontainers.image.source"] == $source'
+            staging="$IMAGE:build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$arch"
+            docker tag "$local_image" "$staging"
+            docker push "$staging"
+            digest="$(docker buildx imagetools inspect "$staging" --format '{{.Manifest.Digest}}')"
+            refs+=("$IMAGE@$digest")
+            echo "linux/$arch: \`$IMAGE@$digest\`" >> "$GITHUB_STEP_SUMMARY"
+          done
+          tag_args=()
+          for tag in $TAGS; do
+            tag_args+=(--tag "$IMAGE:$tag")
+          done
+          docker buildx imagetools create "${tag_args[@]}" "${refs[@]}"
+          digest="$(docker buildx imagetools inspect "$IMAGE:sha-$REVISION" --format '{{.Manifest.Digest}}')"
+          docker buildx imagetools inspect "$IMAGE@$digest" --raw | jq -e \
+            --arg amd64 "${refs[0]#*@}" --arg arm64 "${refs[1]#*@}" \
+            '(.manifests | length) == 2 and
+            any(.manifests[]; .platform.os == "linux" and .platform.architecture == "amd64" and .digest == $amd64) and
+            any(.manifests[]; .platform.os == "linux" and .platform.architecture == "arm64" and .digest == $arm64)'
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Multi-platform image: \`$IMAGE@$digest\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Tags: \`$TAGS\`" >> "$GITHUB_STEP_SUMMARY"
+
+  anonymous-pull:
+    needs: [metadata, publish]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Pull by digest without credentials and smoke-test the public image
+        env:
+          IMAGE: ${{ needs.metadata.outputs.image }}@${{ needs.publish.outputs.digest }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          export DOCKER_CONFIG="$(mktemp -d)"
+          trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+          if ! docker pull --platform "linux/$ARCH" "$IMAGE"; then
+            echo '::error::Anonymous pull failed. Check package visibility (Public) and package Actions access; see docs/containers.md.'
+            exit 1
+          fi
+          SMOKE_UID=65532 ./tests/container-smoke.sh "$IMAGE"
+          echo "Anonymous pull and runtime smoke passed for linux/$ARCH: \`$IMAGE\`" >> "$GITHUB_STEP_SUMMARY"
