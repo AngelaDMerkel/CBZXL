@@ -77,8 +77,10 @@ you have independently prepared all writable directories.
 
 Scratch usage counts toward the container memory limit. Allow room for decoded
 pages, encoder memory, and parallel work in addition to scratch. Large archives
-can exceed the starter defaults; increase memory/scratch together or place
-`SCRATCH_DIR` on a writable disk-backed volume. The 8192 MiB archive expansion
+can exceed the starter defaults; increase memory/scratch together or mount a
+writable disk-backed volume and set both `SCRATCH_DIR` and `WORKSPACE_DIR` in
+Compose's `environment` to a directory on that volume. `WORKSPACE_DIR` takes
+precedence when both are set. The 8192 MiB archive expansion
 ceiling is a safety maximum, not a promise that every allowed archive fits the
 default memory budget. See the [configuration reference](../README.md#configuration)
 for application settings.
