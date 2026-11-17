@@ -4,8 +4,8 @@
 
 - Before starting each major change, create a new, dedicated Git branch and a new Git worktree for that branch. Perform the change in that worktree.
 - Major changes include new features, substantial bug fixes, refactors, migrations, and changes spanning multiple components. When in doubt, treat the work as a major change.
-- Use the `codex/` branch prefix and a descriptive name, for example `codex/improve-archive-scanning`.
-- Create the branch and worktree before editing files, for example: `git worktree add -b codex/<change-name> <new-worktree-path> <base-branch>`.
+- Use descriptive branch names that explain the actual change, for example `feat/nested-archive-support`, `fix/archive-scanning`, or `docs/agent-workflow`. Branch names must never contain `codex`.
+- Create the branch and worktree before editing files, for example: `git worktree add -b <descriptive-branch-name> <new-worktree-path> <base-branch>`.
 - Do not reuse a branch or worktree from a different major change, or perform major changes directly on the default branch.
 
 ## Commits
